@@ -11,7 +11,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Replicate, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -803,6 +803,52 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(
     assert model.decoder.high_precision not in expected_scales
 
 
+def _verify_extra_parallel_bf16_reduce_scatter(device: torch.device) -> None:
+    """Verify FSDP2 native BF16 backward scaling via ``_configure_extra_parallel_reduce_scatter``.
+
+    Covers 1D singleton (``ep_fsdp == 1``), 2D HSDP singleton
+    (``ep_replicate == 2, ep_fsdp == 1``), and multi-rank (``ep_fsdp == 2``)
+    ExtraParallel meshes on both CPU/Gloo and CUDA/NCCL.
+    """
+    rank = dist.get_rank()
+    device_type = device.type
+    mp_bf16 = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
+    ep_meshes = (
+        (DeviceMesh(device_type, [[0, 1, 2, 3]], mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"], 1),
+        (
+            DeviceMesh(device_type, [[[0, 1]], [[2, 3]]], mesh_dim_names=("ep_replicate", "ep_fsdp", "ep"))[
+                ("ep_replicate", "ep_fsdp")
+            ],
+            1,
+        ),
+        (DeviceMesh(device_type, [[0, 1], [2, 3]], mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"], 2),
+    )
+    for para_fsdp_mesh, expected_rs_size in ep_meshes:
+        torch.manual_seed(99)
+        mod = nn.Linear(8, 8, bias=False, device=device)
+        fully_shard(mod, mesh=para_fsdp_mesh, mp_policy=mp_bf16)
+        rs_size = torch_parallelize._fsdp_reduce_scatter_size(para_fsdp_mesh)
+        assert rs_size == expected_rs_size
+        torch_parallelize._configure_extra_parallel_reduce_scatter(mod, 4.0, reduce_scatter_size=rs_size)
+        x = torch.ones(2, 8, device=device, dtype=torch.bfloat16) * float(rank + 1)
+        (mod(x).sum()).backward()
+        full_grad = mod.weight.grad.full_tensor().float()
+        # On each rank r, d(sum(x @ W.T))/dW[i, j] = sum_b x[b, j] = 2 * (r + 1).
+        # Summing over participating ranks in para_fsdp_mesh and dividing ONCE by 4.0:
+        participating = para_fsdp_mesh.mesh.flatten().tolist()
+        expected_val = sum(2.0 * (r + 1) for r in participating) / 4.0
+        torch.testing.assert_close(
+            full_grad,
+            torch.full_like(full_grad, expected_val),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        del mod, x, full_grad
+        gc.collect()
+        if device_type != "cpu":
+            dist.barrier(device_ids=[device.index])
+
+
 def _run_transport_policy_gloo(rank, rendezvous):
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -811,8 +857,6 @@ def _run_transport_policy_gloo(rank, rendezvous):
     original_get_node_id = reduce_scatter_module._get_node_id
     original_gather = dist.all_gather_object
     try:
-        from torch.distributed.device_mesh import DeviceMesh
-
         # Synthetic node identities isolate placement/consensus logic; all workers run locally.
         # Noncontiguous shard rows ensure rank arithmetic cannot substitute for actual groups.
         mesh = DeviceMesh("cpu", [[0, 2], [1, 3]], mesh_dim_names=("replica", "shard"))
@@ -837,45 +881,8 @@ def _run_transport_policy_gloo(rank, rendezvous):
             original_gather(decisions, policy.can_use(mesh))
             assert decisions == [expected] * 4
 
-        # Verify real FSDP2 backward gradient scaling through _configure_extra_parallel_reduce_scatter
-        # across singleton (ep_fsdp == 1, 1D and 2D HSDP) and multi-rank (ep_fsdp == 2) BF16 reductions.
         dist.all_gather_object = original_gather
-        mp_bf16 = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
-        ep_meshes = (
-            DeviceMesh("cpu", [[0, 1, 2, 3]], mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"],
-            DeviceMesh("cpu", [[[0, 1]], [[2, 3]]], mesh_dim_names=("ep_replicate", "ep_fsdp", "ep"))[
-                ("ep_replicate", "ep_fsdp")
-            ],
-            DeviceMesh("cpu", [[0, 1], [2, 3]], mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"],
-        )
-        for para_fsdp_mesh in ep_meshes:
-            torch.manual_seed(99)
-            mod = nn.Linear(8, 8, bias=False)
-            w_ref = mod.weight.detach().bfloat16().float().clone()
-            fully_shard(mod, mesh=para_fsdp_mesh, mp_policy=mp_bf16)
-            rs_size = torch_parallelize._fsdp_reduce_scatter_size(para_fsdp_mesh)
-            torch_parallelize._configure_extra_parallel_reduce_scatter(mod, 4.0, reduce_scatter_size=rs_size)
-            x = torch.ones(2, 8, dtype=torch.bfloat16) * float(rank + 1)
-            (mod(x).sum()).backward()
-            full_grad = mod.weight.grad.full_tensor().float()
-            # On each rank r, d(sum(x @ W.T))/dW[i, j] = sum_b x[b, j] = 2 * (r + 1).
-            # Summing over participating ranks in para_fsdp_mesh and dividing ONCE by 4.0:
-            coords = para_fsdp_mesh.mesh.flatten().tolist()
-            if para_fsdp_mesh.ndim == 1 and para_fsdp_mesh.size() == 1:
-                participating = [rank]
-            elif para_fsdp_mesh.ndim == 2 and rs_size == 1:
-                # 2D HSDP [[[0],[2]]] or [[[1],[3]]]: replicate axis sums peers with same ep rank
-                participating = [rank, (rank + 2) % 4]
-            else:
-                # ep_fsdp=2: [0, 2] or [1, 3]
-                participating = [r for r in coords if (r % 2) == (rank % 2)]
-            expected_val = sum(2.0 * (r + 1) for r in participating) / 4.0
-            torch.testing.assert_close(
-                full_grad,
-                torch.full_like(w_ref, expected_val),
-                rtol=2e-2,
-                atol=2e-2,
-            )
+        _verify_extra_parallel_bf16_reduce_scatter(torch.device("cpu"))
     finally:
         reduce_scatter_module._get_node_id = original_get_node_id
         dist.all_gather_object = original_gather
@@ -1088,8 +1095,14 @@ def _run_transport_policy_fsdp2_gradients(fsdp_mesh, hsdp_mesh, device):
         reduce_scatter_module.FP32ReduceScatterWithLowPrecisionTransport = original_comm_class
 
 
+def _run_extra_parallel_bf16_reduce_scatter_nccl() -> None:
+    rank = dist.get_rank()
+    device = torch.device(get_device_type(), int(os.environ.get("LOCAL_RANK", rank)))
+    _verify_extra_parallel_bf16_reduce_scatter(device)
+
+
 def _run_reduce_scatter_nccl_and_fsdp2_step() -> None:
-    steps = [_run_reduce_scatter_nccl, _run_fsdp2_optimizer_step]
+    steps = [_run_reduce_scatter_nccl, _run_fsdp2_optimizer_step, _run_extra_parallel_bf16_reduce_scatter_nccl]
     if os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
         steps = list(reversed(steps))
     for step_fn in steps:

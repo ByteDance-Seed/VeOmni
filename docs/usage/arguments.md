@@ -903,10 +903,28 @@ See [HyperParallel](../key_features/hyper_parallel.md) for installation and conf
 | --- | --- | --- | --- |
 | enable | `bool` | `True` | Enable mixed precision training. |
 | param_dtype | `str` | `"bfloat16"` | Dtype for the unsharded parameter. |
-| reduce_dtype | `str` | `"float32"` | Dtype for gradient reduction (i.e. reduce-scatter or all-reduce). |
+| reduce_dtype | `Optional[str]` | `"float32"` | Dtype for gradient reduction (i.e. reduce-scatter or all-reduce). When set to `null`, FSDP2 inherits `param_dtype`. |
 | output_dtype | `str` | `None` | Dtype for casting floating-point forward outputs (FSDP2). |
 | cast_forward_inputs | `bool` | `True` | Enable mixed precision cast forward inputs (FSDP2). |
 
+> **ExtraParallel BF16 reduction guard (CUDA / NCCL FSDP2):** When `mixed_precision.enable: true`
+> and the effective reduction dtype is `bfloat16` (either `reduce_dtype: bfloat16` or
+> `reduce_dtype: null` with `param_dtype: bfloat16`), `AcceleratorConfig` rejects FSDP2
+> (`fsdp_mode: fsdp2` / `hyper_fsdp2`) topologies where any ExtraParallel reduce-scatter group
+> spans more than one rank (`para_size > 1` and `dp_shard_sp_size // para_size > 1`, with
+> `dp_shard_sp_size = world_size // dp_replicate_size`). On NCCL, PyTorch's default `PreMulSum`
+> path for `gradient_divide_factor != reduce_scatter_size` truncates power-of-two `1 / 2^k`
+> scalars to `bfloat16(0.0)` and silently zeroes ExtraParallel gradients. Ascend NPU (HCCL,
+> which patches `PREMUL_SUM` to `SUM` + local scaling via `apply_hccl_premul_sum_patch()`),
+> Cambricon MLU (CNCL), non-FSDP2 modes (`ddp`, `eager`), and `mixed_precision.enable: false`
+> are unaffected and exempt. To migrate an affected configuration, choose one of:
+> - Set `reduce_dtype: float32` (default; optionally enable
+>   `fsdp_config.low_precision_reduce_scatter_comm: true` for BF16 wire transport with FP32
+>   accumulation).
+> - Make the ExtraParallel reduce-scatter group a singleton (`para_size == dp_shard_sp_size`,
+>   i.e. equal to `dp_shard * cp * ulysses`, which works in both 1D FSDP and 2D HSDP).
+> - Use `reduce_dtype: float16` (which uses PyTorch's overflow-safe `ReduceOp.SUM` path rather
+>   than `PreMulSum`).
 
 ### OffloadConfig
 

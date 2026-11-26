@@ -221,9 +221,21 @@ class TestBf16ReduceOverAnExtraParallelCollective:
     """
 
     @staticmethod
-    def _build(monkeypatch, *, world_size, reduce_dtype, ep_size=1, dp_replicate_size=-1):
+    def _build(
+        monkeypatch,
+        *,
+        world_size,
+        reduce_dtype,
+        ep_size=1,
+        dp_replicate_size=-1,
+        npu=False,
+        mlu=False,
+    ):
         from veomni.arguments import MixedPrecisionConfig
+        from veomni.utils import device as device_utils
 
+        monkeypatch.setattr(device_utils, "IS_NPU_AVAILABLE", npu)
+        monkeypatch.setattr(device_utils, "IS_MLU_AVAILABLE", mlu)
         monkeypatch.setenv("WORLD_SIZE", str(world_size))
         return AcceleratorConfig(
             ep_size=ep_size,
@@ -253,8 +265,12 @@ class TestBf16ReduceOverAnExtraParallelCollective:
         self._build(monkeypatch, world_size=128, ep_size=32, reduce_dtype="float16")
 
     def test_disabled_mixed_precision_is_not_checked(self, monkeypatch):
-        monkeypatch.setenv("WORLD_SIZE", "128")
         from veomni.arguments import MixedPrecisionConfig
+        from veomni.utils import device as device_utils
+
+        monkeypatch.setattr(device_utils, "IS_NPU_AVAILABLE", False)
+        monkeypatch.setattr(device_utils, "IS_MLU_AVAILABLE", False)
+        monkeypatch.setenv("WORLD_SIZE", "128")
 
         AcceleratorConfig(
             ep_size=32,
@@ -285,7 +301,10 @@ class TestBf16ReduceOverAnExtraParallelCollective:
     def test_non_fsdp2_modes_skip_the_check(self, monkeypatch, fsdp_mode):
         # SeedOmni sub-modules can inherit global ep_size while running under DDP or eager.
         from veomni.arguments import MixedPrecisionConfig
+        from veomni.utils import device as device_utils
 
+        monkeypatch.setattr(device_utils, "IS_NPU_AVAILABLE", False)
+        monkeypatch.setattr(device_utils, "IS_MLU_AVAILABLE", False)
         monkeypatch.setenv("WORLD_SIZE", "128")
         AcceleratorConfig(
             ep_size=32,
@@ -294,3 +313,14 @@ class TestBf16ReduceOverAnExtraParallelCollective:
                 mixed_precision=MixedPrecisionConfig(enable=True, param_dtype="bfloat16", reduce_dtype="bfloat16"),
             ),
         )
+
+    @pytest.mark.parametrize("reduce_dtype", ["bfloat16", None])
+    def test_hccl_npu_backend_accepts_wide_bf16_group(self, monkeypatch, reduce_dtype):
+        # Ascend NPU installs apply_hccl_premul_sum_patch() (SUM + local scaling)
+        # and does not hit ProcessGroupNCCL's bf16 PreMulSum scalar bug.
+        args = self._build(monkeypatch, world_size=8, ep_size=2, reduce_dtype=reduce_dtype, npu=True)
+        assert args.ep_size == 2
+
+    def test_cncl_mlu_backend_accepts_wide_bf16_group(self, monkeypatch):
+        args = self._build(monkeypatch, world_size=8, ep_size=2, reduce_dtype="bfloat16", mlu=True)
+        assert args.ep_size == 2

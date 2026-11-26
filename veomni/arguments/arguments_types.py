@@ -1040,7 +1040,10 @@ class AcceleratorConfig:
         reduction never takes the PreMulSum path -- it gets pre/post factors with
         plain ``ReduceOp.SUM``. Non-FSDP2 modes (``ddp``, ``eager``) skip this
         check because they never run FSDP2 ExtraParallel reduce-scatter (for
-        example, a SeedOmni sub-module may inherit a global ``ep_size``).
+        example, a SeedOmni sub-module may inherit a global ``ep_size``). Ascend
+        NPU (HCCL, which installs ``apply_hccl_premul_sum_patch()`` to run SUM +
+        local scaling) and Cambricon MLU (CNCL) also skip this check because they
+        do not execute ``ProcessGroupNCCL``'s ``ncclRedOpCreatePreMulSum`` path.
 
         A singleton group is fine and is what smaller shapes use: the reduce-scatter
         never issues a collective there, and ``foreach_reduce`` already divides in
@@ -1057,6 +1060,11 @@ class AcceleratorConfig:
         mixed_precision = self.fsdp_config.mixed_precision
         effective_reduce_dtype = mixed_precision.reduce_dtype or mixed_precision.param_dtype
         if not mixed_precision.enable or effective_reduce_dtype != "bfloat16":
+            return
+
+        from ..utils.device import IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
+
+        if IS_NPU_AVAILABLE or IS_MLU_AVAILABLE:
             return
 
         # `ep` is folded in on demand rather than written back to the raw fields,
