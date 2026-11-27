@@ -532,6 +532,52 @@ def _supports_output_index_for_resume(dataset: Any) -> bool:
     return callable(getattr(dataset, "get_item", None)) and hasattr(dataset, "output_index_for_resume")
 
 
+def _detach_hf_epoch_for_worker(dataset) -> None:
+    """Replace shared-memory ``HFIterableDataset._epoch`` with a worker-local int.
+
+    Hugging Face ``IterableDataset`` stores ``_epoch`` in a shared-memory tensor
+    across DataLoader workers so ``set_epoch`` updates it in-place across
+    processes. Inside a worker process, rebinding ``_epoch`` to a plain ``int``
+    isolates per-worker reset epochs without deepcopying transforms or
+    allocating extra ``/dev/shm`` tensors.
+    """
+    seen = set()
+    current = dataset
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ShardedIterableDataset):
+            return
+        if isinstance(current, HFIterableDataset):
+            current._epoch = int(current._epoch)
+            return
+        for attr in ("_data", "_dataset"):
+            nxt = getattr(current, attr, None)
+            if nxt is not None:
+                current = nxt
+                break
+        else:
+            return
+
+
+def _clear_hf_starting_state_dict(dataset) -> None:
+    """Clear stale ``_starting_state_dict`` on wrapped HF streams before a reset pass."""
+    seen = set()
+    current = dataset
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, HFIterableDataset):
+            if getattr(current, "_starting_state_dict", None) is not None:
+                current._starting_state_dict = None
+            return
+        for attr in ("_data", "_dataset"):
+            nxt = getattr(current, attr, None)
+            if nxt is not None:
+                current = nxt
+                break
+        else:
+            return
+
+
 class WeightedMultiSourceDataset(IterableDataset):
     """Multi-source dataset with weighted sampling.
 
@@ -616,6 +662,8 @@ class WeightedMultiSourceDataset(IterableDataset):
         self._random_state = np.random.RandomState(seed=self._seed)
         self._iters: List[Any] = []
         self._epoch = 0
+        self._shared_epoch = torch.tensor(0, dtype=torch.int64).share_memory_()
+        self._reset_counts = [0 for _ in range(self._ds_num)]
         self._exhausted = [False for _ in range(self._ds_num)]
         if self._weights.shape[0] != self._ds_num:
             raise ValueError("weights length must match datasets length")
@@ -702,6 +750,7 @@ class WeightedMultiSourceDataset(IterableDataset):
             epoch: Current epoch number.
         """
         self._epoch = epoch
+        self._shared_epoch.fill_(epoch)
         for dataset in self._datasets:
             set_epoch_fn = getattr(dataset, "set_epoch", None)
             if callable(set_epoch_fn):
@@ -717,16 +766,32 @@ class WeightedMultiSourceDataset(IterableDataset):
         """
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
+        if worker_info is not None:
+            self._epoch = int(self._shared_epoch.item())
+            for ds in self._datasets:
+                _detach_hf_epoch_for_worker(ds)
         if not self._just_resumed:
             seed_seq = np.random.SeedSequence([self._seed, self._epoch, self.dp_rank, worker_id])
             current_seed = int(seed_seq.generate_state(1, dtype=np.uint32)[0])
             self._random_state = np.random.RandomState(current_seed)
+            for idx, ds in enumerate(self._datasets):
+                _clear_hf_starting_state_dict(ds)
+                if worker_info is not None or self._reset_counts[idx] > 0:
+                    set_epoch_fn = getattr(ds, "set_epoch", None)
+                    if callable(set_epoch_fn):
+                        set_epoch_fn(self._epoch)
             self._exhausted = [False for _ in range(self._ds_num)]
+            self._reset_counts = [0 for _ in range(self._ds_num)]
             self._avg_len_sum = [0.0 for _ in range(self._ds_num)]
             self._avg_len_count = [0 for _ in range(self._ds_num)]
             self._global_sample_idx = 0
         else:
             self._just_resumed = False
+            for idx, ds in enumerate(self._datasets):
+                if worker_info is not None or self._reset_counts[idx] > 0:
+                    set_epoch_fn = getattr(ds, "set_epoch", None)
+                    if callable(set_epoch_fn):
+                        set_epoch_fn(self._epoch + self._reset_counts[idx])
 
         self._iters = [iter(ds) for ds in self._datasets]
         while True:
@@ -811,6 +876,11 @@ class WeightedMultiSourceDataset(IterableDataset):
                 logger.warning(
                     f"Data source #{ds_idx} (source_name: {self._source_names[ds_idx]}) is exhausted, reset and continue"
                 )
+                self._reset_counts[ds_idx] += 1
+                _clear_hf_starting_state_dict(self._datasets[ds_idx])
+                set_epoch_fn = getattr(self._datasets[ds_idx], "set_epoch", None)
+                if callable(set_epoch_fn):
+                    set_epoch_fn(self._epoch + self._reset_counts[ds_idx])
                 self._iters[ds_idx] = iter(self._datasets[ds_idx])
                 try:
                     return next(self._iters[ds_idx])
@@ -874,8 +944,9 @@ class WeightedMultiSourceDataset(IterableDataset):
             dataset_states_by_id[source_id] = ds_state
         avg_len_sum_by_id = {source_id: self._avg_len_sum[idx] for idx, source_id in enumerate(self._source_ids)}
         avg_len_count_by_id = {source_id: self._avg_len_count[idx] for idx, source_id in enumerate(self._source_ids)}
-        # save _exhausted state
+        # save _exhausted and _reset_counts state
         exhausted_by_id = {source_id: self._exhausted[idx] for idx, source_id in enumerate(self._source_ids)}
+        reset_counts_by_id = {source_id: self._reset_counts[idx] for idx, source_id in enumerate(self._source_ids)}
         return {
             "version": 0,
             "topology": {
@@ -890,6 +961,7 @@ class WeightedMultiSourceDataset(IterableDataset):
                 "avg_len_sum": avg_len_sum_by_id,
                 "avg_len_count": avg_len_count_by_id,
                 "exhausted": exhausted_by_id,
+                "reset_counts": reset_counts_by_id,
                 "global_sample_idx": self._global_sample_idx,
                 "dataset_states": dataset_states_by_id,
             },
@@ -960,13 +1032,18 @@ class WeightedMultiSourceDataset(IterableDataset):
             if callable(load_state_fn):
                 load_state_fn(ds_state)
 
-        # Ensure _exhausted is re-initialized for the current source count
+        # Ensure _exhausted and _reset_counts are re-initialized for the current source count
         # This is important when sources are added/removed during checkpoint resume
         if "exhausted" in runtime and isinstance(runtime["exhausted"], dict):
             exhausted_dict = runtime["exhausted"]
             self._exhausted = [bool(exhausted_dict.get(source_id, False)) for source_id in self._source_ids]
         else:
             self._exhausted = [False for _ in range(self._ds_num)]
+        if "reset_counts" in runtime and isinstance(runtime["reset_counts"], dict):
+            reset_counts_dict = runtime["reset_counts"]
+            self._reset_counts = [int(reset_counts_dict.get(source_id, 0)) for source_id in self._source_ids]
+        else:
+            self._reset_counts = [0 for _ in range(self._ds_num)]
 
         self._just_resumed = True
 
@@ -1903,6 +1980,11 @@ def build_weighted_multisource_dataset(
     level = multisource_config.get("level", "sample")
     stopping_strategy = multisource_config.get("stopping_strategy", "first_exhausted")
     split_by_node = multisource_config.get("upstream_sharded", True)
+    if kwargs.get("dataset_repeat"):
+        logger.warning_rank0(
+            "`dataset_repeat=True` is ignored by `veomni_weighted_multisource`; "
+            "set `stopping_strategy: never_exhausted` in the multisource YAML instead."
+        )
 
     datasets = [
         build_iterable_dataset(
@@ -1912,7 +1994,6 @@ def build_weighted_multisource_dataset(
             source_name=source_names[idx] if source_names is not None else None,
             split_by_node=split_by_node,
             shuffle=shuffle,
-            dataset_repeat=bool(kwargs.get("dataset_repeat", False)),
         )
         for idx, source in enumerate(sources)
     ]

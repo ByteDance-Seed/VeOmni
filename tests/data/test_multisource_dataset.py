@@ -618,6 +618,300 @@ def test_stopping_strategy_never_exhausted():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_reset_advances_subdataset_epoch_and_checkpoints_reset_counts():
+    class _EpochTrackingStream(MockIterableDataset):
+        def __init__(self, data, name):
+            super().__init__(data, name=name)
+            self.epochs = []
+
+        def set_epoch(self, epoch: int):
+            self.epochs.append(epoch)
+
+    ds1 = _EpochTrackingStream([{"input_ids": [1]}], name="a")
+    ds2 = _EpochTrackingStream([{"input_ids": [2]}], name="b")
+    dataset = _make_simple_dataset(
+        datasets=[ds1, ds2],
+        weights=[0.5, 0.5],
+        source_ids=["id_a", "id_b"],
+        stopping_strategy="never_exhausted",
+    )
+    dataset.set_epoch(5)
+    assert ds1.epochs == [5]
+    assert ds2.epochs == [5]
+
+    dataset._iters = [iter(ds1), iter(ds2)]
+    assert dataset._next_sample(0)["input_ids"] == [1]
+    assert dataset._next_sample(0)["input_ids"] == [1]
+    assert dataset._next_sample(0)["input_ids"] == [1]
+    assert dataset._reset_counts == [2, 0]
+    assert ds1.epochs == [5, 6, 7]
+
+    # Save/restore preserves reset_counts and reconciles added/removed sources.
+    state = dataset.state_dict()
+    assert state["runtime"]["reset_counts"] == {"id_a": 2, "id_b": 0}
+
+    restored_ds1 = _EpochTrackingStream([{"input_ids": [1]}], name="a")
+    restored_ds2 = _EpochTrackingStream([{"input_ids": [2]}], name="b")
+    restored = _make_simple_dataset(
+        datasets=[restored_ds1, restored_ds2],
+        weights=[0.5, 0.5],
+        source_ids=["id_a", "id_b"],
+        stopping_strategy="never_exhausted",
+    )
+    # StatefulDataLoader resume order: set_epoch(epoch) runs before deferred load_state_dict() -> iter().
+    restored.set_epoch(5)
+    restored.load_state_dict(state)
+    assert restored._reset_counts == [2, 0]
+    next(iter(restored))
+    assert restored_ds1.epochs[-1] == 7
+    assert restored_ds2.epochs[-1] == 5
+
+    # Direct load_state_dict() -> set_epoch(epoch) -> iter() order also restores epoch + reset_count.
+    restored_ds1_b = _EpochTrackingStream([{"input_ids": [1]}], name="a")
+    restored_ds2_b = _EpochTrackingStream([{"input_ids": [2]}], name="b")
+    restored_b = _make_simple_dataset(
+        datasets=[restored_ds1_b, restored_ds2_b],
+        weights=[0.5, 0.5],
+        source_ids=["id_a", "id_b"],
+        stopping_strategy="never_exhausted",
+    )
+    restored_b.load_state_dict(state)
+    restored_b.set_epoch(5)
+    next(iter(restored_b))
+    assert restored_ds1_b.epochs[-1] == 7
+    assert restored_ds2_b.epochs[-1] == 5
+
+    restored_added = _make_simple_dataset(
+        datasets=[
+            _EpochTrackingStream([{"input_ids": [1]}], name="a"),
+            _EpochTrackingStream([{"input_ids": [2]}], name="b"),
+            _EpochTrackingStream([{"input_ids": [3]}], name="c"),
+        ],
+        weights=[0.4, 0.4, 0.2],
+        source_ids=["id_a", "id_b", "id_c"],
+        stopping_strategy="never_exhausted",
+    )
+    restored_added.load_state_dict(state, reconcile_policy="allow_add")
+    assert restored_added._reset_counts == [2, 0, 0]
+
+    restored_removed = _make_simple_dataset(
+        datasets=[_EpochTrackingStream([{"input_ids": [1]}], name="a")],
+        weights=[1.0],
+        source_ids=["id_a"],
+        stopping_strategy="never_exhausted",
+    )
+    restored_removed.load_state_dict(state, reconcile_policy="allow_add_remove")
+    assert restored_removed._reset_counts == [2]
+
+    # Backward compatibility when an older checkpoint omits reset_counts.
+    legacy_state = copy.deepcopy(state)
+    legacy_state["runtime"].pop("reset_counts")
+    restored.load_state_dict(legacy_state)
+    assert restored._reset_counts == [0, 0]
+
+    # Fresh iteration resets _reset_counts and sub-dataset epochs so re-iterating stays deterministic.
+    dataset._reset_counts = [3, 1]
+    it = iter(dataset)
+    next(it)
+    assert dataset._reset_counts == [0, 0]
+    assert ds1.epochs[-1] == 5
+    assert ds2.epochs[-1] == 5
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_resumed_hf_source_clears_starting_state_dict_on_reset():
+    from datasets import Dataset as HFDataset
+
+    from veomni.data.dataset import IterativeDataset
+
+    hf_stream = HFDataset.from_dict({"x": list(range(4))}).to_iterable_dataset(num_shards=1)
+    ds = IterativeDataset(hf_stream, transform=lambda row: {"input_ids": [int(row["x"])]})
+    # Consume to the end of the shard and snapshot state.
+    it = iter(ds)
+    for _ in range(4):
+        next(it)
+    saved = ds.state_dict()
+
+    hf_resumed = HFDataset.from_dict({"x": list(range(4))}).to_iterable_dataset(num_shards=1)
+    ds_resumed = IterativeDataset(hf_resumed, transform=lambda row: {"input_ids": [int(row["x"])]})
+    ds_resumed.load_state_dict(saved)
+    multisource = _make_simple_dataset(
+        datasets=[ds_resumed],
+        weights=[1.0],
+        source_ids=["src"],
+        stopping_strategy="never_exhausted",
+    )
+    multisource._just_resumed = True
+    it_resumed = iter(multisource)
+    samples = [next(it_resumed)["input_ids"][0] for _ in range(6)]
+    assert samples == [0, 1, 2, 3, 0, 1]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_multisource_workers_keep_hf_epoch_private_without_copying_transform():
+    import threading
+
+    from datasets import Dataset as HFDataset
+
+    from veomni.data.dataset import IterativeDataset
+
+    # Lock is intentionally non-deepcopyable: detaching HF's shared _epoch must not deepcopy _transform.
+    non_copyable_lock = threading.Lock()
+
+    def _transform(row, lock):
+        assert lock is not None
+        return {"input_ids": [int(row["x"])]}
+
+    hf_short = HFDataset.from_dict({"x": list(range(8))}).to_iterable_dataset(num_shards=2)
+    hf_short = hf_short.shuffle(seed=0, buffer_size=4)
+    hf_long = HFDataset.from_dict({"x": list(range(24))}).to_iterable_dataset(num_shards=2)
+    hf_long = hf_long.shuffle(seed=1, buffer_size=4)
+
+    ds_short = IterativeDataset(hf_short, transform=partial(_transform, lock=non_copyable_lock))
+    ds_long = IterativeDataset(hf_long, transform=partial(_transform, lock=non_copyable_lock))
+    dataset = _make_simple_dataset(
+        datasets=[ds_short, ds_long],
+        weights=[0.5, 0.5],
+        source_ids=["short", "long"],
+        stopping_strategy="all_exhausted",
+    )
+
+    loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=2)
+    samples = list(loader)
+    assert len(samples) >= 24
+    # Parent HF streams must keep epoch == 0 even after worker exhaustion resets.
+    assert int(hf_short._epoch) == 0
+    assert int(hf_long._epoch) == 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_persistent_workers_receive_set_epoch_updates():
+    from datasets import Dataset as HFDataset
+
+    from veomni.data.dataset import IterativeDataset
+
+    hf_a = HFDataset.from_dict({"x": list(range(32))}).to_iterable_dataset(num_shards=2).shuffle(seed=7, buffer_size=8)
+    hf_b = (
+        HFDataset.from_dict({"x": list(range(100, 132))})
+        .to_iterable_dataset(num_shards=2)
+        .shuffle(seed=11, buffer_size=8)
+    )
+    dataset = _make_simple_dataset(
+        datasets=[
+            IterativeDataset(hf_a, transform=lambda row: {"input_ids": [int(row["x"])]}),
+            IterativeDataset(hf_b, transform=lambda row: {"input_ids": [int(row["x"])]}),
+        ],
+        weights=[0.5, 0.5],
+        source_ids=["a", "b"],
+        stopping_strategy="first_exhausted",
+    )
+
+    loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=2, persistent_workers=True)
+    dataset.set_epoch(0)
+    epoch0 = [item["input_ids"][0] for item in loader]
+    dataset.set_epoch(1)
+    epoch1 = [item["input_ids"][0] for item in loader]
+    assert epoch0 != epoch1
+    assert [x for x in epoch0 if x < 100] != [x for x in epoch1 if x < 100]
+    assert int(hf_a._epoch) == 1
+    assert int(hf_b._epoch) == 1
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_build_weighted_multisource_dataset_preserves_cursor_on_resume(tmp_path):
+    import json
+
+    import yaml
+
+    from veomni.data import dataset as dataset_mod
+
+    data_file = tmp_path / "src.jsonl"
+    data_file.write_text("\n".join(json.dumps({"x": i}) for i in range(4)) + "\n", encoding="utf-8")
+    config_path = tmp_path / "multisource.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": [str(data_file)],
+                "names": ["src"],
+                "schedule": [{"schedule_type": "const", "weights": [1.0]}],
+                "stopping_strategy": "never_exhausted",
+                "upstream_sharded": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _transform(row, source_name=None):
+        return {"input_ids": [int(row["x"])]}
+
+    ds = dataset_mod.build_weighted_multisource_dataset(
+        train_path=str(config_path),
+        transform=_transform,
+        shuffle=False,
+        dataset_repeat=True,
+    )
+    it = iter(ds)
+    assert next(it)["input_ids"] == [0]
+    assert next(it)["input_ids"] == [1]
+    saved = ds.state_dict()
+
+    ds_resumed = dataset_mod.build_weighted_multisource_dataset(
+        train_path=str(config_path),
+        transform=_transform,
+        shuffle=False,
+        dataset_repeat=True,
+    )
+    ds_resumed.load_state_dict(saved)
+    it_resumed = iter(ds_resumed)
+    assert next(it_resumed)["input_ids"] == [2]
+    assert next(it_resumed)["input_ids"] == [3]
+    assert next(it_resumed)["input_ids"] == [0]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("stopping_strategy", ["first_exhausted", "all_exhausted", "never_exhausted"])
+def test_build_weighted_multisource_dataset_does_not_repeat_subdatasets(tmp_path, monkeypatch, stopping_strategy):
+    import yaml
+
+    from veomni.data import dataset as dataset_mod
+
+    config_path = tmp_path / "multisource.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": ["src_a", "src_b"],
+                "names": ["a", "b"],
+                "schedule": [{"schedule_type": "const", "weights": [0.5, 0.5]}],
+                "stopping_strategy": stopping_strategy,
+                "upstream_sharded": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    recorded_calls = []
+
+    def _fake_build_iterable(**kwargs):
+        recorded_calls.append(kwargs)
+        return MockIterableDataset([{"input_ids": [1]}], name=kwargs["source_name"])
+
+    monkeypatch.setattr(dataset_mod, "build_iterable_dataset", _fake_build_iterable)
+
+    warnings = []
+    monkeypatch.setattr(dataset_mod.logger, "warning_rank0", warnings.append)
+
+    ds = dataset_mod.build_weighted_multisource_dataset(
+        train_path=str(config_path),
+        dataset_repeat=True,
+    )
+    assert ds._stopping_strategy == stopping_strategy
+    assert len(recorded_calls) == 2
+    assert all("dataset_repeat" not in call for call in recorded_calls)
+    assert len(warnings) == 1
+    assert "stopping_strategy" in warnings[0]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_determinism_with_seed():
     data_a = [{"input_ids": [i]} for i in range(10)]
     data_b = [{"input_ids": [i]} for i in range(10, 20)]
