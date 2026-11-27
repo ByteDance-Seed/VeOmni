@@ -459,6 +459,13 @@ class OmniModelRuntime:
 
         return self.model(batch, node_runner=run_node)
 
+    def count_loss_tokens(self, micro_batches: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        """Pre-count window ``_loss_tokens`` totals per module under each module's ParallelState."""
+        counter = getattr(self.model, "count_loss_tokens", None)
+        if counter is None:
+            return {}
+        return counter(micro_batches, scope_fn=self.module_context)
+
     def clip_grad_norm(self) -> float:
         """Clip every module's grads and return the whole-model norm.
 

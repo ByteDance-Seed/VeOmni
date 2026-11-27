@@ -1,0 +1,8 @@
+# DeepSeek-V4.1-Flash training DAG without n-gram and MTP (vision + text_encoder + llm).
+#
+#   {deepseek_v41_vision, deepseek_v41_text_encoder.encode}
+#       -> deepseek_v41_llm -> deepseek_v41_text_encoder.decode -> end
+- { from: deepseek_v41_vision,              to: deepseek_v41_llm }
+- { from: deepseek_v41_text_encoder.encode, to: deepseek_v41_llm }
+- { from: deepseek_v41_llm,                 to: deepseek_v41_text_encoder.decode }
+- { from: deepseek_v41_text_encoder.decode, to: end }

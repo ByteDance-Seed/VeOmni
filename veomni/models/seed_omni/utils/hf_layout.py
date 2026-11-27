@@ -391,7 +391,7 @@ class OmniHFLayout:
             return {}, {}
 
     def source_weight_files(self, source_path: str) -> dict[str, str]:
-        """``{weight key: shard filename}`` of a safetensors HF checkpoint."""
+        """``{weight key: shard filename}`` of the source checkpoint."""
         return read_source_weight_files(source_path)
 
     def validate_module_state(self, source_path: str, name: str, model: torch.nn.Module) -> None:
@@ -451,7 +451,7 @@ class HFSource:
 
     @classmethod
     def from_path(cls, path: str, model_type: str) -> HFSource:
-        layout = get_hf_layout(model_type)
+        layout = get_hf_layout(model_type, os.path.realpath(path))
         return cls(path=os.path.realpath(layout.resolve_source_path(path)), model_type=model_type)
 
     @property
@@ -1205,5 +1205,6 @@ __all__ = [
     "read_hf_source",
     "resolve_omni_checkpoint_root",
     "save_hf_source_checkpoint",
+    "read_source_weight_files",
     "source_tensor_specs",
 ]

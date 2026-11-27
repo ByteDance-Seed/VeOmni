@@ -314,3 +314,163 @@ def test_omni_training_arguments_validates_loss_reduction():
 
     with pytest.raises(ValueError, match="train.loss_reduction"):
         OmniTrainingArguments(loss_reduction="invalid")
+
+
+def test_omni_model_forward_flattens_dict_loss_and_loss_tokens():
+    """Dict-valued ``_loss`` and ``_loss_tokens`` flatten to matching ``{node}.{name}`` keys."""
+
+    class _MultiLossNode(torch.nn.Module):
+        def decode(self, batch):
+            batch[LOSS_KEY] = {"ce_loss": torch.tensor(1.5), "mtp_loss": torch.tensor(0.5), "off": None}
+            batch[LOSS_TOKENS_KEY] = {
+                "ce_loss": torch.tensor(10, dtype=torch.int64),
+                "mtp_loss": torch.tensor(8, dtype=torch.int64),
+            }
+
+    model = OmniModel.__new__(OmniModel)
+    torch.nn.Module.__init__(model)
+    model.training_graph = TrainingGraph([{"from": "head.decode", "to": "end"}])
+    model._losses = {}
+    model._loss_tokens = {}
+    node = _MultiLossNode()
+    model.get_module = lambda name: node
+
+    out = model.forward({}, node_runner=lambda mod, node_def, batch: getattr(mod, node_def.method)(batch))
+    assert out["loss"].item() == pytest.approx(2.0)
+    assert set(out["losses"]) == {"head.decode.ce_loss", "head.decode.mtp_loss"}
+    assert set(out["loss_tokens"]) == {"head.decode.ce_loss", "head.decode.mtp_loss"}
+    assert int(out["loss_tokens"]["head.decode.ce_loss"].item()) == 10
+    assert int(out["loss_tokens"]["head.decode.mtp_loss"].item()) == 8
+
+
+def test_multi_loss_token_mean_single_micro_step_preserves_independent_scales():
+    """With num_micro_steps=1, losses with wildly different token counts (e.g. 2 vs 200) keep 1:1 relative scale."""
+    param = torch.nn.Parameter(torch.tensor([2.0, -1.0]))
+    grad_at_step: list[torch.Tensor] = []
+    optimizer = SimpleNamespace(
+        param_groups=[{"params": [param]}],
+        step=lambda: grad_at_step.append(param.grad.detach().clone()),
+        zero_grad=MagicMock(),
+    )
+    lr_scheduler = SimpleNamespace(step=MagicMock())
+
+    def forward(mb):
+        ce = (param[0] - 1.0) ** 2
+        kl = (param[1] + 3.0) ** 2
+        return {
+            "loss": ce + kl,
+            "losses": {"text.decode.ce_loss": ce, "llm.forward.indexer_kl_loss": kl},
+            "loss_tokens": {
+                "text.decode.ce_loss": torch.tensor(2, dtype=torch.int64),
+                "llm.forward.indexer_kl_loss": torch.tensor(200, dtype=torch.int64),
+            },
+        }
+
+    model = SimpleNamespace(
+        forward=forward,
+        clip_grad_norm=lambda: torch.tensor(1.0),
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+    )
+    trainer = _build_trainer(loss_reduction="token_mean", model=model)
+    captured = {}
+    trainer.on_step_end = lambda **kwargs: captured.update(kwargs)
+
+    trainer.train_step(iter([[{}]]))
+
+    # Exact grads: d(ce)/d(p0) = 2*(2-1) = 2.0, d(kl)/d(p1) = 2*(-1+3) = 4.0 (no 100x distortion).
+    assert torch.allclose(grad_at_step[0], torch.tensor([2.0, 4.0]))
+    assert captured["loss_dict"]["text.decode.ce_loss"] == pytest.approx(1.0)
+    assert captured["loss_dict"]["llm.forward.indexer_kl_loss"] == pytest.approx(4.0)
+    assert captured["loss"] == pytest.approx(5.0)
+
+
+def test_multi_loss_token_mean_grad_accum_matches_independent_token_mean_reference():
+    """With num_micro_steps>1 and count_loss_tokens, each loss is independently token-averaged over the window."""
+    p_acc = torch.nn.Parameter(torch.tensor([1.5, -0.5]))
+    p_ref = torch.nn.Parameter(p_acc.detach().clone())
+
+    # Micro-batch 0: 3 CE tokens, 100 KL tokens.
+    # Micro-batch 1: 1 CE token,  300 KL tokens.
+    # CE weights should be [3/4, 1/4]; KL weights should be [100/400, 300/400].
+    mb0 = {
+        "ce_x": torch.tensor([[1.0, 0.5], [2.0, -1.0], [-0.5, 1.5]]),
+        "ce_t": torch.tensor([1.0, 0.0, 2.0]),
+        "kl_val": torch.tensor(2.0),
+        "kl_n": 100,
+    }
+    mb1 = {
+        "ce_x": torch.tensor([[-2.0, 3.0]]),
+        "ce_t": torch.tensor([-1.0]),
+        "kl_val": torch.tensor(0.5),
+        "kl_n": 300,
+    }
+
+    ce_all = (
+        (torch.cat([mb0["ce_x"], mb1["ce_x"]], dim=0) @ p_ref - torch.cat([mb0["ce_t"], mb1["ce_t"]])) ** 2
+    ).mean()
+    kl_all = (100 * (p_ref[1] * mb0["kl_val"]) ** 2 + 300 * (p_ref[1] * mb1["kl_val"]) ** 2) / 400
+    (ce_all + kl_all).backward()
+
+    grad_at_step: list[torch.Tensor] = []
+    optimizer = SimpleNamespace(
+        param_groups=[{"params": [p_acc]}],
+        step=lambda: grad_at_step.append(p_acc.grad.detach().clone()),
+        zero_grad=MagicMock(),
+    )
+    lr_scheduler = SimpleNamespace(step=MagicMock())
+
+    def forward(mb):
+        ce = ((mb["ce_x"] @ p_acc - mb["ce_t"]) ** 2).mean()
+        kl = (p_acc[1] * mb["kl_val"]) ** 2
+        return {
+            "loss": ce + kl,
+            "losses": {"text.decode.ce_loss": ce, "llm.forward.indexer_kl_loss": kl},
+            "loss_tokens": {
+                "text.decode.ce_loss": torch.tensor(mb["ce_x"].shape[0], dtype=torch.int64),
+                "llm.forward.indexer_kl_loss": torch.tensor(mb["kl_n"], dtype=torch.int64),
+            },
+        }
+
+    def count_loss_tokens(mbs):
+        return {
+            "text.decode.ce_loss": torch.tensor(sum(m["ce_x"].shape[0] for m in mbs), dtype=torch.int64),
+            "llm.forward.indexer_kl_loss": torch.tensor(sum(m["kl_n"] for m in mbs), dtype=torch.int64),
+        }
+
+    model = SimpleNamespace(
+        forward=forward,
+        count_loss_tokens=count_loss_tokens,
+        clip_grad_norm=lambda: torch.tensor(1.0),
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+    )
+    trainer = _build_trainer(loss_reduction="token_mean", model=model)
+    captured = {}
+    trainer.on_step_end = lambda **kwargs: captured.update(kwargs)
+
+    trainer.train_step(iter([[mb0, mb1]]))
+
+    assert torch.allclose(grad_at_step[0], p_ref.grad, atol=1e-6, rtol=1e-6)
+    assert captured["loss_dict"]["text.decode.ce_loss"] == pytest.approx(ce_all.item(), rel=1e-6)
+    assert captured["loss_dict"]["llm.forward.indexer_kl_loss"] == pytest.approx(kl_all.item(), rel=1e-6)
+    assert captured["loss"] == pytest.approx((ce_all + kl_all).item(), rel=1e-6)
+
+
+def test_multi_loss_token_mean_grad_accum_requires_count_loss_tokens():
+    """Multi-loss token_mean with num_micro_steps>1 fails fast if count_loss_tokens is missing."""
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    model = SimpleNamespace(
+        forward=lambda mb: {
+            "loss": param * 2.0,
+            "losses": {"a": param * 1.0, "b": param * 1.0},
+            "loss_tokens": {
+                "a": torch.tensor(4, dtype=torch.int64),
+                "b": torch.tensor(10, dtype=torch.int64),
+            },
+        }
+    )
+    trainer = _build_trainer(loss_reduction="token_mean", model=model)
+    with pytest.raises(ValueError, match="count_loss_tokens"):
+        trainer.forward_backward_step({}, num_micro_steps=2, window_loss_tokens=None)
+    assert param.grad is None

@@ -137,6 +137,7 @@ seed_omni/models/qwen3.md
 seed_omni/models/qwen3_moe.md
 seed_omni/models/qwen3vl.md
 seed_omni/models/bagel.md
+seed_omni/models/deepseek_v41_flash.md
 ```
 
 ```{toctree}

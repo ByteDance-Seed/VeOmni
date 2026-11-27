@@ -1,0 +1,14 @@
+# DeepSeek-V4.1-Flash full training DAG (vision + ngram + text_encoder + llm + mtp).
+#
+#   deepseek_v41_vision -> deepseek_v41_ngram
+#   {deepseek_v41_ngram, deepseek_v41_text_encoder.encode}
+#       -> deepseek_v41_llm -> deepseek_v41_mtp -> deepseek_v41_text_encoder.decode -> end
+#
+# `vision -> ngram` is required so the n-gram node knows each image span's token
+# length when constructing the full packed sequence.
+- { from: deepseek_v41_vision,              to: deepseek_v41_ngram }
+- { from: deepseek_v41_ngram,               to: deepseek_v41_llm }
+- { from: deepseek_v41_text_encoder.encode, to: deepseek_v41_llm }
+- { from: deepseek_v41_llm,                 to: deepseek_v41_mtp }
+- { from: deepseek_v41_mtp,                 to: deepseek_v41_text_encoder.decode }
+- { from: deepseek_v41_text_encoder.decode, to: end }

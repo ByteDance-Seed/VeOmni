@@ -1,0 +1,18 @@
+# Default multimodal SFT mix (image + video + text understanding).
+# `sources` are placeholders: replace each entry with a local path or storage URL
+# this job can read. `names` are preprocessor keys in
+# `veomni/data/seed_omni/preprocess.py` — leave them as they are.
+sources:
+  - sharegpt4v_cap_100k
+  - llava_video
+  - tulu-3-sft-mixture
+names:
+  - sharegpt4v_cap_100k
+  - llava_video
+  - tulu-3-sft-mixture
+schedule:
+  - schedule_type: const
+    weights: [0.4, 0.4, 0.2]
+level: token
+stopping_strategy: all_exhausted
+upstream_sharded: true

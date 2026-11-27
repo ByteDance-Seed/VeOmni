@@ -1,0 +1,96 @@
+# DeepSeek-V4.1-Flash DeepGEMM FP8 training without n-gram and MTP (vision + text_encoder + llm)
+# on 128 GPUs (16 nodes x 8), 256k context, CP=16.
+#
+# `model.model_path` and `data.yaml`'s `sources` are placeholders: replace them
+# with paths this job can read before launching.
+#
+#   NNODES=16 NODE_RANK=<rank> MASTER_ADDR=<host> bash train.sh \
+#     tasks/omni/train_omni.py configs/seed_omni/DeepSeek/deepseek_v41_flash/deepgemm/no_ngram_mtp.yaml
+
+model:
+  model_path: DeepSeek-V4.1-Flash
+  model_config:
+    modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/deepgemm/modules_no_ngram_mtp.yaml
+    train_graph: configs/seed_omni/DeepSeek/deepseek_v41_flash/deepgemm/graph_no_ngram_mtp.yaml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    cp_size: 16
+    skip_sp_gather_between_modules: true
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      enable_async_activation: true
+      activation_gpu_limit: 0.0
+      activation_offload_modules: []
+      activation_offload_host_cache_limit_gb: 32.0
+
+  optimizer:
+    type: adamw
+    lr: 4.0e-5
+    lr_min: 4.0e-6
+    lr_start: 4.0e-7
+    lr_warmup_ratio: 0.10
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.1
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  max_seq_len: 262144
+  train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
+  dyn_bsz_buffer_size: 64
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+    persistent_workers: true
+  mm_configs:
+    use_audio_in_video: false
+    fps: 2.0
+    min_frames: 4
+    max_frames: 8
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 16
+  micro_batch_size: 1
+  loss_reduction: token_mean
+  dyn_bsz: true
+  dyn_bsz_runtime: worker
+  bsz_warmup_ratio: 0.0
+  empty_cache_steps: 0
+
+  checkpoint:
+    output_dir: outputs/deepseek_v41_flash_deepgemm_fp8_no_ngram_mtp_256k_cp16
+    save_steps: 500
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: deepseek_v41_flash_deepgemm_fp8_no_ngram_mtp_256k_cp16

@@ -1,0 +1,163 @@
+# Per-module recipe for DeepSeek-V4.1-Flash full DeepGEMM FP8 training on 128 GPUs (256k, CP=16).
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    ulysses_size: 16
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: false
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  ops_implementation:
+    cross_entropy_loss_implementation: liger_kernel
+  accelerator:
+    cp_size: 16
+    ulysses_size: 1
+    skip_sp_gather_between_modules: true
+    extra_parallel_names: ["emb"]
+    extra_parallel_sizes: [128]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    freeze: true
+  broadcast_model_weights_from_rank0: false
+  extra_parallel_stream_load: true
+  accelerator:
+    cp_size: 16
+    ulysses_size: 1
+    extra_parallel_names: ["emb"]
+    extra_parallel_sizes: [128]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  broadcast_model_weights_from_rank0: false
+  extra_parallel_stream_load: true
+  model_config:
+    weight_quantization: null
+    compress_kv_dtype: fp4
+    dsa_indexer_loss: true
+    emit_draft_hiddens: true
+    dspark_block_size: 5
+  ops_implementation:
+    moe_implementation:
+      name: deepgemm
+      kwargs: {dtype: fp8}
+    linear_implementation: deepgemm
+    gated_mlp_implementation: deepgemm
+    kv_round_implementation: triton
+    mhc_implementation: tilelang
+    dsa_indexer_implementation: tilelang
+    rms_norm_implementation: liger_kernel
+  optimizer:
+    type: muon
+    lr: 4.0e-5
+    lr_start: 4.0e-7
+    lr_min: 4.0e-6
+    lr_warmup_ratio: 0.10
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.1
+    muon_lr: 4.0e-5
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.1
+    muon_expert_zero_comm: true
+    muon_ns_implementation: std
+    muon_head_group_size: 1
+    muon_head_split_modules:
+      - self_attn.wq_b
+      - indexer.wq_b
+  accelerator:
+    cp_size: 16
+    ulysses_size: 1
+    skip_sp_gather_between_modules: true
+    ep_size: 32
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+
+deepseek_v41_mtp:
+  model_path: deepseek_v41_mtp
+  broadcast_model_weights_from_rank0: false
+  extra_parallel_stream_load: true
+  model_config:
+    weight_quantization: null
+    dspark_block_size: 5
+    num_nextn_predict_layers: 3
+    freeze: false
+  ops_implementation:
+    moe_implementation:
+      name: deepgemm
+      kwargs: {dtype: fp8}
+    linear_implementation: deepgemm
+    gated_mlp_implementation: deepgemm
+    kv_round_implementation: triton
+    mhc_implementation: tilelang
+    dsa_indexer_implementation: tilelang
+    rms_norm_implementation: liger_kernel
+  optimizer:
+    type: muon
+    lr: 4.0e-5
+    lr_start: 4.0e-7
+    lr_min: 4.0e-6
+    lr_warmup_ratio: 0.10
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.1
+    muon_lr: 4.0e-5
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.1
+    muon_expert_zero_comm: true
+    muon_ns_implementation: std
+    muon_head_group_size: 1
+    muon_head_split_modules:
+      - self_attn.wq_b
+  accelerator:
+    cp_size: 16
+    ulysses_size: 1
+    skip_sp_gather_between_modules: true
+    ep_size: 32
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
