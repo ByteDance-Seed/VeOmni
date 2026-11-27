@@ -744,3 +744,83 @@ def test_the_decode_walk_skips_the_assistant_speech_target():
 
     assert hidden.shape[0] == 5, f"expected the two text rows only, got {tuple(hidden.shape)}"
     assert shift_labels.shape[0] == 5
+
+
+# ── shard handoff ────────────────────────────────────────────────────────────
+#
+# The alignment test drives a text-only batch, so neither media producer's shard
+# branch is reached there. These two cover the branches themselves — they were
+# added after an import in the audio one shipped broken: the module resolved only
+# when the branch ran, and nothing ran it.
+
+
+def test_the_audio_window_splits_into_per_clip_slices():
+    """Each clip receives its intersection with this rank's window.
+
+    Lengths come from ``audio_output_lengths`` rather than from the value, because
+    the tower returns one unsegmented tensor and a sharded value only holds a
+    window. Two clips of unequal length are used so a wrong derivation cannot pass
+    by symmetry.
+    """
+    from veomni.models.seed_omni.modules.qwen3omni.audio.accelerated.accelerated import _scatter_audio_window
+    from veomni.models.seed_omni.modules.qwen3omni.audio.modeling import audio_output_lengths
+    from veomni.models.seed_omni.modules.qwen3omni.audio.processing import _OMNI_MEL_LEN
+
+    n_window = 100
+    mel_lens = [200, 300]
+    full = [int(v) for v in audio_output_lengths(torch.tensor(mel_lens), n_window).tolist()]
+    sp_size = 2
+    window = (sum(full) + (-sum(full) % sp_size)) // sp_size
+
+    def _items():
+        return [
+            ConversationItem(type="audio", value=torch.zeros(n, 4), role="user", meta={_OMNI_MEL_LEN: mel})
+            for n, mel in zip(full, mel_lens)
+        ]
+
+    covered = 0
+    for rank in range(sp_size):
+        items = _items()
+        _scatter_audio_window(items, torch.randn(window, 4), n_window=n_window, sp_rank=rank, sp_size=sp_size)
+        rows = [item.value.size(0) for item in items]
+        # No item ever receives padding: the window's pad tail is dropped, so the
+        # slices add up to at most the window width.
+        assert sum(rows) <= window, (rank, rows, window)
+        covered += sum(rows)
+
+    # Every real row is emitted exactly once across the group.
+    assert covered == sum(full), (covered, full)
+
+
+def test_the_vision_window_splits_merged_tokens_and_deepstack():
+    """Merged tokens and their DeepStack rows are sliced by the same schedule.
+
+    They are indexed by visual position, so a mismatch would pair one item's
+    activation with another's feature — silently, since the shapes still line up.
+    """
+    from veomni.models.seed_omni.modules.qwen3omni.vision.modeling import scatter_qwen3omni_visual_embeds
+
+    class _Slot:
+        def __init__(self, num_merged, item, grid):
+            self.num_merged = num_merged
+            self.item = item
+            self.grid = grid
+
+    sizes = [4, 2]
+    sp_size = 2
+    window = (sum(sizes) + (-sum(sizes) % sp_size)) // sp_size
+    num_layers = 2
+
+    for rank in range(sp_size):
+        items = [ConversationItem(type="image", value=None, role="user", meta={}) for _ in sizes]
+        slots = [_Slot(n, item, torch.tensor((1, 2, 2))) for n, item in zip(sizes, items)]
+        embeds = torch.randn(window, 8)
+        deepstack = [torch.randn(window, 8) for _ in range(num_layers)]
+
+        scatter_qwen3omni_visual_embeds(slots, embeds, deepstack, sp_rank=rank, sp_size=sp_size)
+
+        for item in items:
+            assert item.value.size(0) == len(item.meta["deepstack"][0])
+            assert len(item.meta["deepstack"]) == num_layers
+        # Nothing from the pad tail may reach an item.
+        assert sum(item.value.size(0) for item in items) <= window

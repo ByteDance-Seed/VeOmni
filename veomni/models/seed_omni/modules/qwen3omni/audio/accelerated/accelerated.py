@@ -140,7 +140,7 @@ def _scatter_audio_window(
     same derivation the gather path uses, so both paths agree on the segment
     boundaries by construction.
     """
-    from ...base.sp_shard import split_sp_sharded_tensor
+    from ....base.sp_shard import split_sp_sharded_tensor
 
     if not items:
         return
