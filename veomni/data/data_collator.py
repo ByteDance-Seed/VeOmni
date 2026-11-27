@@ -328,6 +328,18 @@ class PackingCollator(DataCollator):
         return batch
 
 
+def _compact_cpu_image_shard(shard):
+    """Release oversized image backing storage without copying pinned or differentiable views."""
+    if (
+        shard.layout == torch.strided
+        and not shard.requires_grad
+        and not shard.is_pinned()
+        and shard.untyped_storage().nbytes() > shard.numel() * shard.element_size()
+    ):
+        return shard.clone(memory_format=torch.contiguous_format)
+    return shard
+
+
 @dataclass
 class SequenceParallelCollator(DataCollator):
     collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
@@ -343,6 +355,7 @@ class SequenceParallelCollator(DataCollator):
         self.sp_rank = get_parallel_state().sp_rank
 
     def sp_slice(self, key: str, feature: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Slice a field for this SP rank, compacting eligible CPU image views."""
         if isinstance(feature, list):
             assert dim == 0, f"Only support dim=0 for {key} as it is a List"
             seq_length = len(feature)
@@ -351,7 +364,11 @@ class SequenceParallelCollator(DataCollator):
         else:
             seq_length = feature.size(dim)
             sp_chunk_size = seq_length // self.sp_size
-            return feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
+            shard = feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
+            if key in ("pixel_values", "pixel_values_videos") and shard.device.type == "cpu":
+                # Processor-produced views can retain all packed image storage.
+                shard = _compact_cpu_image_shard(shard)
+            return shard
 
     def sp_padding(
         self,
