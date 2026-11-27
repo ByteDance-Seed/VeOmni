@@ -256,7 +256,7 @@ class TrainingMixin(TrainingModuleMixin):
         )
         if loss_reduction_group is not None:
             loss = reduce_sequence_parallel_loss(loss, num_valid_tokens, group=loss_reduction_group)
-        return {"conversation_list": conversation, "_loss": loss}
+        return {"conversation_list": conversation, "_loss": loss, "_loss_tokens": num_valid_tokens.detach().clone()}
 
     def _anchor_dummy_decode_velocity_inputs(
         self,

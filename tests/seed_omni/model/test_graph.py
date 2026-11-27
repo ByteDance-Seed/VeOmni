@@ -323,7 +323,7 @@ def test_omni_model_forward_runs_fake_module_chain():
 
     # Each Linear is ones-initialized, so a row of ones becomes 8, then 64.
     assert torch.allclose(batch["hidden"], torch.full((2, hidden_size), 64.0))
-    assert out == {"loss": None, "losses": {}, "conversation_list": None}
+    assert out == {"loss": None, "losses": {}, "loss_tokens": {}, "conversation_list": None}
 
 
 class _ItemEncodingModule(PretrainedOmniModule):

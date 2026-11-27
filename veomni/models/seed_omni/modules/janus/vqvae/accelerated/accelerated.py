@@ -9,6 +9,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 
 from .......distributed.parallel_state import get_parallel_state
 from .......distributed.sequence_parallel import gather_outputs, slice_input_tensor
@@ -137,8 +138,20 @@ class TrainingMixin(TrainingModuleMixin):
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         loss = outputs.pop("loss", None)
+        loss_tokens = outputs.pop("loss_tokens", None)
         if loss is not None:
             outputs["_loss"] = loss
+            if loss_tokens is not None:
+                ps = get_parallel_state()
+                reduce_group = (
+                    ps.fsdp_group
+                    if ps.fsdp_group is not None
+                    else (getattr(ps, "sp_group", None) if getattr(ps, "sp_enabled", False) else None)
+                )
+                loss_tokens = loss_tokens.detach().to(dtype=torch.int64)
+                if reduce_group is not None and dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(loss_tokens, op=dist.ReduceOp.SUM, group=reduce_group)
+                outputs["_loss_tokens"] = loss_tokens
         outputs["conversation_list"] = conversation
         return outputs
 

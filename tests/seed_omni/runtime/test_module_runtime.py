@@ -782,20 +782,6 @@ def test_a_frozen_module_has_no_async_save_to_drain():
     runtime.wait_for_pending_save()
 
 
-@pytest.mark.parametrize(
-    ("accelerator", "expected_eager"),
-    [
-        (SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="eager")), True),
-        (SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="eager"), ep_size=4), False),
-        (SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="eager"), extra_parallel_sizes=[4]), False),
-        (SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")), False),
-    ],
-)
-def test_is_eager_checks_extra_parallel_besides_fsdp_mode(accelerator, expected_eager):
-    runtime = _unbuilt(accelerator=accelerator)
-    assert runtime.is_eager is expected_eager
-
-
 # ---------------------------------------------------------------- compile gate
 #
 # `module_compile_config` reads the accelerator only: the run switch, the wrap

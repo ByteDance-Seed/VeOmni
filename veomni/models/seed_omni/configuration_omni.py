@@ -43,9 +43,6 @@ DEFAULT_TRAINING_GRAPH_FILE = "training_graph.yaml"
 DEFAULT_GENERATION_GRAPH_FILE = "generation_graph.yaml"
 DEFAULT_GRAPH_SCENARIO = "default"
 
-#: Root key a pre-scenario-map sidecar nests its map under, per payload type.
-_LEGACY_GRAPH_WRAPPER = {list: "training_graph", dict: "generation_graphs"}
-
 _SAFE_INFER_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -545,22 +542,9 @@ class OmniConfig(VeOmniPretrainedConfig):
         ``value_type`` is the per-scenario payload: ``list`` (training DAG) or
         ``dict`` (generation FSM). A bare payload (one DAG / one FSM) is stored
         under :data:`DEFAULT_GRAPH_SCENARIO`.
-
-        A split checkpoint converted before the scenario maps were introduced on
-        disk nests its map under one wrapper key -- ``generation_graphs:`` for the
-        FSMs. Unwrap that one level so those checkpoints keep loading and keep
-        their scenario names; otherwise the wrapper becomes the scenario name and
-        the checkpoint's own ``infer_type`` misses it. The match is on the exact
-        key, because a legitimate map with a single scenario is indistinguishable
-        from a wrapper by shape alone.
         """
         with open(path, encoding="utf-8") as f:
             payload = yaml.safe_load(f)
-        wrapper = _LEGACY_GRAPH_WRAPPER.get(value_type)
-        wrapped = payload.get(wrapper) if isinstance(payload, dict) and len(payload) == 1 else None
-        is_bare_fsm = value_type is dict and isinstance(wrapped, dict) and {"initial", "states"} <= set(wrapped)
-        if isinstance(wrapped, dict) and not is_bare_fsm:
-            payload = wrapped
         if isinstance(payload, list) and value_type is list:
             payload = {DEFAULT_GRAPH_SCENARIO: payload}
         elif isinstance(payload, dict) and value_type is dict and {"initial", "states"} <= set(payload):

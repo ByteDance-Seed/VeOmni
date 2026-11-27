@@ -135,12 +135,11 @@ Common overrides:
 - `--train.global_batch_size` / `--train.micro_batch_size`: global vs per-step
   micro batch.
 - `--train.loss_reduction`: how a gradient-accumulation window is averaged
-  (`sample_mean`, default, averages micro-batches equally; `token_mean` weights
-  each micro-batch by its share of the window's supervised tokens across the
-  loss-reduction group so long samples are not diluted by short ones; supported
-  for training graphs with a single `TextEncoder.decode` objective).
-- `--train.log_memory_steps`: log rank-0 allocated / peak / reserved device
-  memory every N steps (`0` disables it).
+  (`sample_mean`, default, averages micro-batches equally; `token_mean` scales
+  each micro-batch's backward by the loss node's group-reduced `_loss_tokens`
+  count and divides the accumulated gradients by the window's total tokens so
+  long samples are not diluted by short ones; supported for single-loss graphs
+  whose loss node emits `_loss_tokens`).
 - `--data.max_seq_len`: packed sequence length.
 - `--train.checkpoint.output_dir`: run root; DCP checkpoints land in
   `<output_dir>/checkpoints/`.
@@ -190,13 +189,6 @@ bash train.sh tasks/omni/train_omni.py \
 ```
 
 The checkpoint layout is described in [Checkpointing](../../usage/checkpoint.md).
-Set `VEOMNI_RESUME_STALL_SECONDS=<N>` (positive float in seconds; default `0`,
-disabled) to enable a `faulthandler` stall watchdog in `GlobalStateCallback`
-that dumps every thread's stack trace to `stderr` if trainer global-state
-restoration (dataloader cursor, RNG, meters) or subsequent training steps make
-no forward progress for `<N>` seconds. Note that `CheckpointCallback` runs
-`trainer.load()` before `GlobalStateCallback`, so model and optimizer
-restoration are not covered by this watchdog.
 
 ## 5. Inference
 

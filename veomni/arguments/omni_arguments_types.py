@@ -719,16 +719,6 @@ class OmniTrainingArguments:
         default=500,
         metadata={"help": "Number of steps between two empty cache operations."},
     )
-    log_memory_steps: int = field(
-        default=0,
-        metadata={
-            "help": (
-                "Log allocated / peak / reserved device memory every N steps, at the point where "
-                "every gradient is live. 0 disables it. Used by memory-budget runs, where the "
-                "question is how much headroom a configuration leaves rather than how fast it runs."
-            )
-        },
-    )
     gc_steps: int = field(
         default=500,
         metadata={"help": "Number of steps between two gc.collect. GC is disabled if it is positive."},
@@ -793,8 +783,6 @@ class OmniTrainingArguments:
             raise ValueError(
                 f"Unknown train.loss_reduction {self.loss_reduction!r}; expected 'sample_mean' or 'token_mean'."
             )
-        if self.log_memory_steps < 0:
-            raise ValueError(f"train.log_memory_steps must be >= 0, got {self.log_memory_steps}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))

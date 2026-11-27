@@ -58,8 +58,9 @@ if TYPE_CHECKING:
 
 logger = helper.create_logger(__name__)
 
-# Must match the ``_loss`` key every OmniModule's ``post_forward`` emits.
+# Must match the ``_loss`` / ``_loss_tokens`` keys OmniModules' ``post_forward`` emits.
 LOSS_KEY = "_loss"
+LOSS_TOKENS_KEY = "_loss_tokens"
 
 # HF hub kwargs forwarded to :meth:`OmniConfig.from_pretrained`.
 _CONFIG_LOAD_KWARG_NAMES = frozenset(
@@ -182,6 +183,7 @@ class OmniModel(PreTrainedModel):
         self._last_printed_state: str | None = None
         self._generated: list[dict[str, Any]] = []
         self._losses: dict[str, Any] = {}
+        self._loss_tokens: dict[str, Any] = {}
 
         self.reset()
 
@@ -551,15 +553,20 @@ class OmniModel(PreTrainedModel):
 
         self.training_graph.reset()
         self._losses.clear()
+        self._loss_tokens.clear()
 
         for node in self.training_graph.iter_nodes():
             run_node(self.get_module(node.module), node, batch)
             loss = batch.pop(LOSS_KEY, None)
+            loss_tokens = batch.pop(LOSS_TOKENS_KEY, None)
             if loss is not None:
                 self._losses[node.name] = loss
+                if loss_tokens is not None:
+                    self._loss_tokens[node.name] = loss_tokens
         return {
             "loss": _sum_losses(self._losses),
             "losses": dict(self._losses),
+            "loss_tokens": dict(self._loss_tokens),
             "conversation_list": batch.get("conversation_list"),
         }
 

@@ -53,7 +53,6 @@ import json
 import math
 import os
 from dataclasses import asdict
-from datetime import timedelta
 from typing import Any, Dict, List, Mapping
 
 import torch
@@ -76,7 +75,6 @@ from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 from ...ops.batch_invariant import set_batch_invariant_mode
 from ...utils import helper, logging
-from ...utils.constants import IGNORE_INDEX
 from ...utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -230,7 +228,7 @@ class OmniTrainer:
         device = torch.device(device_str)
 
         if not dist.is_initialized():
-            dist.init_process_group(backend=get_dist_comm_backend(), timeout=timedelta(hours=6))
+            dist.init_process_group(backend=get_dist_comm_backend())
 
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 
@@ -277,66 +275,7 @@ class OmniTrainer:
         model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train_args=self.args.train)
         if model.optimizer is None and self.args.train.training_task != "offline_embedding":
             raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
-        self._validate_loss_reduction(model)
         return model
-
-    def _validate_loss_reduction(self, model: OmniModelRuntime) -> None:
-        """Validate ``train.loss_reduction='token_mean'`` against the active training graph.
-
-        ``token_mean`` scales the summed DAG loss by each micro-batch's share of
-        shifted supervised text tokens, which is only valid when the training
-        graph's sole loss-producing objective is a single ``TextEncoder.decode``
-        node. Multi-objective graphs (e.g. Janus with image VQ loss, BAGEL with
-        flow-matching loss, Qwen3-MoE with router auxiliary loss) and non-text
-        graphs (e.g. Cosmos3) must use ``sample_mean``.
-
-        Also detects decoders that shift each text item independently
-        (``BagelTextEncoder``) rather than once per sample (``TextEncoder``) so
-        :meth:`_count_supervised_tokens` uses the decoder's exact target count.
-        """
-        self._text_label_shift_mode = "per_sample"
-        self._token_mean_loss_node: str | None = None
-        if getattr(self.args.train, "loss_reduction", "sample_mean") != "token_mean":
-            return
-        training_graph = getattr(getattr(model, "model", None), "training_graph", None)
-        if training_graph is None:
-            return
-
-        from ...models.seed_omni.accelerated.utils.dispatch import unwrap_module_chain
-        from ...models.seed_omni.modules.bagel.text_encoder.modeling import BagelTextEncoder
-        from ...models.seed_omni.modules.text_encoder.modeling import TextEncoder
-
-        sinks = list(training_graph.sinks)
-        if len(sinks) != 1:
-            raise ValueError(
-                f"train.loss_reduction='token_mean' only supports training graphs with a single "
-                f"TextEncoder.decode objective; got sinks {sinks}. Use train.loss_reduction='sample_mean' "
-                "for multi-objective graphs."
-            )
-        sink = sinks[0]
-        module_name = training_graph.module_of(sink)
-        method = training_graph.method_of(sink)
-        raw_module = unwrap_module_chain(model.get_module(module_name))
-        if method != "decode" or not isinstance(raw_module, TextEncoder):
-            raise ValueError(
-                f"train.loss_reduction='token_mean' requires a TextEncoder.decode sink; "
-                f"got {sink!r} ({type(raw_module).__name__}). Use train.loss_reduction='sample_mean' instead."
-            )
-        for node in training_graph.execution_order:
-            if node == sink:
-                continue
-            node_method = training_graph.method_of(node)
-            node_module = unwrap_module_chain(model.get_module(training_graph.module_of(node)))
-            router_aux = getattr(node_module, "_router_aux_loss_enabled", None)
-            if node_method in ("decode", "decode_velocity") or (callable(router_aux) and router_aux()):
-                raise ValueError(
-                    f"train.loss_reduction='token_mean' only supports a single {sink!r} objective, "
-                    f"but node {node!r} ({type(node_module).__name__}) also produces a loss. "
-                    "Use train.loss_reduction='sample_mean' instead."
-                )
-        self._token_mean_loss_node = sink
-        if isinstance(raw_module, BagelTextEncoder):
-            self._text_label_shift_mode = "per_item"
 
     def _build_offline_cache_writer(self) -> None:
         if self.args.train.training_task == "offline_embedding":
@@ -558,170 +497,70 @@ class OmniTrainer:
             self.LOG_SAMPLE = False
         return micro_batch
 
-    def _loss_reduce_group(self):
-        """The group the model's loss was reduced over, or ``None`` when there is none.
-
-        Mirrors ``loss_reduction_group=fsdp_group`` on the text encoder's loss, so
-        a ``token_mean`` weight counts the same tokens the loss already averaged.
-        """
-        from ...distributed.parallel_state import get_parallel_state
-
-        return getattr(get_parallel_state(), "fsdp_group", None)
-
-    def _count_supervised_tokens(self, micro_batch: Mapping[str, Any]) -> int:
-        """Supervised-token count of one micro-batch, for ``loss_reduction='token_mean'``.
-
-        Counts the *shifted* labels, matching what the model's `ForCausalLMLoss`
-        divides by. The causal shift (`labels[1:]` + one trailing ``IGNORE_INDEX``)
-        moves the first label out of the tensor, so counting the unshifted row
-        over-counts by one whenever that first position is supervised -- and then
-        the micro-batch would be weighted by a denominator the loss never used.
-        The shift keeps every other position, so its supervised count differs from
-        the unshifted one only in that boundary case.
-
-        Handles packed batches (``packed_labels``), flat/list ``labels``, and
-        SeedOmni ``conversation_list`` batches (per-sample text ``meta["labels"]``
-        with sample-boundary masking matching ``TextEncoder._prepare_decode_inputs``).
-        """
-        labels = micro_batch.get("packed_labels")
-        if labels is None:
-            labels = micro_batch.get("labels")
-        if labels is not None:
-            if hasattr(labels, "numel"):
-                # A packed row arrives as [T] or [1, T]; the shift is over the last dim.
-                return int((labels[..., 1:] != IGNORE_INDEX).sum().item())
-            total = 0
-            for row in labels:
-                if hasattr(row, "numel"):
-                    total += int((row[..., 1:] != IGNORE_INDEX).sum().item())
-                else:
-                    total += sum(1 for token in row[1:] if token != IGNORE_INDEX)
-            return total
-
-        conversation_list = micro_batch.get("conversation_list")
-        if conversation_list is None:
-            return 0
-        per_item = getattr(self, "_text_label_shift_mode", "per_sample") == "per_item"
-        total = 0
-        if per_item:
-            # Match BagelTextEncoder._prepare_decode_inputs: each non-dummy text
-            # item is shifted independently.
-            for sample in conversation_list:
-                for part in sample:
-                    if getattr(part, "is_dummy", False) or getattr(part, "type", "text") != "text":
-                        continue
-                    meta = getattr(part, "meta", None)
-                    part_labels = meta.get("labels") if isinstance(meta, Mapping) else None
-                    if part_labels is not None:
-                        total += int((part_labels.reshape(-1)[1:] != IGNORE_INDEX).sum().item())
-            return total
-
-        for sample in conversation_list:
-            sample_labels: List[torch.Tensor] = []
-            has_non_text_prefix = False
-            for part in sample:
-                if getattr(part, "is_dummy", False):
-                    continue
-                if getattr(part, "type", "text") == "text":
-                    meta = getattr(part, "meta", None)
-                    part_labels = meta.get("labels") if isinstance(meta, Mapping) else None
-                    if part_labels is not None and part_labels.numel() > 0:
-                        sample_labels.append(part_labels.reshape(-1))
-                else:
-                    # Match TextEncoder._prepare_decode_inputs: each non-text
-                    # segment contributes a masked placeholder row before the
-                    # causal shift so a following supervised text token is kept.
-                    if not sample_labels:
-                        has_non_text_prefix = True
-            if not sample_labels:
-                continue
-            first_start = 0 if has_non_text_prefix else 1
-            total += int((sample_labels[0][first_start:] != IGNORE_INDEX).sum().item())
-            for part_labels in sample_labels[1:]:
-                total += int((part_labels != IGNORE_INDEX).sum().item())
-        return total
-
-    def forward_backward_step(
-        self, micro_batch: Dict[str, Any], *, num_micro_steps: int = 1, backward_scale: float | None = None
-    ):
+    def forward_backward_step(self, micro_batch: Dict[str, Any], *, num_micro_steps: int = 1):
         """One gradient-accumulation micro-batch over the training DAG.
 
-        ``OmniModelRuntime.forward`` returns ``{"loss", "losses", "conversation_list"}``
+        ``OmniModelRuntime.forward`` returns ``{"loss", "losses", "loss_tokens", "conversation_list"}``
         where ``loss`` is the summed per-node ``_loss``; a single backward then
         propagates across every FSDP2 unit. The result is dropped before the
         backward so the item copies a root wrap's input cast made are not held through it.
 
-        Each node's loss is a mean over its own micro-batch, so ``backward_scale``
-        sets the gradient weight of this micro-batch: ``1 / num_micro_steps`` for
-        a mean over micro-batches (``loss_reduction='sample_mean'``), or
-        ``local_tokens / global_tokens`` for a mean over tokens
-        (``'token_mean'``), where ``global_tokens`` already spans every dp rank.
-        The returned loss stays unscaled for logging, except that the caller reads
-        ``loss * token_count`` back out to rebuild the window mean.
+        Under ``loss_reduction='sample_mean'`` (default), each micro-batch is scaled
+        by ``1 / num_micro_steps`` so accumulated gradients are the mean over
+        micro-batches. Under ``loss_reduction='token_mean'``, the single loss node's
+        ``_loss`` is multiplied by its group-reduced ``_loss_tokens`` so backward
+        accumulates the exact token-weighted gradient sum across micro-batches, and
+        :meth:`train_step` divides every ``param.grad`` by the window's total tokens
+        before ``clip_grad_norm()``.
         """
         micro_batch = self.preforward(micro_batch)
-
-        self._log_memory("before forward")
 
         # Forward: spill activations to CPU (if enabled) + batch-invariant ops.
         with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             result: Dict[str, Any] = self.model.forward(micro_batch)
 
-        self._log_memory("after forward")
-
         total_loss: torch.Tensor = result["loss"]
         loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
+        loss_tokens: Dict[str, torch.Tensor] = result.get("loss_tokens", {})
         del result
         micro_batch.clear()
 
-        token_mean_node = getattr(self, "_token_mean_loss_node", None)
-        if token_mean_node is not None and loss_dict:
-            extra_loss_nodes = [name for name in loss_dict if name != token_mean_node]
-            if extra_loss_nodes:
+        if getattr(self.args.train, "loss_reduction", "sample_mean") == "token_mean":
+            if len(loss_dict) != 1 or set(loss_tokens.keys()) != set(loss_dict.keys()):
                 raise ValueError(
-                    f"train.loss_reduction='token_mean' only supports a single {token_mean_node!r} objective, "
-                    f"but forward produced additional loss(es) from {extra_loss_nodes}. "
+                    "train.loss_reduction='token_mean' requires a single loss node reporting '_loss_tokens'; "
+                    f"got losses={list(loss_dict.keys())} and loss_tokens={list(loss_tokens.keys())}. "
                     "Use train.loss_reduction='sample_mean' instead."
                 )
-
-        scale = 1.0 / num_micro_steps if backward_scale is None else backward_scale
+            raw_tokens = next(iter(loss_tokens.values()))
+            token_count = (
+                raw_tokens.detach().to(device=total_loss.device, dtype=torch.int64)
+                if isinstance(raw_tokens, torch.Tensor)
+                else torch.tensor(raw_tokens, device=total_loss.device, dtype=torch.int64)
+            )
+            scaled_loss = total_loss * token_count.to(dtype=torch.float32)
+        else:
+            token_count = None
+            scaled_loss = total_loss / num_micro_steps
 
         # Backward: separate offload hook stack (may differ from forward when GC is on).
         with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            (total_loss * scale).backward()
-
-        self._log_memory("after backward")
+            scaled_loss.backward()
 
         del micro_batch
-        return total_loss, loss_dict
+        return total_loss, loss_dict, token_count
 
-    def _log_memory(self, where: str) -> None:
-        """Report device memory at a gradient high-water point.
-
-        ``train.log_memory_steps=0`` disables it (the default), because reading
-        ``memory_allocated`` can force a device sync. The peak counters are
-        process-wide, so a single line after the backward already carries the
-        maximum reached during the forward and backward that preceded it; logging
-        before the forward too makes an out-of-memory trace say which side of the
-        step it died on.
-
-        Skipped on a backend without the allocator counters (CPU), where there is
-        no device budget to report and the call would raise.
-        """
-        steps = getattr(self.args.train, "log_memory_steps", 0)
-        if not steps or self.state.global_step % steps != 0 or getattr(self.args.train, "global_rank", 0) != 0:
-            return
-        device = get_torch_device()
-        memory_allocated = getattr(device, "memory_allocated", None)
-        if memory_allocated is None:
-            return
-        logger.info_rank0(
-            f"[memory] step {self.state.global_step} {where}: "
-            f"allocated {memory_allocated() / 1024**3:.2f} GiB, "
-            f"peak {device.max_memory_allocated() / 1024**3:.2f} GiB, "
-            f"reserved {device.memory_reserved() / 1024**3:.2f} GiB, "
-            f"peak reserved {device.max_memory_reserved() / 1024**3:.2f} GiB"
-        )
+    def _scale_optimizer_grads(self, scale: float) -> None:
+        """Rescale all live gradients across every module optimizer in-place."""
+        seen: set[int] = set()
+        with torch.no_grad():
+            for group in self.model.optimizer.param_groups:
+                for param in group["params"]:
+                    pid = id(param)
+                    if pid in seen or param.grad is None:
+                        continue
+                    seen.add(pid)
+                    param.grad.mul_(scale)
 
     def model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
         """Keep every module's params gathered across the grad-accumulation window."""
@@ -749,59 +588,42 @@ class OmniTrainer:
 
         total_loss_tensor: torch.Tensor | None = None
         total_loss_dict_tensors: Dict[str, torch.Tensor] = {}
+        total_tokens_tensor: torch.Tensor | None = None
         num_micro_steps = len(micro_batches)
-
-        # ``token_mean`` weights each micro-batch by its share of the window's
-        # supervised tokens, so counting them up front is what makes a long trace
-        # count for more than a short answer. The count is a cheap scan of the
-        # packed labels (no forward), then one all-reduce so every rank divides by
-        # the same window total. ``sample_mean`` keeps the old equal weighting and
-        # skips the scan entirely.
-        token_scale = None
-        local_token_counts: List[int] = []
-        if self.args.train.loss_reduction == "token_mean":
-            local_token_counts = [self._count_supervised_tokens(mb) for mb in micro_batches]
-            # The model's loss for a micro-batch is already the token mean over the
-            # whole reduce group, so the weight needs that same group's count for
-            # *each* micro-batch -- not just the window total of this rank's slice.
-            # int64 is exact for token counts and supported across NCCL, HCCL, CNCL, and Gloo.
-            counts = torch.tensor(local_token_counts, dtype=torch.int64, device=self.device)
-            group = self._loss_reduce_group()
-            if group is not None and dist.is_available() and dist.is_initialized():
-                dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
-            local_token_counts = counts.tolist()
-            token_scale = sum(local_token_counts)
+        token_mean = getattr(self.args.train, "loss_reduction", "sample_mean") == "token_mean"
 
         for micro_step, micro_batch in enumerate(micro_batches):
             self.model_reshard(micro_step, num_micro_steps)
-            backward_scale = None
-            if token_scale is not None:
-                # A window with no supervised token at all cannot be normalized;
-                # fall back to the equal weighting so the step still runs.
-                backward_scale = (
-                    local_token_counts[micro_step] / token_scale if token_scale > 0 else 1.0 / num_micro_steps
+            loss, loss_dict, token_count = self.forward_backward_step(micro_batch, num_micro_steps=num_micro_steps)
+            if token_mean:
+                weight = token_count.to(dtype=torch.float32)
+                total_tokens_tensor = (
+                    token_count if total_tokens_tensor is None else (total_tokens_tensor + token_count)
                 )
-            loss, loss_dict = self.forward_backward_step(
-                micro_batch, num_micro_steps=num_micro_steps, backward_scale=backward_scale
-            )
-            loss_weight = (
-                local_token_counts[micro_step] / token_scale
-                if (token_scale is not None and token_scale > 0)
-                else 1.0 / num_micro_steps
-            )
-            # ``loss`` is this micro-batch's token mean, so weight by ``loss_weight``
-            # before adding: the logged value is then the window's token mean.
-            loss_scaled = loss.detach() * loss_weight
+            else:
+                weight = 1.0 / num_micro_steps
+            loss_scaled = loss.detach().float() * weight
             total_loss_tensor = loss_scaled if total_loss_tensor is None else (total_loss_tensor + loss_scaled)
             for k, v in loss_dict.items():
-                v_scaled = v.detach() * loss_weight
+                v_scaled = v.detach().float() * weight
                 total_loss_dict_tensors[k] = (
                     v_scaled if k not in total_loss_dict_tensors else (total_loss_dict_tensors[k] + v_scaled)
                 )
 
+        if token_mean:
+            total_tokens = float(total_tokens_tensor.item()) if total_tokens_tensor is not None else 0.0
+            if total_tokens > 0.0:
+                self._scale_optimizer_grads(1.0 / total_tokens)
+                total_loss = float(total_loss_tensor.item()) / total_tokens if total_loss_tensor is not None else 0.0
+                total_loss_dict = {k: float(v.item()) / total_tokens for k, v in total_loss_dict_tensors.items()}
+            else:
+                total_loss = 0.0
+                total_loss_dict = dict.fromkeys(total_loss_dict_tensors, 0.0)
+        else:
+            total_loss = float(total_loss_tensor.item()) if total_loss_tensor is not None else 0.0
+            total_loss_dict = {k: float(v.item()) for k, v in total_loss_dict_tensors.items()}
+
         grad_norm = self.model.clip_grad_norm()
-        total_loss = float(total_loss_tensor.item()) if total_loss_tensor is not None else 0.0
-        total_loss_dict: Dict[str, float] = {k: float(v.item()) for k, v in total_loss_dict_tensors.items()}
         if math.isfinite(float(grad_norm)):
             self.model.optimizer.step()
         else:
@@ -809,10 +631,6 @@ class OmniTrainer:
                 f"Step {self.state.global_step}: non-finite grad_norm={grad_norm}, "
                 "skipping optimizer.step() to protect model parameters."
             )
-        # The per-micro-batch probe already covers the gradient high-water mark
-        # (see `_log_memory`); this one runs after optimizer.step() to catch a
-        # step whose peak lands in the optimizer update.
-        self._log_memory("after optimizer")
         self.model.lr_scheduler.step()
         self.model.optimizer.zero_grad()
 

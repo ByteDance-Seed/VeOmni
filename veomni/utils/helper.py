@@ -972,8 +972,8 @@ def create_profiler(
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
         experimental_config = None
 
-    warmup = 0
-    wait = start_step - 1
+    warmup = 0 if start_step == 1 else 1
+    wait = start_step - warmup - 1
     active = end_step - start_step
     logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")
 

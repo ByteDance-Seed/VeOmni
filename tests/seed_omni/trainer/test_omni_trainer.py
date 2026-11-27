@@ -66,7 +66,7 @@ def _accumulate_grads(num_micro_steps: int) -> torch.Tensor:
 
     trainer = OmniTrainer.__new__(OmniTrainer)
     trainer.model = SimpleNamespace(forward=forward, module_runtimes={})
-    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False, log_memory_steps=0))
+    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
     trainer.model_fwd_context = nullcontext()
     trainer.model_bwd_context = nullcontext()
     trainer.preforward = lambda micro_batch: micro_batch

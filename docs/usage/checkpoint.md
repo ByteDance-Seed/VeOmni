@@ -165,15 +165,6 @@ SeedOmni (`OmniTrainer`) writes both halves the same way: the model half through
 through the shared `GlobalStateCallback`, so its steps carry the same per-rank
 `loader/` and `extra_state/` files and the same manifest.
 
-To diagnose hangs during trainer global-state restoration or between training
-steps, set `VEOMNI_RESUME_STALL_SECONDS=<N>` (positive float in seconds;
-default `0`, disabled). `GlobalStateCallback` arms
-`faulthandler.dump_traceback_later(<N>)` around `load_global_state()`, re-arms
-it after every completed step in `on_step_end()`, and cancels it on
-`on_train_end()`. Because `CheckpointCallback` runs `trainer.load()` before
-`GlobalStateCallback`, model and optimizer restoration are outside this
-watchdog window.
-
 ## Staged and asynchronous saves
 
 `train.checkpoint.stage_dir` and `train.checkpoint.save_async` are two answers to

@@ -78,7 +78,7 @@ def _recorded_steps(monkeypatch, start_step: int, end_step: int, train_steps: in
 def test_memory_history_covers_only_the_profiled_window(monkeypatch):
     # With warmup=1: warmup step 19 plus active step 20; nothing from the 18 steps before.
     assert _recorded_steps(monkeypatch, start_step=20, end_step=21, train_steps=30, warmup=1) == [19, 20]
-    # With warmup=0 (create_profiler default): only active step 20.
+    # With warmup=0: only active step 20.
     assert _recorded_steps(monkeypatch, start_step=20, end_step=21, train_steps=30, warmup=0) == [20]
 
 
@@ -172,7 +172,7 @@ def test_create_profiler_skips_memory_dump_when_profile_memory_false(monkeypatch
         with_modules=False,
         global_rank=0,
     )
-    assert captured["schedule"] == (4, 0, 2, 1)
+    assert captured["schedule"] == (3, 1, 2, 1)
     assert not isinstance(prof, helper.ProfilerWithMem)
     captured["handler"](prof)
     assert dump_calls == []

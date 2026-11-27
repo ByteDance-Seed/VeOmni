@@ -143,29 +143,7 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
     "global_accelerator, module_override, expected_mode, expected_flag",
     [
         ({"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)}, {}, "eager", True),
-        # Inference defaults to `eager`, but an `ep` plan is compute parallelism
-        # that has to be built under a process group. With WORLD_SIZE=8 and
-        # ep_size=4 (ep_fsdp_size=2, including under HSDP dp_replicate_size=2),
-        # `_finish_without_fsdp_wrap` rejects `extra_parallel_only=True`, so
-        # `OmniModuleRuntimeArguments` promotes it to wrapped `fsdp2`
-        # (`extra_parallel_only=False`) and clears any inherited `True` flag.
-        # When `ep_size` spans `fsdp_size` (`ep_fsdp_size=1`), it promotes with
-        # `extra_parallel_only=True`.
-        ({"ep_size": 4}, {}, "fsdp2", False),
-        ({"ep_size": 8}, {}, "fsdp2", True),
-        ({"ep_size": 4}, {"accelerator": {"dp_replicate_size": 2}}, "fsdp2", False),
-        (
-            {"ep_size": 4, "fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
-            {},
-            "fsdp2",
-            False,
-        ),
-        (
-            {"ep_size": 4},
-            {"accelerator": {"extra_parallel_names": ["ep"], "extra_parallel_sizes": [1]}},
-            "eager",
-            False,
-        ),
+        ({"ep_size": 4}, {}, "eager", False),
         (
             {"ep_size": 4},
             {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "extra_parallel_only": True}}},
@@ -194,11 +172,7 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
     ],
     ids=[
         "global_no_wrap_stays_eager",
-        "global_ep_with_remaining_fsdp_normalizes_to_fsdp2",
-        "global_ep_full_shard_normalizes_to_extra_parallel_only",
-        "global_ep_hsdp_keeps_fsdp2_wrap",
-        "global_ep_clears_incompatible_inherited_extra_parallel_only",
-        "explicit_ep_override_to_1_stays_eager",
+        "global_ep_stays_eager_without_override",
         "global_ep_explicit_fsdp2",
         "plain_eager",
         "explicit_ddp_ignores_extra_parallel_only",
@@ -608,96 +582,6 @@ def test_build_omni_model_runtime_args_rejects_top_level_dp_size_mismatch(monkey
     )
     with pytest.raises(ValueError, match="Top-level `model.accelerator` resolved to dp_size=4"):
         build_omni_model_runtime_args(args_sp2)
-
-
-def test_inference_ep_or_emb_with_default_eager_normalizes_to_extra_parallel_only(monkeypatch):
-    """An inference module with ``ep``/``emb`` promotes out of ``eager`` to ``fsdp2``,
-    and sets ``extra_parallel_only=True`` only when every enabled axis spans ``dp_shard_sp``."""
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    global_args = OmniModuleRuntimeArguments(model_path="/tmp/model")
-    modules = build_omni_module_runtime_args(
-        global_args,
-        "/tmp/model",
-        {
-            "ep_partial_mod": {"accelerator": {"ep_size": 4}},
-            "ep_full_mod": {"accelerator": {"ep_size": 8}},
-            "emb_mod": {
-                "accelerator": {
-                    "extra_parallel_names": ["emb"],
-                    "extra_parallel_sizes": [8],
-                    "extra_parallel_placement_innermost": [False],
-                }
-            },
-            "eager_mod": {"model_path": "eager_mod"},
-        },
-        for_inference=True,
-    )
-    assert modules["ep_partial_mod"].needs_distributed_build is True
-    assert modules["ep_partial_mod"].accelerator.fsdp_config.fsdp_mode == "fsdp2"
-    assert modules["ep_partial_mod"].accelerator.fsdp_config.extra_parallel_only is False
-    for name in ("ep_full_mod", "emb_mod"):
-        assert modules[name].needs_distributed_build is True
-        assert modules[name].accelerator.fsdp_config.fsdp_mode == "fsdp2"
-        assert modules[name].accelerator.fsdp_config.extra_parallel_only is True
-    assert modules["eager_mod"].needs_distributed_build is False
-    assert modules["eager_mod"].accelerator.fsdp_config.fsdp_mode == "eager"
-
-
-@pytest.mark.parametrize(
-    ("override", "expect_extra_parallel_only"),
-    [
-        ({"ep_size": 8}, True),
-        ({"ep_size": 4}, False),
-        ({"ep_size": 4, "dp_replicate_size": 2}, False),
-    ],
-    ids=["ep8_world8", "ep4_world8", "hsdp_dp_rep2_ep4_world8"],
-)
-def test_promoted_extra_parallel_only_matches_parallel_state_fsdp_size(
-    monkeypatch, override, expect_extra_parallel_only
-):
-    """Promotion enables ``extra_parallel_only`` iff ``ParallelState.extra_parallel_fsdp_size == 1``."""
-    from veomni.distributed.parallel_state import ParallelState
-    from veomni.distributed.torch_parallelize import _finish_without_fsdp_wrap
-
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    global_args = OmniModuleRuntimeArguments(model_path="/tmp/model")
-    mod = build_omni_module_runtime_args(
-        global_args,
-        "/tmp/model",
-        {"mod": {"accelerator": override}},
-        for_inference=True,
-    )["mod"]
-    acc = mod.accelerator
-    assert acc.fsdp_config.fsdp_mode == "fsdp2"
-    assert acc.fsdp_config.extra_parallel_only is expect_extra_parallel_only
-
-    names, sizes, _ = acc.resolved_extra_parallel
-    monkeypatch.setattr(ParallelState, "world_size", property(lambda _self: 8))
-    ps = ParallelState(
-        dp_size=acc.dp_size,
-        dp_replicate_size=acc.dp_replicate_size,
-        dp_shard_size=acc.dp_shard_size,
-        tp_size=acc.tp_size,
-        pp_size=acc.pp_size,
-        cp_size=acc.cp_size,
-        ulysses_size=acc.ulysses_size,
-        dp_mode="fsdp2",
-        device_type="cpu",
-        extra_parallel_names=tuple(names),
-        extra_parallel_sizes=dict(zip(names, sizes)),
-        extra_parallel_only=True,
-    )
-    assert (ps.extra_parallel_fsdp_size("ep") == 1) is expect_extra_parallel_only
-    if not expect_extra_parallel_only:
-        with pytest.raises(ValueError, match="requires ep_fsdp_size=1"):
-            _finish_without_fsdp_wrap(
-                nn.Module(),
-                weights_path=None,
-                parallel_state=ps,
-                fqn2spec_info=None,
-                should_skip_hf_weight_load=True,
-                kwargs={"init_device": "meta"},
-            )
 
 
 def test_skip_sp_gather_between_modules_is_global_and_propagates_to_modules(monkeypatch):
