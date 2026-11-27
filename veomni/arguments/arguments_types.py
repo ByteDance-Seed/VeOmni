@@ -794,11 +794,11 @@ class FSDPConfig:
             "help": (
                 "Use mixed_precision.param_dtype for node-local FSDP2 ReduceScatter communication, while "
                 "keeping FP32 reduction buffers and accumulation. Disabled by default. Equal parameter and "
-                "reduction dtypes retain native communication. The custom path requires enabled mixed precision, "
-                "bfloat16 or float16 parameters, and float32 reduction. "
-                "Cross-node or unknown-placement shard groups fall back to native communication; "
-                "HSDP replica-linked groups make a consistent choice. FP32 modules excluded from mixed "
-                "precision keep native communication."
+                "reduction dtypes retain native communication. The custom path requires enabled mixed precision "
+                "and float32 reduction. CUDA/NCCL supports bfloat16 or float16 parameters and HSDP "
+                "replica-linked groups. Ascend/HCCL supports bfloat16 parameters with no HSDP replicas. "
+                "Cross-node or unknown-placement shard groups fall back to native communication. "
+                "FP32 modules excluded from mixed precision keep native communication."
             )
         },
     )
