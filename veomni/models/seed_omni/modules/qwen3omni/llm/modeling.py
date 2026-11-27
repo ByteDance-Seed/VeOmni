@@ -107,6 +107,8 @@ def pack_qwen3omni_conversations_for_forward(
     device: torch.device,
     spatial_merge_size: int,
     position_id_per_seconds: int = 13,
+    *,
+    sharded: bool = False,
 ) -> Dict[str, Any]:
     """Pack Qwen3-Omni conversation embeds for backbone forward (training + inference).
 
@@ -115,7 +117,17 @@ def pack_qwen3omni_conversations_for_forward(
     ``arange`` on all three rows (TMRoPE degenerates to 1-D there); only vision
     segments spread across t/h/w. They are float, like upstream's — see
     :func:`qwen3omni_vision_position_ids`.
+
+    ``sharded`` reads the batch after a ``skip_sp_gather_between_modules``
+    handoff: each ``item.value`` then holds only this rank's window, so lengths
+    and positions must come from ``meta`` (:func:`item_token_len`) rather than
+    from the value's row count. The returned ``position_ids`` /
+    ``visual_pos_masks`` / ``deepstack`` are still over the **full** row — the
+    caller pads and slices them — and ``inputs_embeds_shape`` holds the window
+    row counts the hidden-state scatter needs.
     """
+    from ...base.llm_packing import item_token_len
+
     inputs_embeds_list: list[torch.Tensor] = []
     position_ids_list: list[torch.Tensor] = []
     visual_pos_masks_list: list[torch.Tensor] = []
@@ -129,7 +141,7 @@ def pack_qwen3omni_conversations_for_forward(
             if not is_thinker_input(item):
                 continue
             embeds = item.value.to(device)
-            length = embeds.size(0)
+            length = item_token_len(item) if sharded else embeds.size(0)
             if length == 0:
                 # An empty segment carries no position and would break the
                 # ``seg_pos.max()`` cursor below. It is kept in the packed
@@ -177,6 +189,15 @@ def pack_qwen3omni_conversations_for_forward(
     inputs_embeds, inputs_embeds_shape = naflatten(inputs_embeds_list)
     if inputs_embeds.dim() == 2:
         inputs_embeds = inputs_embeds.unsqueeze(0)
+    if sharded:
+        # ``naflatten`` reported the *window* row counts, which is what the
+        # hidden-state scatter needs. The sequence metadata below is over the full
+        # row, so the batch shape is restated in full lengths.
+        inputs_embeds_shape = torch.tensor(
+            [[int(item_token_len(item))] for sample in conversations for item in sample if is_thinker_input(item)],
+            dtype=torch.long,
+            device="cpu",
+        )
     position_ids = torch.cat(position_ids_list, dim=1).unsqueeze(1)
     visual_pos_masks = torch.cat(visual_pos_masks_list, dim=0).unsqueeze(0)
 
@@ -362,6 +383,11 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
     config_class = Qwen3OmniLlmConfig
     base_model_prefix = "qwen3omni_llm"
     main_input_name = "inputs_embeds"
+    # Hidden states and both thinker traces are plain per-item concatenations of
+    # the carrier, so ``forward_post`` can hand this rank's window on item by item
+    # and the consumer concatenates it back — the same contract the qwen3 backbone
+    # implements.
+    supports_sp_sharded_handoff = True
     _no_split_modules = ["Qwen3OmniMoeThinkerTextDecoderLayer"]
     supports_gradient_checkpointing = True
     # This wrapper owns no attention — ``self.language_model`` does, and the

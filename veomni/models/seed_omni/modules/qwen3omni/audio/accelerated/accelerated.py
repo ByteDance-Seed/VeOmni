@@ -77,6 +77,23 @@ class TrainingMixin(TrainingModuleMixin):
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         items = self._audio_items or []
         embeds = outputs.get("audio_embeds")
+        ps = get_parallel_state()
+        if embeds is not None and ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
+            # Shard handoff: each item takes its intersection with this rank's
+            # window, and the backbone concatenates those slices straight into its
+            # own row — nothing is gathered here.
+            carrier = self._conversation_carrier
+            self._audio_items = None
+            self._conversation_carrier = None
+            self._sp_own_len = None
+            _scatter_audio_window(
+                items,
+                embeds,
+                n_window=self.config.audio_config.n_window,
+                sp_rank=ps.sp_rank,
+                sp_size=ps.sp_size,
+            )
+            return {"conversation_list": carrier}
         if embeds is not None and get_parallel_state().sp_size > 1:
             # The tower hands back only this rank's shard: gather it (autograd-
             # aware, so backward sums across the SP group) and strip the pad tail
@@ -106,6 +123,31 @@ class TrainingMixin(TrainingModuleMixin):
             ),
             "feature_lens": torch.full((batch_size,), frames, dtype=torch.long, device=device),
         }
+
+
+def _scatter_audio_window(
+    items: List[ConversationItem],
+    embeds: torch.Tensor,
+    *,
+    n_window: int,
+    sp_rank: int,
+    sp_size: int,
+) -> None:
+    """Split this rank's audio window into per-clip slices.
+
+    Lengths are the tower's *output* rows per clip, derived from the mel lengths
+    rather than observed, because the tower returns one unsegmented tensor. The
+    same derivation the gather path uses, so both paths agree on the segment
+    boundaries by construction.
+    """
+    from ...base.sp_shard import split_sp_sharded_tensor
+
+    if not items:
+        return
+    mel_lengths = torch.tensor([int(item.meta[_OMNI_MEL_LEN]) for item in items], dtype=torch.long)
+    sizes = audio_output_lengths(mel_lengths, n_window).tolist()
+    for item, chunk in zip(items, split_sp_sharded_tensor(embeds, sizes, sp_rank, sp_size), strict=True):
+        item.value = chunk
 
 
 class VeOmniMixin(BaseMixin, TrainingMixin):

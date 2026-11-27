@@ -123,11 +123,29 @@ class TrainingMixin(TrainingModuleMixin):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del image_grid_thw, kwargs
-        if get_parallel_state().sp_size > 1:
+        ps = get_parallel_state()
+        if ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
+            # Shard handoff: the merged tokens are this rank's window, so each
+            # item takes its intersection with that window and the backbone
+            # concatenates them straight into its own row. Nothing is gathered.
+            carrier = self._conversation_carrier
+            output_slots = self._visual_output_slots
+            self._conversation_carrier = None
+            self._visual_output_slots = None
+            self._sp_own_len = None
+            scatter_qwen3omni_visual_embeds(
+                output_slots,
+                image_embeds,
+                deepstack_features,
+                sp_rank=ps.sp_rank,
+                sp_size=ps.sp_size,
+            )
+            return {"conversation_list": carrier}
+        if ps.sp_size > 1:
             # SP output-gather: all-gather Ulysses shards of merged tokens (+
             # deepstack) back to the full sequence (autograd-aware; backward sums
             # grads across the SP group), then drop the sp-pad tail.
-            group = get_parallel_state().sp_group
+            group = ps.sp_group
 
             def _gather(tensor: torch.Tensor) -> torch.Tensor:
                 tensor = gather_outputs(tensor, gather_dim=0, group=group)

@@ -123,15 +123,30 @@ def scatter_qwen3omni_visual_embeds(
     output_slots: List[_VisualOutputSlot],
     embeds: torch.Tensor,
     deepstack_features: List[torch.Tensor],
+    *,
+    sp_rank: int = 0,
+    sp_size: int = 1,
 ) -> None:
     """Scatter merged ViT tokens back onto conversation items.
 
     ``second_per_grid`` is deliberately left untouched: the CPU preprocessor set
     it and the backbone still needs it after this.
+
+    With ``sp_size > 1`` the tensors hold this rank's window only, so each item
+    receives its intersection with that window (:func:`split_sp_sharded_tensor`)
+    instead of a whole span. That is the ``skip_sp_gather_between_modules``
+    handoff: the backbone concatenates these per-item slices straight into its
+    own row, so nothing is gathered on the way in.
     """
     sizes = [slot.num_merged for slot in output_slots]
-    embeds_split = torch.split(embeds, sizes, dim=0)
-    deepstack_split = [torch.split(layer, sizes, dim=0) for layer in deepstack_features]
+    if sp_size > 1:
+        from ...base.sp_shard import split_sp_sharded_tensor
+
+        embeds_split = split_sp_sharded_tensor(embeds, sizes, sp_rank, sp_size)
+        deepstack_split = [split_sp_sharded_tensor(layer, sizes, sp_rank, sp_size) for layer in deepstack_features]
+    else:
+        embeds_split = torch.split(embeds, sizes, dim=0)
+        deepstack_split = [torch.split(layer, sizes, dim=0) for layer in deepstack_features]
     for index, slot in enumerate(output_slots):
         slot.item.value = embeds_split[index]
         slot.item.meta["grid_thw"] = slot.grid
@@ -183,6 +198,10 @@ class Qwen3OmniVisionEncoder(InferenceMixin, PretrainedOmniModule):
     preprocessor_class = Qwen3OmniVisionPreprocessor
     base_model_prefix = "qwen3omni_vision"
     main_input_name = "pixel_values"
+    # Merged tokens are a plain per-item concatenation of the carrier, so
+    # ``forward_post`` can write this rank's window back item by item — the same
+    # contract the qwen3-vl tower implements.
+    supports_sp_sharded_handoff = True
     _no_split_modules = ["Qwen3OmniMoeVisionBlock"]
     supports_gradient_checkpointing = True
 

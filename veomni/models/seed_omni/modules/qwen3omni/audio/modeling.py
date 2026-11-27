@@ -68,6 +68,10 @@ class Qwen3OmniAudioEncoder(InferenceMixin, PretrainedOmniModule):
     preprocessor_class = Qwen3OmniAudioPreprocessor
     base_model_prefix = "qwen3omni_audio"
     main_input_name = "input_features"
+    # The tower's output rows are a plain per-clip concatenation, and each clip's
+    # output length is derivable from its mel length, so ``forward_post`` can hand
+    # the backbone this rank's window item by item.
+    supports_sp_sharded_handoff = True
     _no_split_modules = ["Qwen3OmniMoeAudioEncoderLayer"]
     supports_gradient_checkpointing = True
 

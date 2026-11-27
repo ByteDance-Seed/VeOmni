@@ -49,6 +49,7 @@ from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG
 from veomni.models.seed_omni.accelerated.utils.executor import TrainNodeRunner
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
+from veomni.models.seed_omni.modules.base.sp_shard import sp_local_len, sp_valid_in_window
 from veomni.models.seed_omni.modules.qwen3omni.hf_layout import QWEN3OMNI_HF_LAYOUT
 from veomni.models.seed_omni.modules.qwen3omni.text_encoder.chat_template import Qwen3OmniChatTemplate
 from veomni.models.seed_omni.modules.qwen3omni.text_encoder.configuration import Qwen3OmniTextEncoderConfig
@@ -418,6 +419,15 @@ def _run_alignment_matrix(
     sp2_ps = _init_parallel_state(
         dp_size=1, dp_shard_size=1, ulysses_size=world, dp_mode="fsdp2", device_type=device_type, name="sp2"
     )
+    sp2_skip_ps = _init_parallel_state(
+        dp_size=1,
+        dp_shard_size=1,
+        ulysses_size=world,
+        dp_mode="fsdp2",
+        device_type=device_type,
+        skip_sp_gather_between_modules=True,
+        name="sp2_skip_gather",
+    )
     _init_parallel_state(dp_size=world, ulysses_size=1, dp_mode="ddp", device_type=device_type, name="ref_sp1")
 
     shard_extra = {"mp_policy": mp_policy} if mp_policy is not None else {}
@@ -437,9 +447,16 @@ def _run_alignment_matrix(
     # leaves the term comparable, so that is the mode where the router is checked
     # on its own. SP=1 with the objective on is covered too, but only for values
     # that stay comparable — see the note at the comparison below.
+    #
+    # ``sp2_skip_gather`` runs the same SP=2 batch through the shard handoff
+    # instead of the gather: every producer writes only this rank's window onto
+    # the carrier and the backbone concatenates from there. It has to match the
+    # gathering path exactly, which is the only thing that makes the cheaper
+    # handoff safe to turn on.
     modes = [
         (1, "sp1", sp1_ps, False),
         (2, "sp2", sp2_ps, True),
+        (2, "sp2_skip_gather", sp2_skip_ps, True),
     ]
     for attn_impl in attn_impls:
         for sp_size, ps_name, ps, router in modes:
@@ -479,8 +496,16 @@ def _run_alignment_matrix(
                     local_convs = all_convs
 
                 loss = _run_qwen3omni_graph_step(te, llm, local_convs)
-                expected_rows = sum(int(item.meta["labels"].numel()) for conv in local_convs for item in conv)
-                assert sum(item.value.size(0) for conv in local_convs for item in conv) == expected_rows
+                if ps.skip_sp_gather_between_modules:
+                    # Shard handoff: every value on the carrier holds only this
+                    # rank's window, so the row total is the window's real rows —
+                    # not the full span, which is what the gathering modes leave.
+                    rows = sum(item.value.size(0) for conv in local_convs for item in conv)
+                    assert rows == sp_valid_in_window(7, rank, ps.sp_size), (ps_name, rank, rows)
+                    assert sp_local_len(7, ps.sp_size) == 4
+                else:
+                    expected_rows = sum(int(item.meta["labels"].numel()) for conv in local_convs for item in conv)
+                    assert sum(item.value.size(0) for conv in local_convs for item in conv) == expected_rows
                 loss.backward()
 
                 omni_grads = _collect_omni_as_source_dict(te, llm, grads=True)
@@ -603,7 +628,7 @@ def test_qwen3omni_thinker_graph_matches_monolithic_under_fsdp2_and_sp(tmp_path:
     )
     for rank in range(2):
         reports = json.loads((out_dir / f"rank{rank}.json").read_text(encoding="utf-8"))
-        assert set(reports) == {"sp1", "sp2_router"}
+        assert set(reports) == {"sp1", "sp2_router", "sp2_skip_gather_router"}
         for mode, report in reports.items():
             assert report["loss_match"], (rank, mode, report)
             assert not report["grad_mismatches"], (rank, mode, report)

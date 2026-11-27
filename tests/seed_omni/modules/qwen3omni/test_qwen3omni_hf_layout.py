@@ -434,6 +434,10 @@ def test_the_gather_keeps_its_length_until_the_loss_has_run():
         ) as ps:
             ps.return_value.sp_size = 2
             ps.return_value.sp_group = object()
+            # This case exercises the gathering path, so the run-wide shard
+            # handoff is off. It has to be stated: ``ParallelState`` is mocked
+            # here, and an unset attribute on a ``MagicMock`` is truthy.
+            ps.return_value.skip_sp_gather_between_modules = False
             # `forward_pre` stores these; the ordering bug is what cleared the
             # router one too early.
             module._sp_own_len = ROWS

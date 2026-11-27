@@ -18,6 +18,8 @@ from .......distributed.parallel_plan import ParallelPlan
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
+from ....base.llm_packing import item_token_len
+from ....base.sp_shard import pad_sp_shard, split_sp_sharded_tensor
 from ...carrier import is_thinker_input, scatter_hidden_states
 from ..configuration import Qwen3OmniLlmConfig
 from ..modeling import (
@@ -58,11 +60,17 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        ps = get_parallel_state()
+        sharded = ps.sp_size > 1 and ps.skip_sp_gather_between_modules
+        # ``sharded`` means the producers handed this rank their windows, so the
+        # packed embeds are already this rank's row and the lengths/positions come
+        # from ``meta``. Everything else is the same packer.
         packed = pack_qwen3omni_conversations_for_forward(
             conversation_list,
             self.device,
             self._spatial_merge_size,
             self.config.position_id_per_seconds,
+            sharded=sharded,
         )
         inputs_embeds = packed["inputs_embeds"]
 
@@ -79,31 +87,43 @@ class TrainingMixin(TrainingModuleMixin):
             inputs_embeds, packed["visual_pos_masks"], packed["deepstack_visual_embeds"]
         )
 
-        if get_parallel_state().sp_size > 1:
-            # SP input-slice: slice the (replicated) packed sample to this rank's
-            # Ulysses shard, including the TMRoPE positions and DeepStack rows. Pad the
-            # sample to a multiple of ``sp_size``, extend the full-sample varlen
-            # ``cu_seqlens`` with the pad tail (the attention all-to-all reconstructs
-            # the full sequence before the kernel), then hand this rank only its
-            # ``1/sp_size`` chunk of embeds (dim 1), 3-row positions (dim 2) and
-            # ``visual_pos_masks`` (dim 1). The DeepStack embeds are indexed by visual
-            # position, so slice out exactly the rows whose visual tokens fall in this
-            # rank's chunk (``n_before`` skipped + ``k_local`` kept).
-            ps = get_parallel_state()
+        if ps.sp_size > 1:
+            # SP: hand this rank its Ulysses shard of the packed sample, including
+            # the TMRoPE positions and DeepStack rows. Pad the sample to a multiple
+            # of ``sp_size``, extend the full-sample varlen ``cu_seqlens`` with the
+            # pad tail (the attention all-to-all reconstructs the full sequence
+            # before the kernel), then hand this rank only its ``1/sp_size`` chunk
+            # of embeds (dim 1), 3-row positions (dim 2) and ``visual_pos_masks``
+            # (dim 1). The DeepStack embeds are indexed by visual position, so slice
+            # out exactly the rows whose visual tokens fall in this rank's chunk
+            # (``n_before`` skipped + ``k_local`` kept).
+            #
+            # ``sharded`` changes what "this rank's chunk" means for the embeds
+            # only: the producers already wrote their windows onto the carrier, so
+            # ``inputs_embeds`` *is* the shard and must not be sliced a second time.
+            # Padding restores the window width the attention gathers to. The
+            # metadata is built over the full row either way, so it is padded and
+            # sliced in both modes.
             group, sp_size, sp_rank = ps.sp_group, ps.sp_size, ps.sp_rank
 
-            self._sp_own_len = inputs_embeds.size(1)
+            full_len = sum(
+                item_token_len(item) for sample in conversation_list for item in sample if not item.is_dummy
+            )
+            self._sp_own_len = full_len
             # Same length, but tracked apart from ``_sp_own_len``: the router loss
             # gathers its own tensor set and is consumed before the hidden-state
             # gather, so sharing one field would have them clobber each other.
-            self._sp_router_own_len = inputs_embeds.size(1)
+            self._sp_router_own_len = full_len
             cu = packed["cu_seq_lens"]
             max_length = int((cu[1:] - cu[:-1]).max().item()) if cu.numel() > 1 else 0
 
-            embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
+            if sharded:
+                embeds = pad_sp_shard(inputs_embeds, full_len, sp_size, dim=1)
+            else:
+                embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
             pids = sp_pad(packed["position_ids"], dim=2, pad_value=0)
             mask = sp_pad(visual_pos_masks, dim=1, pad_value=0)
-            padded_len = embeds.size(1)
+            padded_len = pids.size(2)
             pad_len = padded_len - self._sp_own_len
             if pad_len > 0:
                 tail = torch.tensor([padded_len], dtype=cu.dtype, device=cu.device)
@@ -112,7 +132,8 @@ class TrainingMixin(TrainingModuleMixin):
 
             unit = padded_len // sp_size
             n_before = int(mask[:, : unit * sp_rank].sum().item())
-            embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
+            if not sharded:
+                embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
             pids = slice_input_tensor(pids, dim=2, padding=False, group=group)
             mask = slice_input_tensor(mask, dim=1, padding=False, group=group)
             if deepstack_visual_embeds is not None:
@@ -189,7 +210,40 @@ class TrainingMixin(TrainingModuleMixin):
         outputs.pop("router_attention_mask", None)
         traces = self._thinker_traces(outputs)
 
-        if get_parallel_state().sp_size > 1:
+        ps = get_parallel_state()
+        sharded = ps.sp_size > 1 and ps.skip_sp_gather_between_modules
+        if sharded:
+            # Shard handoff: this rank keeps its own window and the consumer (the
+            # next module's packer, or ``decode``'s label slice) concatenates from
+            # the carrier. The traces follow the same split so they stay aligned
+            # with the hidden states the talker pairs them against.
+            conversation = self._conversation_carrier
+            pack_shape = self._pack_inputs_embeds_shape
+            self._conversation_carrier = None
+            self._pack_inputs_embeds_shape = None
+            self._sp_own_len = None
+            window_lengths = [item_token_len(item) for sample in conversation for item in sample if not item.is_dummy]
+            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                hidden_states = hidden_states.squeeze(0)
+            scatter_hidden_states(
+                conversation,
+                split_sp_sharded_tensor(hidden_states, window_lengths, ps.sp_rank, ps.sp_size),
+            )
+            if traces:
+                embed_trace, hidden_trace = (_unbatch(t).squeeze(0) for t in traces[:2])
+                _scatter_thinker_trace_slices(
+                    conversation,
+                    split_sp_sharded_tensor(embed_trace, window_lengths, ps.sp_rank, ps.sp_size),
+                    split_sp_sharded_tensor(hidden_trace, window_lengths, ps.sp_rank, ps.sp_size),
+                )
+            result: Dict[str, Any] = {"conversation_list": conversation}
+            # Cleared *after* the router loss has consumed the length, the same
+            # ordering the gathering path uses below.
+            result = self._with_router_loss(result, router_logits, conversation)
+            self._sp_router_own_len = None
+            return result
+
+        if ps.sp_size > 1:
             # SP output-gather: all-gather Ulysses shards back to the full sequence
             # (autograd-aware; backward sums grads across the SP group), then strip
             # the SP pad tail so the packed length matches its carrier below.
@@ -212,6 +266,24 @@ class TrainingMixin(TrainingModuleMixin):
             _scatter_thinker_traces(conversation, *(unflatten(_unbatch(t), pack_shape) for t in traces))
 
         result: Dict[str, Any] = {"conversation_list": conversation}
+        # Cleared only after every consumer has run: ``_full_sequence_router_logits``
+        # needs it, and it is read *after* the block above cleared the others.
+        # Clearing it up there left `None` reaching `.narrow(..., None)`.
+        result = self._with_router_loss(result, router_logits, conversation)
+        self._sp_router_own_len = None
+        return result
+
+    def _with_router_loss(
+        self,
+        result: Dict[str, Any],
+        router_logits: Any,
+        conversation: list[list[ConversationItem]],
+    ) -> Dict[str, Any]:
+        """Attach the router-balancing term, if this run collects router logits.
+
+        Shared by the gathering and the shard-handoff exits, so the two cannot
+        drift on the coefficient or on which tensor the objective sees.
+        """
         if router_logits is not None:
             # ``OmniModel.forward`` sums every node's ``_loss``, so a mid-graph
             # module contributes by returning one. Without this the objective was
@@ -225,10 +297,6 @@ class TrainingMixin(TrainingModuleMixin):
                 coefficient = getattr(cfg, "router_aux_loss_coef", 0.0)
                 device = conversation[0][0].value.device
                 result["_loss"] = aux_loss.to(device=device) * coefficient
-        # Cleared only after every consumer has run: ``_full_sequence_router_logits``
-        # needs it, and it is read *after* the block above cleared the others.
-        # Clearing it up there left `None` reaching `.narrow(..., None)`.
-        self._sp_router_own_len = None
         return result
 
     def _full_sequence_router_logits(self, router_logits: Any) -> Any:
@@ -285,6 +353,27 @@ class TrainingMixin(TrainingModuleMixin):
                 f"the checkpoint split copies the index from talker_config.accept_hidden_layer."
             )
         return (all_hidden_states[0].detach(), all_hidden_states[accept].detach())
+
+
+def _scatter_thinker_trace_slices(
+    conversation: list[list[ConversationItem]],
+    embed_slices: list[torch.Tensor],
+    hidden_slices: list[torch.Tensor],
+) -> None:
+    """Leave each item's window slice of both traces on the item, in carrier order.
+
+    The shard-handoff counterpart of :func:`_scatter_thinker_traces`: the walk and
+    the order are identical (``is_thinker_input`` items only, paired by position),
+    but each item receives the intersection of its span with this rank's window.
+    """
+    embed_iterator = iter(embed_slices)
+    hidden_iterator = iter(hidden_slices)
+    for sample in conversation:
+        for part in sample:
+            if not is_thinker_input(part):
+                continue
+            part.meta[THINKER_EMBED] = next(embed_iterator)
+            part.meta[THINKER_HIDDEN] = next(hidden_iterator)
 
 
 class VeOmniMixin(BaseMixin, TrainingMixin):
