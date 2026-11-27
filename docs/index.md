@@ -76,6 +76,7 @@ examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
 examples/minimax_h3_smoke_test.md
+examples/minimax_m3_vl.md
 examples/minimax_h3_image.md
 examples/hunyuanvideo15.md
 examples/wan2.1.md

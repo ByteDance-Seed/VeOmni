@@ -119,7 +119,7 @@ class VisionPreprocessor(ModulePreprocessorBase):
 | Function | Called by | Effect |
 |----------|-----------|--------|
 | [`ModulePreprocessorBase.__call__(batch, inference=False, **kwargs)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L85) | [`OmniProcessor.preprocess_batch`](../../../veomni/models/seed_omni/processing_omni.py#L239) | By default, delegates `batch["conversation_list"]` to `preprocess_conversations` in `config.module_names` order. Packed preprocessors may override this path. |
-| [`bind_module_assets(model, *, checkpoint_path=None, preprocessor=None, config_overrides=None)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L128) | [`PretrainedOmniModule.from_pretrained`](../../../veomni/models/seed_omni/modules/module_modeling_base.py#L32) and [`ModuleRuntime._build_model_assets`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L361) | Copies CPU asset attributes (`_processor`, `_image_processor`, `_video_processor`, `_tokenizer`, `_chat_template`) from the preprocessor onto `model` if not already set, so `generate()` and HF checkpoint export can access them. |
+| [`bind_module_assets(model, *, checkpoint_path=None, preprocessor=None, config_overrides=None)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L128) | [`PretrainedOmniModule.from_pretrained`](../../../veomni/models/seed_omni/modules/module_modeling_base.py#L32) and [`ModuleRuntime._build_model_assets`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L393) | Copies CPU asset attributes (`_processor`, `_image_processor`, `_video_processor`, `_tokenizer`, `_chat_template`) from the preprocessor onto `model` if not already set, so `generate()` and HF checkpoint export can access them. |
 
 ## Call flow
 
@@ -129,8 +129,8 @@ class VisionPreprocessor(ModulePreprocessorBase):
   - When `train.dyn_bsz: true`, [`get_length_fn`](../../../veomni/data/dataset.py#L444) (`count_mode="total"` and `physical_token_cap`, including `is_dummy=True` items) and [`get_length_by_labels_fn`](../../../veomni/data/dataset.py#L480) (`count_mode="effective"`, excluding `is_dummy=True` items) read those metadata fields to batch samples by token budget, and [`SeedOmniCollator.__call__`](../../../veomni/data/seed_omni/collator.py#L102) groups the selected sample dicts into a micro-batch.
   - **Packed training exception**: Qwen3-VL can enable `packed_preprocess`; its text preprocessor consumes `conversation_list` and emits packed tensors. `OmniProcessor.preprocess` retains the resulting batch dict, and `SeedOmniCollator` concatenates its packed tensors and reconstructs sample boundaries.
 - **Inference request**:
-  - [`OmniInferencer._build_model`](../../../veomni/trainer/omni/omni_inferencer.py#L120) builds [`OmniProcessor.from_config`](../../../veomni/models/seed_omni/processing_omni.py#L109).
-  - [`OmniInferencer._run`](../../../veomni/trainer/omni/omni_inferencer.py#L237) calls [`OmniProcessor.__call__(..., inference=True)`](../../../veomni/models/seed_omni/processing_omni.py#L167) → [`OmniProcessor.preprocess`](../../../veomni/models/seed_omni/processing_omni.py#L216) → [`OmniProcessor.preprocess_batch(..., inference=True)`](../../../veomni/models/seed_omni/processing_omni.py#L239).
+  - [`OmniInferencer._build_model`](../../../veomni/trainer/omni/omni_inferencer.py#L126) builds [`OmniProcessor.from_config`](../../../veomni/models/seed_omni/processing_omni.py#L109).
+  - [`OmniInferencer._run`](../../../veomni/trainer/omni/omni_inferencer.py#L243) calls [`OmniProcessor.__call__(..., inference=True)`](../../../veomni/models/seed_omni/processing_omni.py#L167) → [`OmniProcessor.preprocess`](../../../veomni/models/seed_omni/processing_omni.py#L216) → [`OmniProcessor.preprocess_batch(..., inference=True)`](../../../veomni/models/seed_omni/processing_omni.py#L239).
 
 ## Rules an implementation must follow
 

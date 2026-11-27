@@ -950,6 +950,71 @@ def test_wan_eager_matches_reference():
     assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize("seqlen", (1, 16))
+def test_wan_eager_real_pair_matches_complex_reference(seqlen: int):
+    torch.manual_seed(0)
+    head_dim = 64
+    heads = 4
+    x = torch.randn(2, seqlen, heads, head_dim, dtype=torch.float32, requires_grad=True)
+    angle = torch.randn(seqlen, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle)
+    freqs_cos = freqs.real.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    freqs_sin = freqs.imag.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+
+    x_h = x.detach().reshape(2, seqlen, heads * head_dim).requires_grad_(True)
+    out_h = _wan_reference_rope_apply(x_h, freqs, head_dim)
+
+    x_e = x.detach().requires_grad_(True)
+    out_e = resolve_op("rope", "wan", "eager").wrapper(x_e, (freqs_cos, freqs_sin), head_dim=head_dim)
+    assert out_e.shape == (2, seqlen, heads * head_dim)
+    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = torch.randn_like(out_e)
+    out_h.backward(go)
+    out_e.backward(go)
+    assert torch.allclose(x_e.grad.reshape_as(x_h.grad), x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+@pytest.mark.parametrize("seqlen", (1, 16))
+def test_wan_npu_real_pair_backward_stays_real(monkeypatch, seqlen: int):
+    from veomni.ops.kernels.rope.wan import torch_npu as wan_npu
+
+    def fail_complex(*_args, **_kwargs):
+        raise AssertionError("real-pair NPU RoPE must not construct a complex frequency table")
+
+    torch.manual_seed(0)
+    head_dim = 64
+    heads = 4
+    x = torch.randn(2, seqlen, heads, head_dim, dtype=torch.float32)
+    angle = torch.randn(seqlen, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle)
+    freqs_cos = freqs.real.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    freqs_sin = freqs.imag.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    x_e = x.detach().requires_grad_(True)
+    out_e = resolve_op("rope", "wan", "eager").wrapper(x_e, (freqs_cos, freqs_sin), head_dim=head_dim)
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
+
+    monkeypatch.setattr(wan_npu.torch, "complex", fail_complex)
+    saved_cos, saved_sin = wan_npu._saved_real_pair((freqs_cos, freqs_sin))
+    assert saved_cos.dtype == torch.float32
+    assert saved_sin.dtype == torch.float32
+    assert not torch.is_complex(saved_cos)
+    assert saved_cos.shape == (seqlen, 1, head_dim // 2)
+
+    dx = wan_npu._real_pair_dx(grad_output, saved_cos, saved_sin, head_dim, tuple(x.shape))
+    assert dx.shape == x.shape
+    assert torch.allclose(dx, x_e.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+    empty = torch.empty(2, 0, heads, head_dim)
+    empty_out, saved = wan_npu.forward(empty, (freqs_cos, freqs_sin), head_dim=head_dim)
+    assert empty_out.shape == empty.shape
+    assert all(not torch.is_complex(tensor) for tensor in saved.tensors)
+    restored, grad_freqs = wan_npu.backward(empty_out, saved)
+    assert restored.shape == empty.shape
+    assert grad_freqs is None
+
+
 @pytest.mark.parametrize(
     ("seqlen", "head_dim"),
     (
@@ -982,6 +1047,29 @@ def test_wan_triton_preserves_singleton_frequency_axes(monkeypatch, seqlen: int,
     torch.testing.assert_close(grad_x, grad_output)
     assert grad_freqs is None
     assert conjugate_calls == [False, True]
+
+
+def test_wan_triton_real_pair_preserves_sequence_axis(monkeypatch):
+    from veomni.ops.kernels.rope.wan import triton as wan_triton
+
+    seqlen = 1
+    head_dim = 8
+    seen: list[tuple[int, ...]] = []
+
+    def record_launch(shaped: Tensor, cos: Tensor, sin: Tensor, *, conjugate: bool = False) -> Tensor:
+        seen.append(tuple(cos.shape))
+        assert sin.shape == cos.shape
+        return shaped
+
+    monkeypatch.setattr(wan_triton, "apply_rotary_interleaved", record_launch)
+    x = torch.randn(2, seqlen, 4 * head_dim)
+    angle = torch.randn(seqlen, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle)
+    freqs_cos = freqs.real.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    freqs_sin = freqs.imag.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+
+    wan_triton.forward(x, (freqs_cos, freqs_sin), head_dim=head_dim)
+    assert seen == [(seqlen, head_dim // 2)]
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Wan Triton RoPE needs a GPU")
@@ -1035,3 +1123,79 @@ def test_wan_npu_matches_eager():
     out_e.backward(go)
     out_o.backward(go)
     assert torch.allclose(x_e.grad.float(), x_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
+
+
+def test_host_default_torch_npu_rope_accepts_cpu_tensors(monkeypatch):
+    """Full and partial NPU defaults must keep CPU activations on eager."""
+    from veomni.ops.kernels.rope.full import eager as full_eager
+    from veomni.ops.kernels.rope.full import torch_npu as full_npu
+    from veomni.ops.kernels.rope.partial import eager as partial_eager
+    from veomni.ops.kernels.rope.partial import torch_npu as partial_npu
+
+    def reject_fused(*args, **kwargs):
+        raise AssertionError("npu_rotary_mul ran on a CPU tensor")
+
+    try:
+        import torch_npu
+    except ImportError:
+        pass
+    else:
+        monkeypatch.setattr(torch_npu, "npu_rotary_mul", reject_fused)
+
+    torch.manual_seed(0)
+    q = torch.randn(2, 2, 4, 8)
+    k = torch.randn(2, 2, 4, 8)
+    grad_q = torch.randn_like(q)
+    grad_k = torch.randn_like(k)
+    cases = (
+        (full_npu, full_eager, torch.randn(2, 4, 8), torch.randn(2, 4, 8)),
+        (partial_npu, partial_eager, torch.randn(2, 4, 4), torch.randn(2, 4, 4)),
+    )
+    for fused, eager, cos, sin in cases:
+        (ref_q, ref_k), ref_saved = eager.forward(q, k, cos, sin)
+        (out_q, out_k), saved = fused.forward(q, k, cos, sin)
+        torch.testing.assert_close(out_q, ref_q)
+        torch.testing.assert_close(out_k, ref_k)
+        ref_grads = eager.backward((grad_q, grad_k), ref_saved)
+        grads = fused.backward((grad_q, grad_k), saved)
+        torch.testing.assert_close(grads[0], ref_grads[0])
+        torch.testing.assert_close(grads[1], ref_grads[1])
+
+        empty = torch.empty(0, 2, 4, 8)
+        (empty_q, empty_k), empty_saved = fused.forward(empty, empty, cos, sin)
+        assert empty_q.shape == empty.shape
+        assert empty_k.shape == empty.shape
+        empty_grads = fused.backward((torch.empty_like(empty_q), torch.empty_like(empty_k)), empty_saved)
+        assert empty_grads[0].shape == empty.shape
+        assert empty_grads[1].shape == empty.shape
+
+
+def _npu_ready() -> bool:
+    return bool(IS_NPU_AVAILABLE and torch.npu.is_available())
+
+
+@pytest.mark.skipif(not _npu_ready(), reason="NPU Wan RoPE needs an available NPU")
+def test_wan_npu_real_pair_matches_eager():
+    eager = resolve_op("rope", "wan", "eager").wrapper
+    other = resolve_op("rope", "wan", "torch_npu").wrapper
+    torch.manual_seed(0)
+    head_dim = 64
+    heads = 4
+    seqlen = 16
+    x = torch.randn(2, seqlen, heads, head_dim, dtype=torch.bfloat16)
+    angle = torch.randn(seqlen, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle)
+    freqs_cos = freqs.real.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    freqs_sin = freqs.imag.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+
+    x_e = x.detach().requires_grad_(True)
+    out_e = eager(x_e, (freqs_cos, freqs_sin), head_dim=head_dim)
+    x_o = x.to("npu").detach().requires_grad_(True)
+    out_o = other(x_o, (freqs_cos.to("npu"), freqs_sin.to("npu")), head_dim=head_dim)
+    assert out_o.shape == out_e.shape
+    assert torch.allclose(out_o.float().cpu(), out_e.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
+
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
+    out_o.backward(grad_output.to("npu"))
+    assert torch.allclose(x_o.grad.float().cpu(), x_e.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)

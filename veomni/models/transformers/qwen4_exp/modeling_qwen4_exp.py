@@ -85,7 +85,6 @@ from veomni.ops import VeomniOp
 from veomni.ops.kernels.gated_delta_rule import GROUPED_VALUE_HEAD_IMPLS
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 from veomni.utils.seqlen_pos_transform_utils import pos2culen
@@ -979,6 +978,7 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.veomni_rope = VeomniOp("rope", "partial", config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_qsa_indexer = VeomniOp("qsa_indexer", "standard", config.ops_config.qsa_indexer_implementation)
 
     def forward(
         self,
@@ -1109,15 +1109,7 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                     block_starts[None, None] + self.compress_ratio - 1
                     <= query_positions[None, query_start:query_end, None]
                 )
-                # NPU TopKV2 faults on sparse -inf rows (ReLU scores >= 0).
-                mask_fill_value = -1.0 if IS_NPU_AVAILABLE else float("-inf")
-                scores = scores.masked_fill(~visible, mask_fill_value)
-                top_blocks = scores.topk(top_count, dim=-1).indices
-                top_valid = (
-                    visible.to(torch.int8).gather(-1, top_blocks).bool()
-                    if hidden_states.device.type == "npu"
-                    else visible.gather(-1, top_blocks)
-                )
+                top_blocks, top_valid = self.veomni_qsa_indexer(scores, visible, top_count)
                 selected_starts = block_starts[top_blocks].to(torch.int32)
                 selected_chunk = selected_starts[..., None] + block_offsets
                 selected_chunks.append(selected_chunk.masked_fill(~top_valid[..., None], -1).flatten(-2))

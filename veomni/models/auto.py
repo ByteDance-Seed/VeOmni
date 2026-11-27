@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import functools
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -26,11 +25,11 @@ from transformers import (
     PreTrainedModel,
 )
 
+from veomni.distributed.context_parallel.support import check_cp_platform_support
 from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from veomni.models.loader import get_loader
 from veomni.models.registry import get_model_config, get_model_processor
 from veomni.utils import logging
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 if TYPE_CHECKING:
@@ -81,38 +80,6 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
         validate()
 
 
-#: DSA implementations that can serve CP's geometry on Ascend. Both CANN adapters
-#: take CP's local-query/global-KV layout without recomputation: sparse attention
-#: narrows the replicated KV buffer to the prefix the kernel assumes, and the
-#: indexer narrows the compressed table to the local prefix and lets the kernel's
-#: ``kv_len - q_len`` row inference number the shard's queries from their global
-#: rows. A packed indexer batch runs one BSND call per packed sample that
-#: intersects the shard, because the global slices cannot feed the TND path a
-#: local query shard; the sparse attention adapter makes the same per-sample split.
-_NPU_CP_DSA_IMPLEMENTATIONS = {
-    "dsa_indexer_implementation": frozenset({"eager", "cann"}),
-    "dsa_attention_implementation": frozenset({"eager", "cann"}),
-}
-
-
-def _check_deepseek_v4_npu_dsa_ops(config: PretrainedConfig) -> None:
-    """Refuse an Ascend CP run whose DSA operators cannot serve CP's geometry."""
-    # Read both levels directly: this gate runs on the builder's adapted config, which
-    # always has ``ops_config``, and every selection resolves to a dataclass default.
-    # A gate on an allow-list must fail closed, so a missing tree or field raises here
-    # instead of admitting a config whose ops selections could not be judged.
-    ops_config = config.ops_config
-    for field, implementations in _NPU_CP_DSA_IMPLEMENTATIONS.items():
-        implementation = getattr(ops_config, field)
-        if implementation not in implementations:
-            allowed = " or ".join(sorted(implementations))
-            raise NotImplementedError(
-                f"Context parallelism on Ascend/NPU requires {field} to be {allowed}; got {implementation!r}. "
-                "The CANN implementations serve CP's local-query/global-KV layout; set it in "
-                "configs/text/deepseek_v4_npu.yaml, or set cp_size=1."
-            )
-
-
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
     """Raise unless this model type implements context parallelism.
 
@@ -128,25 +95,14 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
-    # deepseek_v4's context parallelism is validated on Ascend; every other model
-    # stays GPU-only.
-    if IS_NPU_AVAILABLE:
-        if getattr(config, "model_type", None) != "deepseek_v4":
-            raise NotImplementedError(
-                "Context parallelism is GPU-only in this release except for deepseek_v4; "
-                "set cp_size=1 on Ascend/NPU runs."
-            )
-
-        _check_deepseek_v4_npu_dsa_ops(config)
+    check_cp_platform_support(config)
 
     from .seed_omni.modules.module_configuration_base import OmniModuleConfig
 
     if isinstance(config, OmniModuleConfig):
-        if getattr(config, "_supports_context_parallel", False):
-            return
         inner_config = getattr(config, "text_config", None) or getattr(config, "vision_config", None)
         inner_model_type = getattr(inner_config, "model_type", None)
-        if inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
+        if getattr(config, "_supports_context_parallel", False) or inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
             return
 
     model_type = getattr(config, "model_type", None)
@@ -342,22 +298,6 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
-
-    if IS_NPU_AVAILABLE:
-        logger.info_rank0(
-            "We override the model’s forward method on NPU devices to ensure that the FA kwargs are on CPU, since the npu_fused_attention requires cpu FA kwargs"
-        )
-        original_forward = model.forward
-
-        @functools.wraps(original_forward)
-        def wrapped_forward(*args, **kwargs):
-            if "cu_seq_lens_q" in kwargs and kwargs["cu_seq_lens_q"] is not None:
-                kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_q"].cpu()
-            if "cu_seq_lens_k" in kwargs and kwargs["cu_seq_lens_k"] is not None:
-                kwargs["cu_seq_lens_k"] = kwargs["cu_seq_lens_k"].cpu()
-            return original_forward(*args, **kwargs)
-
-        model.forward = wrapped_forward
 
     assert not getattr(model, "use_kernels", False), (
         "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "

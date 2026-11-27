@@ -563,6 +563,21 @@ def test_glm_cudnn_indexer_adapter_delegates_to_dsa_vendor(monkeypatch):
     )
 
 
+def test_dense_sparse_attn_detaches_requested_lse():
+    from veomni.ops.kernels.dsa.attention.deepseek_v4.eager import dense_sparse_attn
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 2, 2, 4, requires_grad=True)
+    kv = torch.randn(1, 3, 4, requires_grad=True)
+    sink = torch.zeros(2)
+    topk_idxs = torch.tensor([[[0, 1], [1, 2]]], dtype=torch.int32)
+    out, lse = dense_sparse_attn(q, kv, sink, topk_idxs, return_lse=True)
+    assert out.requires_grad
+    assert not lse.requires_grad
+    out.sum().backward()
+    assert q.grad is not None and kv.grad is not None
+
+
 def test_dsa_attention_deepseek_v4_eager_matches_hf():
     """Eager sparse MQA matches HF ``eager_attention_forward`` plus sink."""
     torch.manual_seed(0)
