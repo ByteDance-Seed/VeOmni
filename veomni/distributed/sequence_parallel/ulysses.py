@@ -71,26 +71,26 @@ def _all_gather_into_tensor(
     return output
 
 
-def _all_to_all(
-    local_input: Tensor,
-    scatter_dim: int,
-    gather_dim: int,
-    group: Optional[dist.ProcessGroup] = None,
-    async_op: bool = False,
-):
-    group = get_ulysses_sequence_parallel_group() if group is None else group
-    seq_world_size = dist.get_world_size(group)
-    input_list = [t.contiguous() for t in torch.tensor_split(local_input, seq_world_size, scatter_dim)]
-    output_list = [torch.empty_like(input_list[0]) for _ in range(seq_world_size)]
-    comm = dist.all_to_all(output_list, input_list, group=group, async_op=async_op)
-    if async_op:
+def _normalize_dim(dim: int, rank: int) -> int:
+    """Return a positive dimension index."""
+    resolved = dim + rank if dim < 0 else dim
+    if resolved < 0 or resolved >= rank:
+        raise IndexError(f"Dimension {dim} is out of range for rank {rank}")
+    return resolved
 
-        def wait():
-            comm.wait()
-            return torch.cat(output_list, dim=gather_dim).contiguous()
 
-        return wait
-    return torch.cat(output_list, dim=gather_dim).contiguous()
+def _permute_scatter_gather_to_front(x: Tensor, scatter_dim: int, gather_dim: int) -> tuple[Tensor, tuple[int, ...]]:
+    """Move ``scatter_dim`` to 0 and ``gather_dim`` to 1.
+
+    The returned inverse permutation restores the original dimension order.
+    """
+    if scatter_dim == gather_dim:
+        raise ValueError(f"scatter_dim and gather_dim must differ, got {scatter_dim}")
+    order = [scatter_dim, gather_dim, *(dim for dim in range(x.ndim) if dim not in (scatter_dim, gather_dim))]
+    inverse = [0] * x.ndim
+    for new_dim, old_dim in enumerate(order):
+        inverse[old_dim] = new_dim
+    return x.permute(order), tuple(inverse)
 
 
 def _all_to_all_single(
@@ -166,10 +166,26 @@ def all_to_all_tensor(
     group: dist.ProcessGroup,
     async_op: bool = False,
 ):
+    """Exchange ``scatter_dim`` and concatenate the received chunks on ``gather_dim``.
+
+    Dimensions outside the first two axes are permuted onto them so the exchange
+    uses ``all_to_all_single``. Gloo builds that lack the list all-to-all API
+    can then run the same call.
+    """
+    scatter_dim = _normalize_dim(scatter_dim, x.ndim)
+    gather_dim = _normalize_dim(gather_dim, x.ndim)
     if scatter_dim <= 1 and gather_dim <= 1:
         return _all_to_all_single(x, scatter_dim, gather_dim, group, async_op)
-    else:
-        return _all_to_all(x, scatter_dim, gather_dim, group, async_op)
+
+    front, inverse = _permute_scatter_gather_to_front(x, scatter_dim, gather_dim)
+    exchanged = _all_to_all_single(front, 0, 1, group, async_op)
+    if async_op:
+
+        def wait():
+            return exchanged().permute(inverse).contiguous()
+
+        return wait
+    return exchanged.permute(inverse).contiguous()
 
 
 class _SeqAllToAll(torch.autograd.Function):

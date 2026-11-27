@@ -41,6 +41,7 @@ _HOST_FIELDS = (
     "rotary_pos_emb_implementation",
     "rotary_pos_emb_vision_implementation",
     "load_balancing_loss_implementation",
+    "minimax_sparse_attention_implementation",
 )
 
 _FIELD_OP_VARIANTS: dict[str, tuple[str, str]] = {
@@ -52,6 +53,7 @@ _FIELD_OP_VARIANTS: dict[str, tuple[str, str]] = {
     "rotary_pos_emb_implementation": ("rope", "partial"),
     "rotary_pos_emb_vision_implementation": ("rope", "full"),
     "load_balancing_loss_implementation": ("load_balancing_loss", "standard"),
+    "minimax_sparse_attention_implementation": ("minimax_sparse_attention", "standard"),
 }
 
 _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
@@ -64,6 +66,7 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
         "rotary_pos_emb_implementation": "liger_kernel",
         "rotary_pos_emb_vision_implementation": "liger_kernel",
         "load_balancing_loss_implementation": "triton",
+        "minimax_sparse_attention_implementation": "eager",
     },
     "npu": {
         "moe_implementation": "fused_npu",
@@ -74,6 +77,7 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
         "rotary_pos_emb_implementation": "torch_npu",
         "rotary_pos_emb_vision_implementation": "torch_npu",
         "load_balancing_loss_implementation": "eager",
+        "minimax_sparse_attention_implementation": "torch_npu",
     },
     "mlu": {
         "moe_implementation": "fused_triton",
@@ -84,6 +88,7 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
         "rotary_pos_emb_implementation": "eager",
         "rotary_pos_emb_vision_implementation": "eager",
         "load_balancing_loss_implementation": "eager",
+        "minimax_sparse_attention_implementation": "eager",
     },
 }
 
@@ -145,6 +150,7 @@ def test_explicit_eager_is_kept_on_npu(field_name: str, monkeypatch: pytest.Monk
         ("rotary_pos_emb_vision_implementation", "torch_npu"),
         ("moe_implementation", "fused_npu"),
         ("cross_entropy_loss_implementation", "chunk_loss"),
+        ("minimax_sparse_attention_implementation", "torch_npu"),
     ],
 )
 def test_explicit_npu_value_is_kept_on_npu(field_name: str, value: str, monkeypatch: pytest.MonkeyPatch):
@@ -172,13 +178,18 @@ def test_explicit_gpu_default_raises_on_npu(field_name: str, value: str, monkeyp
 
 
 @pytest.mark.parametrize(
-    "field_name",
-    ["rms_norm_implementation", "rotary_pos_emb_implementation", "rotary_pos_emb_vision_implementation"],
+    ("field_name", "value"),
+    [
+        ("rms_norm_implementation", "torch_npu"),
+        ("rotary_pos_emb_implementation", "torch_npu"),
+        ("rotary_pos_emb_vision_implementation", "torch_npu"),
+        ("minimax_sparse_attention_implementation", "torch_npu"),
+    ],
 )
-def test_explicit_npu_value_raises_off_npu(field_name: str, monkeypatch: pytest.MonkeyPatch):
+def test_explicit_npu_value_raises_off_npu(field_name: str, value: str, monkeypatch: pytest.MonkeyPatch):
     _set_host(monkeypatch, "gpu")
-    with pytest.raises(ValueError, match=f"{field_name}='torch_npu' requires Ascend NPU"):
-        OpsImplementationConfig(**{field_name: "torch_npu"})
+    with pytest.raises(ValueError, match=f"{field_name}={value!r} requires Ascend NPU"):
+        OpsImplementationConfig(**{field_name: value})
 
 
 def test_explicit_gpu_value_is_kept_on_mlu(monkeypatch: pytest.MonkeyPatch):

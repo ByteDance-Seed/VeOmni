@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.arguments.arguments_types import AcceleratorConfig, OptimizerConfig
 from veomni.trainer import text_trainer, vlm_trainer
 
 
@@ -50,5 +51,6 @@ def test_exact_sft_flag_is_set_before_callbacks(monkeypatch, module, trainer_nam
     if trainer_name == "VLMTrainer":
         monkeypatch.setattr(trainer_class, "_build_model_runtime", lambda self: SimpleNamespace(parallel_state=None))
         monkeypatch.setattr(trainer_class, "_build_collate_fn", lambda self: None)
-    trainer = trainer_class(SimpleNamespace(data=SimpleNamespace(data_type=data_type)))
+    model = SimpleNamespace(accelerator=AcceleratorConfig(), optimizer=OptimizerConfig())
+    trainer = trainer_class(SimpleNamespace(data=SimpleNamespace(data_type=data_type), model=model))
     assert trainer.base.flag_seen_by_callbacks is expected
