@@ -225,11 +225,11 @@ def _roundtrip_worker(rank, world_size, endpoint):
         )
 
         # Older padded checkpoints must retain their stored tail, not zero it.
-        from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
+        from veomni.checkpoint.dcp_checkpointer import _ExtraParallelSavePlanner
 
         with patch(
-            "veomni.checkpoint.dcp_checkpointer.RowCropSavePlanner",
-            side_effect=lambda rows, **kwargs: DefaultSavePlanner(**kwargs),
+            "veomni.checkpoint.dcp_checkpointer._CanonicalRowCropSavePlanner",
+            side_effect=lambda rows_by_name, **kwargs: _ExtraParallelSavePlanner(**kwargs),
         ):
             DistributedCheckpointer.save(
                 directory,

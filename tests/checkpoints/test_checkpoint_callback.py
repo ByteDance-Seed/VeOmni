@@ -269,6 +269,28 @@ class TestCheckpointCallbackTrainEndWait:
         with pytest.raises(RuntimeError, match="HDFS write failed"):
             cb.on_train_end(TrainerState(global_step=60))
 
+    def test_failed_async_epoch_wait_cannot_be_retried_as_success(self, mock_helper, monkeypatch):
+        from concurrent.futures import Future
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        failed = Future()
+        failed.set_exception(RuntimeError("HDFS write failed"))
+        monkeypatch.setattr(DistributedCheckpointer, "_save_futures", {"weights": failed})
+        monkeypatch.setattr(DistributedCheckpointer, "_async_process_groups", {})
+        trainer = _make_mock_trainer(save_async=True)
+        trainer.wait_for_pending_save.side_effect = DistributedCheckpointer.wait_for_pending_save
+        callback = CheckpointCallback(trainer)
+        callback._last_dcp_step = 5
+        state = TrainerState(global_step=5, epoch=0)
+
+        with pytest.raises(RuntimeError, match="HDFS write failed"):
+            callback.on_epoch_end(state)
+        assert not DistributedCheckpointer._save_futures
+        with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
+            callback.on_epoch_end(state)
+        trainer.save_dcp.assert_not_called()
+
     def test_train_end_waits_even_without_async(self, mock_helper):
         """The call is unconditional; wait_for_pending_save is a no-op when nothing is pending."""
         trainer = _make_mock_trainer(save_async=False)
@@ -360,13 +382,20 @@ class TestModelCheckpointManagerSaveContract:
         runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
         mock_build_ckpt.return_value = mock_checkpointer
+        scheduler_state = {"last_epoch": 7}
+
+        def load(_path, state, **_kwargs):
+            state["extra_state"]["lr_scheduler"] = scheduler_state
+
+        mock_checkpointer.load.side_effect = load
 
         manager = ModelCheckpointManager(runtime)
         manager.load()
 
         loaded = mock_checkpointer.load.call_args.args[1]
-        assert loaded["extra_state"] == {}
+        assert loaded["extra_state"] == {"lr_scheduler": scheduler_state}
         assert loaded["optimizer"] is runtime.optimizer
+        runtime.lr_scheduler.load_state_dict.assert_called_once_with(scheduler_state)
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is runtime.parallel_state
 
     def test_save_lora_writes_the_adapter_to_its_own_export_dir(
@@ -699,8 +728,9 @@ class TestGlobalStateCallbackJobState:
         assert cb.load_global_state() is None
         trainer.channel_loss_callback.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
-        mock_dist.all_reduce.assert_called_once()
-        assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
+        assert mock_dist.all_reduce.call_count == 2
+        assert mock_dist.all_reduce.call_args_list[0].kwargs["op"] is torch.distributed.ReduceOp.MIN
+        assert mock_dist.all_reduce.call_args_list[1].kwargs["op"] is torch.distributed.ReduceOp.MAX
 
     def test_a_pre_split_job_cursor_is_not_read(self, mock_dist, tmp_path):
         """Only ``extra_state/rank_{R}.pt`` carries the cursor now.

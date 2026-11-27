@@ -14,6 +14,32 @@ from ..parallel_state import get_parallel_state
 logger = get_logger(__name__)
 
 
+def _clip_grads_with_norm(params, max_norm, total_norm, foreach=None):
+    """Clip CPU shards locally; communicate only the global norm statistic.
+
+    Offloaded DTensors keep the accelerator mesh for ownership. Passing these
+    through a DTensor foreach kernel can accidentally dispatch CPU payloads
+    onto that mesh. Use their local gradients for the pointwise scaling.
+    """
+    resident = []
+    cpu_grads = []
+    for parameter in params:
+        grad = parameter.grad
+        if grad is None:
+            continue
+        local = grad.to_local() if isinstance(grad, DTensor) else grad
+        if local.device.type == "cpu":
+            cpu_grads.append(local)
+        else:
+            resident.append(parameter)
+    if cpu_grads:
+        coefficient = torch.clamp(max_norm / (total_norm.detach().to("cpu") + 1e-6), max=1.0)
+        for grad in cpu_grads:
+            grad.mul_(coefficient)
+    if resident:
+        torch.nn.utils.clip_grads_with_norm_(resident, max_norm, total_norm, foreach=foreach)
+
+
 def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
@@ -105,7 +131,7 @@ def _cpu_offload_fsdp2_clip_grad_norm(
     total_norm = _finalize_total_norm(total_norm_or_pth_sum, norm_type)
     _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
 
-    torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach=foreach)
+    _clip_grads_with_norm(params, max_norm, total_norm, foreach=foreach)
 
     return total_norm
 
@@ -281,14 +307,10 @@ def extra_parallel_fsdp2_clip_grad_norm(
     # multiplying by max_norm / (nan + 1e-6) would broadcast NaN into every parameter grad.
     if bool(torch.isfinite(total_norm).item()):
         for para in ps.extra_parallel_names:
-            torch.nn.utils.clip_grads_with_norm_(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
-            torch.nn.utils.clip_grads_with_norm_(
-                extra_parallel_replicated_params[para], max_norm, total_norm, foreach=foreach
-            )
-            torch.nn.utils.clip_grads_with_norm_(
-                persistent_extra_parallel_params[para], max_norm, total_norm, foreach=foreach
-            )
-        torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
+            _clip_grads_with_norm(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
+            _clip_grads_with_norm(extra_parallel_replicated_params[para], max_norm, total_norm, foreach=foreach)
+            _clip_grads_with_norm(persistent_extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
+        _clip_grads_with_norm(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
 
     return total_norm
 
