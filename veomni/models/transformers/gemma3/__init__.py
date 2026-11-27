@@ -16,8 +16,6 @@
 
 from veomni.models.registry import MODELING_REGISTRY
 
-from ....utils.device import IS_NPU_AVAILABLE
-
 
 @MODELING_REGISTRY.register("gemma3_text")
 def register_gemma3_text_modeling(architecture: str | None):
@@ -33,9 +31,6 @@ def register_gemma3_text_modeling(architecture: str | None):
 
 @MODELING_REGISTRY.register("gemma3")
 def register_gemma3_modeling(architecture: str | None):
-    if not IS_NPU_AVAILABLE:
-        raise RuntimeError("Gemma 3 VLM training is currently supported only on NPU.")
-
     from .modeling_gemma3 import Gemma3ForConditionalGeneration, Gemma3Model
 
     architecture = architecture or "Gemma3ForConditionalGeneration"

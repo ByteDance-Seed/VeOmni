@@ -14,7 +14,8 @@ Supported in this correctness stage:
   exchange over the active SP/CP group, and only the merged features are
   gathered for the global placeholder scatter.
 - CP-style QSA selection plus main-attention KV all-gather. The indexer uses
-  local block pooling, compressed-row all-gather, and local queries to return
+  local block pooling, compressed-row all-gather, and local queries. Block
+  top-k is `qsa_indexer` (`qsa_indexer_implementation`, eager). It returns
   local `[B, S_local, K]` compact global token indices; `Qwen4ExpTextAttention`
   keeps `query_states` local (`[B, H_q, S_local, D]`) with all query heads intact
   and all-gathers only `key_states` and `value_states` (`[B, H_kv, S_global, D]`).
