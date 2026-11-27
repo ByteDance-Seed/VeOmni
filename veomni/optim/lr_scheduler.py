@@ -13,7 +13,9 @@
 # limitations under the License.
 
 
+import json
 import math
+import weakref
 from typing import TYPE_CHECKING, Dict, Literal
 
 from torch.optim.lr_scheduler import LambdaLR
@@ -26,6 +28,49 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+_CHECKPOINT_SCHEDULER_BINDINGS = weakref.WeakKeyDictionary()
+_CHECKPOINT_SCHEDULER_RECIPES = weakref.WeakKeyDictionary()
+
+
+def checkpoint_scheduler_binding(optimizer):
+    """Find a framework-built scheduler without mutating the optimizer payload."""
+    reference = _CHECKPOINT_SCHEDULER_BINDINGS.get(optimizer)
+    return None if reference is None else reference()
+
+
+def register_checkpoint_scheduler(scheduler, *, name: str, version: int, parameters: dict):
+    """Bind a trusted, reproducible LambdaLR recipe to its optimizer.
+
+    The caller must keep the recipe consistent with the scheduler callable.
+    Parameters must be JSON-serializable and describe every value affecting the
+    schedule; registration does not inspect or sandbox trusted Python code.
+    """
+    if (
+        type(scheduler) is not LambdaLR
+        or not isinstance(name, str)
+        or not name
+        or type(version) is not int
+        or version < 1
+    ):
+        raise ValueError("A LambdaLR recipe needs a name and positive integer version")
+    if not isinstance(parameters, dict):
+        raise TypeError("Scheduler recipe parameters must be a dictionary")
+    recipe = {"name": name, "version": version, "parameters": parameters}
+    try:
+        encoded = json.dumps(recipe, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Scheduler recipe must contain finite JSON values") from exc
+    _CHECKPOINT_SCHEDULER_RECIPES[scheduler] = encoded
+    _CHECKPOINT_SCHEDULER_BINDINGS[scheduler.optimizer] = weakref.ref(scheduler)
+    return scheduler
+
+
+def checkpoint_scheduler_recipe(scheduler):
+    """Return a detached recipe or fail when the caller supplied none."""
+    encoded = _CHECKPOINT_SCHEDULER_RECIPES.get(scheduler)
+    if encoded is None:
+        raise RuntimeError("MultiOptimizer scheduler has no registered checkpoint recipe")
+    return json.loads(encoded)
 
 
 class MultiLRScheduler(dict):
@@ -43,9 +88,10 @@ class MultiLRScheduler(dict):
         return {name: sched.state_dict() for name, sched in self.items()}
 
     def load_state_dict(self, state_dict: Dict[str, any]) -> None:
+        if set(state_dict) != set(self):
+            raise RuntimeError("MultiLRScheduler checkpoint leaves differ from the current optimizer layout")
         for name, sched in self.items():
-            if name in state_dict:
-                sched.load_state_dict(state_dict[name])
+            sched.load_state_dict(state_dict[name])
 
     def get_last_lr(self):
         # Return the first scheduler's LR for logging consistency
@@ -83,15 +129,15 @@ def build_lr_scheduler(
 
     lr_warmup_steps = int(train_steps * lr_warmup_ratio)
     if lr_decay_style == "constant":
-        return get_constant_schedule_with_warmup(
+        scheduler = get_constant_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=lr_warmup_steps,
             lr_start=lr_start,
             init_lr=lr,
         )
 
-    if lr_decay_style == "linear":
-        return get_linear_schedule_with_warmup(
+    elif lr_decay_style == "linear":
+        scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=lr_warmup_steps,
             num_training_steps=train_steps,
@@ -99,8 +145,8 @@ def build_lr_scheduler(
             lr_start=lr_start,
         )
 
-    if lr_decay_style == "cosine":
-        return get_cosine_schedule_with_warmup(
+    elif lr_decay_style == "cosine":
+        scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=lr_warmup_steps,
             num_training_steps=train_steps,
@@ -110,7 +156,10 @@ def build_lr_scheduler(
             lr_start=lr_start,
         )
 
-    raise ValueError(f"Unknown learning rate decay style: {lr_decay_style}.")
+    else:
+        raise ValueError(f"Unknown learning rate decay style: {lr_decay_style}.")
+    _CHECKPOINT_SCHEDULER_BINDINGS[optimizer] = weakref.ref(scheduler)
+    return scheduler
 
 
 def get_constant_schedule_with_warmup(
@@ -131,7 +180,12 @@ def get_constant_schedule_with_warmup(
 
         return 1.0
 
-    return LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch)
+    return register_checkpoint_scheduler(
+        LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch),
+        name="veomni.constant_warmup",
+        version=1,
+        parameters={"num_warmup_steps": num_warmup_steps, "init_lr": init_lr, "lr_start": lr_start},
+    )
 
 
 def get_linear_schedule_with_warmup(
@@ -158,7 +212,18 @@ def get_linear_schedule_with_warmup(
             float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps)),
         )
 
-    return LambdaLR(optimizer, _lr_lambda, last_epoch)
+    return register_checkpoint_scheduler(
+        LambdaLR(optimizer, _lr_lambda, last_epoch),
+        name="veomni.linear_warmup",
+        version=1,
+        parameters={
+            "num_warmup_steps": num_warmup_steps,
+            "num_training_steps": num_training_steps,
+            "init_lr": init_lr,
+            "min_lr": min_lr,
+            "lr_start": lr_start,
+        },
+    )
 
 
 def get_cosine_schedule_with_warmup(
@@ -193,4 +258,17 @@ def get_cosine_schedule_with_warmup(
         factor = factor * (1 - min_lr_ratio) + min_lr_ratio
         return max(0, factor)
 
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
+    return register_checkpoint_scheduler(
+        LambdaLR(optimizer, lr_lambda, last_epoch),
+        name="veomni.cosine_warmup",
+        version=1,
+        parameters={
+            "num_warmup_steps": num_warmup_steps,
+            "num_training_steps": num_training_steps,
+            "init_lr": init_lr,
+            "num_cycles": num_cycles,
+            "lr_decay_ratio": lr_decay_ratio,
+            "min_lr": min_lr,
+            "lr_start": lr_start,
+        },
+    )
