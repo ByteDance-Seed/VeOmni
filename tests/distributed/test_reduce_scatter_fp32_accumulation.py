@@ -860,26 +860,35 @@ def _run_fsdp2_optimizer_step() -> None:
             comm = RecordingReduceScatter(transport_dtype, 1.0 / gradient_divide_factor)
             custom.set_custom_reduce_scatter(comm)
 
-            torch.manual_seed(9000 + rank)
-            inputs = torch.randn(8, 32, device=device, dtype=transport_dtype)
-            baseline(inputs).float().square().sum().backward()
-            custom(inputs).float().square().sum().backward()
-
-            baseline_grad = baseline.weight.grad.to_local()
-            custom_grad = custom.weight.grad.to_local()
-            assert baseline_grad.dtype == torch.float32
-            assert custom_grad.dtype == torch.float32
-            assert comm.calls
-            assert all(dtype == torch.float32 for dtype, _ in comm.calls)
-            assert all(op == dist.ReduceOp.SUM for _, op in comm.calls)
-            torch.testing.assert_close(custom_grad, baseline_grad, rtol=5e-6, atol=5e-6)
-
             baseline_optim = torch.optim.SGD(baseline.parameters(), lr=1e-3)
             custom_optim = torch.optim.SGD(custom.parameters(), lr=1e-3)
-            baseline_optim.step()
-            custom_optim.step()
-            assert torch.isfinite(custom.weight.to_local()).all()
-            del baseline_optim, custom_optim, baseline_grad, custom_grad, inputs, comm, baseline, custom
+            for step in range(2):
+                baseline_optim.zero_grad(set_to_none=True)
+                custom_optim.zero_grad(set_to_none=True)
+                comm.calls.clear()
+                torch.manual_seed(9000 + rank + step * world_size)
+                # Reduce each microbatch before accumulating the FP32 gradient shards.
+                for _ in range(2):
+                    inputs = torch.randn(8, 32, device=device, dtype=transport_dtype)
+                    baseline(inputs).float().square().sum().backward()
+                    custom(inputs).float().square().sum().backward()
+
+                    baseline_grad = baseline.weight.grad.to_local()
+                    custom_grad = custom.weight.grad.to_local()
+                    assert baseline_grad.dtype == torch.float32
+                    assert custom_grad.dtype == torch.float32
+                    torch.testing.assert_close(custom_grad, baseline_grad, rtol=5e-6, atol=5e-6)
+
+                assert len(comm.calls) == 2
+                assert all(dtype == torch.float32 for dtype, _ in comm.calls)
+                assert all(op == dist.ReduceOp.SUM for _, op in comm.calls)
+                before = custom.weight.to_local().detach().clone()
+                baseline_optim.step()
+                custom_optim.step()
+                assert torch.isfinite(custom.weight.to_local()).all()
+                assert not torch.equal(custom.weight.to_local(), before)
+                torch.testing.assert_close(custom.weight.to_local(), baseline.weight.to_local(), rtol=5e-6, atol=5e-6)
+            del baseline_optim, custom_optim, baseline_grad, custom_grad, inputs, comm, baseline, custom, before
             gc.collect()
             dist.barrier(device_ids=[device.index])
 
