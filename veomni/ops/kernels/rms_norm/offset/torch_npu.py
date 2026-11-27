@@ -27,22 +27,32 @@ from . import eager as _eager
 
 @dataclass(frozen=True)
 class _Meta:
-    """Whether the empty-tensor path ran, plus ``eps`` for the eager fallback."""
+    """Whether the eager path ran, plus ``eps`` for that fallback."""
 
     empty: bool
     eps: float
+    use_eager: bool = False
+
+
+def _eager_fallback(x: Tensor, weight: Tensor, eps: float) -> tuple[Tensor, SavedState]:
+    """Run the eager pair and keep its saved tensors for backward."""
+    output, saved = _eager.forward(x, weight, eps=eps)
+    eager_meta = saved.metadata
+    assert isinstance(eager_meta, _eager._Meta)
+    return output, SavedState(saved.tensors, _Meta(eager_meta.empty, eps, use_eager=True))
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
     """NPU fused affine RMSNorm. The fused scale is ``1 + weight``.
 
-    Empty ``x`` falls back to the eager pair. Backward also passes
+    Empty ``x``, and tensors that are not on NPU, fall back to the eager
+    pair. The row is chosen from the host, so a CPU activation on an NPU
+    machine must not enter ``npu_rms_norm``. Backward also passes
     ``1 + weight`` into ``npu_rms_norm_backward``.
     """
     scale = 1.0 + weight
-    if x.numel() == 0:
-        output, saved = _eager.forward(x, weight, eps=eps)
-        return output, SavedState(saved.tensors, _Meta(True, eps))
+    if x.numel() == 0 or x.device.type != "npu":
+        return _eager_fallback(x, weight, eps)
 
     import torch_npu
 
@@ -55,8 +65,8 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, weight, *optional_rstd = saved.tensors
-    if meta.empty:
-        return _eager.backward(grad_output, SavedState((x, weight), _eager._Meta(True, meta.eps)))
+    if meta.use_eager:
+        return _eager.backward(grad_output, SavedState(saved.tensors, _eager._Meta(meta.empty, meta.eps)))
 
     import torch_npu
 

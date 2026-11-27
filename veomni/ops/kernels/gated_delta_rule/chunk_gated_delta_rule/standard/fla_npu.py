@@ -25,6 +25,7 @@ intermediate arithmetic and reciprocal norms. QKV are materialized in BNSD.
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -141,12 +142,39 @@ def _chunk_indices_table(cu_seqlens: tuple[int, ...], chunk_size: int) -> tuple[
     return tuple(_prepare_chunk_indices_list(list(cu_seqlens), chunk_size))
 
 
+_HOST_CU_SEQLENS_LIST_CACHE_MAX = 16
+# Cache ``cu_seqlens`` tensor -> host tuple per (weakref, _version) so multi-layer
+# forwards avoid repeated D2H transfers without model-level precomputation.
+_HOST_CU_SEQLENS_LIST_CACHE: list[tuple[weakref.ref[Tensor], int, tuple[int, ...]]] = []
+
+
 def _as_int_list(value: list[int] | Tensor | None) -> list[int] | None:
     """Normalize an optional integer tensor or sequence to a Python list."""
     if value is None:
         return None
     if isinstance(value, Tensor):
-        return [int(x) for x in value.detach().cpu().flatten().tolist()]
+        # Inference tensors have no version counter, including CPU metadata.
+        if value.is_inference():
+            return [int(x) for x in value.detach().cpu().flatten().tolist()]
+        version = value._version
+        alive: list[tuple[weakref.ref[Tensor], int, tuple[int, ...]]] = []
+        cached: tuple[int, ...] | None = None
+        for ref, cached_version, cached_list in _HOST_CU_SEQLENS_LIST_CACHE:
+            owner = ref()
+            if owner is None:
+                continue
+            alive.append((ref, cached_version, cached_list))
+            if owner is value and cached_version == version:
+                cached = cached_list
+        if cached is not None:
+            _HOST_CU_SEQLENS_LIST_CACHE[:] = alive
+            return list(cached)
+        converted = tuple(int(x) for x in value.detach().cpu().flatten().tolist())
+        alive.append((weakref.ref(value), version, converted))
+        if len(alive) > _HOST_CU_SEQLENS_LIST_CACHE_MAX:
+            alive = alive[-_HOST_CU_SEQLENS_LIST_CACHE_MAX:]
+        _HOST_CU_SEQLENS_LIST_CACHE[:] = alive
+        return list(converted)
     return [int(x) for x in value]
 
 

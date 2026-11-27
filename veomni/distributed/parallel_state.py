@@ -505,7 +505,6 @@ def _init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
-    allow_hybrid_cp: bool = False,
     dp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
@@ -518,6 +517,7 @@ def _init_parallel_state(
     name: Optional[str] = "base",
     npu_ep_hccl_buffer_mib: Optional[int] = None,
     npu_ep_hccl_expansion_mode: Optional[str] = None,
+    allow_hybrid_cp: bool = False,
 ) -> "ParallelState":
     """
     Initialize a parallel state, register it under ``name``, and set it as the

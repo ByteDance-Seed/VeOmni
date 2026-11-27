@@ -22,9 +22,9 @@ and never materializes the score tensor on NVIDIA GPUs, while ``torch_npu``
 prunes per-query-chunk KV intervals with an int8 scatter mask and runs
 ``torch_npu.npu_fusion_attention`` on Ascend NPUs.
 
-The selection itself, its packed-block boundaries, and the Ulysses/CP exchange
-belong to the model, because only the model knows the sequence layout. These
-rows see one local attention call.
+``qsa_indexer`` produces that selection. Packed-block boundaries and the
+Ulysses/CP exchange stay in the model, because only the model knows the
+sequence layout. These rows see one local attention call.
 """
 
 from ...platform import NVIDIA_GPU, GpuKernelRequirement, NpuKernelRequirement

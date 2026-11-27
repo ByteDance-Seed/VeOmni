@@ -7,6 +7,7 @@ import pytest
 import veomni.models.auto as auto
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import AcceleratorConfig
+from veomni.distributed.context_parallel import support as cp_support
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -63,7 +64,7 @@ def test_hybrid_model_guard_keeps_other_families_closed(monkeypatch, npu):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, ulysses_size=8))
-    monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", npu)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", npu)
     auto.check_context_parallel_supported(SimpleNamespace(model_type="qwen4_exp"))
     with pytest.raises(NotImplementedError, match="Qwen4-Exp only"):
         auto.check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
@@ -73,7 +74,7 @@ def test_native_cp_qualification_is_not_extended_to_other_models(monkeypatch):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, ulysses_size=1))
-    monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", True)
     with pytest.raises(NotImplementedError, match="Ascend/NPU"):
         auto.check_context_parallel_supported(SimpleNamespace(model_type="glm_moe_dsa"))
 
