@@ -1,4 +1,0 @@
-{
-  "model_type": "MiniMaxH3ImageConditionModel",
-  "architectures": ["MiniMaxH3ImageConditionModel"]
-}

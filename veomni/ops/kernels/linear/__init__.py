@@ -26,21 +26,37 @@ branches on the row itself.
 The ``qat`` row sits next to the eager reference: it fake-quantizes both GEMM
 operands with the DeepSeek-V4 TileLang quantizers and keeps the multiply in the
 model dtype, which is what an emulated low-precision deployment GEMM computes.
-``torchao_nvfp4`` does the same with torchao's NVFP4 round trip; it is
-``standard`` only, so a model that also binds ``grouped`` (DeepSeek-V4) cannot
-select it.
+``torchao`` serves TorchAO's dynamic FP8 GEMMs and FP4 fake quantization; it is
+``standard`` only, so a model that also binds ``grouped`` (DeepSeek-V4) uses it
+only on ``standard`` sites.
+
+``deepgemm`` is not a recipe at all: it *is* the deployment GEMM, running forward,
+input gradient and weight gradient on the FP8 tensor cores via DeepGEMM. ``qat``
+emulates the same rounding and multiplies in the model dtype, so the two are
+different kernels behind one field rather than two settings of one kernel.
+
+The precision is a row *argument* (``dtype``), not part of the name: ``qat`` is
+FP8-only (``dtype="fp8"``), and ``torchao`` serves FP8, NVFP4, and MXFP4.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, NvidiaGpuPlatform
 from ...registry import register_op
+from .grouped import deepgemm as grouped_deepgemm
 from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
+from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
 from .standard import qat as standard_qat
-from .standard import torchao_nvfp4 as standard_torchao_nvfp4
+from .standard import torchao as standard_torchao
 
 
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+#: DeepGEMM ships Hopper and Blackwell kernels only. SM90 and SM100 are named
+#: explicitly so an SM89 host -- which has an E4M3 type but no DeepGEMM kernel --
+#: is refused at resolve time instead of failing inside the first launch.
+_NVIDIA_SM90_OR_SM100 = GpuKernelRequirement(
+    platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),
+)
 
 
 register_op(
@@ -64,9 +80,9 @@ register_op(
 register_op(
     "linear",
     "standard",
-    "torchao_nvfp4",
-    description="TorchAO NVFP4 fake-quantized dense linear projection",
-    wrapper=standard_torchao_nvfp4.wrapper,
+    "torchao",
+    description="TorchAO low-precision (FP8 / NVFP4 / MXFP4) dense linear projection",
+    wrapper=standard_torchao.wrapper,
     requires=("torchao",),
 )
 
@@ -86,4 +102,24 @@ register_op(
     wrapper=grouped_qat.module_wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
+)
+
+register_op(
+    "linear",
+    "standard",
+    "deepgemm",
+    description="DeepGEMM blockwise FP8 dense linear forward, input gradients and weight gradients",
+    wrapper=standard_deepgemm.wrapper,
+    requirement=_NVIDIA_SM90_OR_SM100,
+    requires=("deep_gemm", "triton"),
+)
+
+register_op(
+    "linear",
+    "grouped",
+    "deepgemm",
+    description="DeepGEMM blockwise FP8 grouped linear forward, input gradients and weight gradients",
+    wrapper=grouped_deepgemm.wrapper,
+    requirement=_NVIDIA_SM90_OR_SM100,
+    requires=("deep_gemm", "triton"),
 )

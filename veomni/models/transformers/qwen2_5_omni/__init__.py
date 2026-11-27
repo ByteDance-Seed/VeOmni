@@ -25,7 +25,7 @@ def register_qwen2_5_omni_config():
 
 
 def _get_qwen2_5_omni_modeling_classes():
-    from .generated.patched_modeling_qwen2_5_omni_gpu import (
+    from .modeling_qwen2_5_omni import (
         Qwen2_5OmniForConditionalGeneration,
         Qwen2_5OmniThinkerForConditionalGeneration,
         Qwen2_5OmniThinkerTextModel,

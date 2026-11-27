@@ -1,4 +1,4 @@
-"""CPU coverage for MiniMax-H3-Image text-to-image and editing conditions."""
+"""CPU coverage for MiniMax-H3-Image T2I and editing conditions."""
 
 import json
 from types import SimpleNamespace
@@ -10,28 +10,28 @@ from PIL import Image
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
-from tests.models.tiny_configs import tiny_minimax_h3_config
 from veomni.data import build_data_transform
 from veomni.models.diffusers.minimax_h3.minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
-from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
-    MiniMaxH3DiTModel,
-)
 from veomni.models.diffusers.minimax_h3_image.layout import unpatchify_image_rows
 from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition import modeling_minimax_h3_image_condition
 from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
     MiniMaxH3ImageConditionModelConfig,
 )
 from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.modeling_minimax_h3_image_condition import (
+    REFERENCE_MODEL_TIME,
     MiniMaxH3ImageConditionModel,
 )
+from veomni.models.diffusers.minimax_h3_image.pdd import DEFAULT_SIGMAS
 from veomni.trainer.dit_trainer import DiTDataCollator, DiTTrainer, OfflineEmbeddingSaver
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _condition_model(seed=42, **kwargs):
-    config = MiniMaxH3ImageConditionModelConfig(skip_encoder_load=True, height=32, width=64, seed=seed)
+def _condition_model(seed=42, pdd_sigmas=DEFAULT_SIGMAS, **kwargs):
+    config = MiniMaxH3ImageConditionModelConfig(
+        skip_encoder_load=True, height=32, width=64, seed=seed, pdd_sigmas=pdd_sigmas
+    )
     config._set_ops_implementation(eager_ops_config())
     return MiniMaxH3ImageConditionModel._from_config(config, **kwargs)
 
@@ -98,52 +98,55 @@ def test_t2i_raw_condition_round_trips_through_dit_cache(tmp_path, monkeypatch):
 
     offline_model = _condition_model(meta_init=True)
     assert offline_model.text_encoder is None and offline_model.vae is None
-    assert offline_model.process_condition(**cached_batch)["image_inputs"]["x"].shape == (2, 8)
+    assert offline_model.process_condition(**cached_batch)["x"].shape == (2, 8)
 
 
 def test_i2i_raw_condition_round_trips_through_dit_cache(tmp_path, monkeypatch):
-    for name in ("target.png", "first.png", "second.png"):
-        Image.new("RGB", (64, 32), 192).save(tmp_path / name)
+    for name, size in (("target.png", (64, 32)), ("first.png", (64, 32)), ("second.png", (32, 64))):
+        Image.new("RGB", size, (64, 128, 192)).save(tmp_path / name)
     transform = build_data_transform("minimax_h3_image_i2i", data_dir=str(tmp_path))
     rows = transform(
         {"image": "target.png", "prompt": "Make it blue", "reference_images": json.dumps(["first.png", "second.png"])},
         source_name="example",
     )
-    assert len(rows[0]["reference_images"]) == 2
-    assert rows[0]["images"][0].size == (64, 32)
+    mode_by_size = {
+        (32, 64): torch.ones(1, 2, 2, 4),
+        (1024, 2048): torch.full((1, 2, 2, 4), 2.0),
+        (2048, 1024): torch.full((1, 2, 4, 2), 3.0),
+    }
 
-    model = _condition_model()
-    target_mode = torch.ones(1, 2, 2, 4)
-    model._vae = SimpleNamespace(
-        device=torch.device("cpu"),
-        config=SimpleNamespace(latents_mean=(0, 0), latents_std=(1, 1)),
-        encode=lambda pixels, return_dict: (SimpleNamespace(mode=lambda: target_mode),),
-    )
+    def encode(pixels, return_dict):
+        assert not return_dict and not torch.is_grad_enabled()
+        mode = mode_by_size[pixels.shape[-2:]]
+        return (SimpleNamespace(mode=lambda: mode),)
 
     def encode_text(prompt, reference_images):
         assert prompt == "Make it blue"
-        assert [image.size for image in reference_images] == [(2048, 1024)] * 2
+        assert [image.size for image in reference_images] == [(2048, 1024), (1024, 2048)]
         return torch.ones(1, 3, 8), torch.tensor([1, 0, 1])
 
-    def encode_references(images, sample_posterior):
-        assert not sample_posterior
-        assert [image.size for image in images] == [(2048, 1024)] * 2
-        return [torch.ones(1, 2, 2, 4), torch.ones(1, 2, 4, 2)]
-
-    monkeypatch.setattr(model, "encode_text", encode_text)
-    monkeypatch.setattr(model, "encode_reference_images", encode_references)
-    cached = model.get_condition(**DiTDataCollator()(rows))
-    assert [ref.shape for ref in cached["reference_latents"][0]] == [(1, 2, 2, 4), (1, 2, 4, 2)]
-    state = model.rng_state_dict()
-    online = model.process_condition(**cached)
-    assert online["image_num_reference_rows"] == 4
-    assert online["image_inputs"]["x"].shape == (6, 8)
-    assert online["image_training_target"].shape == (2, 8)
-    torch.testing.assert_close(
-        online["image_inputs"]["timestep_indices"][online["image_inputs"]["image_indices"]],
-        torch.tensor([0, 0, 0, 0, 1, 1]),
+    sigmas = (1.0, 0.65, 0.2, 0.0)
+    model = _condition_model(pdd_sigmas=sigmas)
+    model._vae = SimpleNamespace(
+        device=torch.device("cpu"),
+        spatial_compression_ratio=16,
+        config=SimpleNamespace(latents_mean=(1, 1), latents_std=(2, 2)),
+        encode=encode,
     )
-    torch.testing.assert_close(online["image_inputs"]["unique_timesteps"][0], torch.tensor(0.999))
+    monkeypatch.setattr(model, "encode_text", encode_text)
+    state = model.rng_state_dict()
+    cached = model.get_condition(**DiTDataCollator()(rows))
+    torch.testing.assert_close(model.rng_state_dict(), state, rtol=0, atol=0)
+    batched_cache = model.get_condition(**DiTDataCollator()(rows * 2))
+    torch.testing.assert_close(batched_cache, {key: values * 2 for key, values in cached.items()}, rtol=0, atol=0)
+    torch.testing.assert_close(model.rng_state_dict(), state, rtol=0, atol=0)
+    torch.testing.assert_close(cached["reference_latents"][0], [torch.full((1, 2, 2, 4), 0.5), torch.ones(1, 2, 4, 2)])
+    online = model.process_condition(**cached)
+    assert online["num_pdd_heads"] == 3 and online["pdd_step_index"] == 1
+    assert online["cond_rows"] == 4 and online["x"].shape == (6, 8)
+    assert online["training_target"].shape == (2, 8)
+    torch.testing.assert_close(online["inverse_indices"], torch.tensor([1, 1, 1, 0, 0, 0, 0, 1, 1]))
+    torch.testing.assert_close(online["unique_timesteps"][0], torch.tensor(REFERENCE_MODEL_TIME))
 
     import veomni.distributed.parallel_state as parallel_state
 
@@ -152,138 +155,17 @@ def test_i2i_raw_condition_round_trips_through_dit_cache(tmp_path, monkeypatch):
     saver.save(DiTTrainer._unpack_dict_of_list(cached)[0])
     dataset = load_dataset("parquet", data_files=str(tmp_path / "rank_0_shard_0.parquet"), split="train")
     offline_batch = DiTDataCollator()(build_data_transform("dit_offline")(dataset[0]))
-    offline_model = _condition_model(meta_init=True)
+    torch.testing.assert_close(dict(offline_batch), cached, rtol=0, atol=0)
+    offline_model = _condition_model(pdd_sigmas=sigmas, meta_init=True)
     offline_model.load_rng_state_dict(state)
     torch.testing.assert_close(offline_model.process_condition(**offline_batch), online, rtol=0, atol=0)
 
 
-def test_mixed_raw_microbatch_matches_online_and_offline_conditions(tmp_path, monkeypatch):
-    model = _condition_model()
-    model._vae = SimpleNamespace(
-        device=torch.device("cpu"),
-        config=SimpleNamespace(latents_mean=(0, 0), latents_std=(1, 1)),
-        encode=lambda pixels, return_dict: (SimpleNamespace(mode=lambda: pixels[:, :2, ::16, ::16]),),
-    )
-
-    def encode_text(prompt, reference_images=None):
-        length = len(prompt.split()) + len(reference_images or [])
-        embeds = torch.arange(length * 8, dtype=torch.float32).reshape(1, length, 8)
-        return embeds, torch.ones(length, dtype=torch.long)
-
-    def encode_references(images, sample_posterior):
-        assert not sample_posterior
-        return [torch.full((1, 2, 2, 4), index + 0.5) for index in range(len(images))]
-
-    monkeypatch.setattr(model, "encode_text", encode_text)
-    monkeypatch.setattr(model, "encode_reference_images", encode_references)
-    raw = DiTDataCollator()(
-        [
-            {"inputs": "A rectangle", "images": [Image.new("RGB", (64, 32), 128)]},
-            {
-                "inputs": "Make the rectangle blue",
-                "images": [Image.new("RGB", (32, 64), 192)],
-                "reference_images": [Image.new("RGB", (64, 32)), Image.new("RGB", (32, 64))],
-            },
-        ]
-    )
-    state = model.rng_state_dict()
-    cached = model.get_condition(**raw)
-    assert cached["reference_latents"][0] == []
-    assert len(cached["reference_latents"][1]) == 2
-    assert [embeds.shape[1] for embeds in cached["prompt_embeds"]] == [2, 6]
-    for index in range(2):
-        expected = model.get_condition(**{key: values[index : index + 1] for key, values in raw.items()})
-        torch.testing.assert_close({key: values[index : index + 1] for key, values in cached.items()}, expected)
-    torch.testing.assert_close(model.rng_state_dict(), state, rtol=0, atol=0)
-    online = model.process_condition(**cached)
-
-    import veomni.distributed.parallel_state as parallel_state
-
-    monkeypatch.setattr(parallel_state, "get_parallel_state", lambda: SimpleNamespace(dp_rank=0, dp_size=1))
-    saver = OfflineEmbeddingSaver(str(tmp_path), dataset_length=2)
-    for item in DiTTrainer._unpack_dict_of_list(cached):
-        saver.save(item)
-    dataset = load_dataset("parquet", data_files=str(tmp_path / "rank_0_shard_0.parquet"), split="train")
-    transform = build_data_transform("dit_offline")
-    offline = DiTDataCollator()([transform(item)[0] for item in dataset])
-    torch.testing.assert_close(dict(offline), cached, rtol=0, atol=0)
-    restored = _condition_model(meta_init=True)
-    restored.load_rng_state_dict(state)
-    torch.testing.assert_close(restored.process_condition(**offline), online, rtol=0, atol=0)
-    torch.testing.assert_close(restored.rng_state_dict(), model.rng_state_dict(), rtol=0, atol=0)
-
-
-def test_mixed_cached_microbatch_preserves_sample_geometry_and_rng_across_grouping():
-    samples = [
-        {key: values[0] for key, values in _cached_batch().items()},
-        {
-            "clean_latents": torch.ones(1, 2, 4, 2),
-            "prompt_embeds": torch.ones(1, 5, 8, dtype=torch.bfloat16),
-            "text_token_tags": torch.tensor([1, 0, 0, 1, 1]),
-            "reference_latents": [torch.zeros(1, 2, 2, 2)],
-        },
-        {
-            "clean_latents": torch.ones(1, 2, 4, 4),
-            "prompt_embeds": torch.ones(1, 2, 8, dtype=torch.bfloat16),
-            "text_token_tags": torch.ones(2, dtype=torch.long),
-            "reference_latents": [torch.zeros(1, 2, 2, 4), torch.ones(1, 2, 4, 2)],
-        },
-    ]
-    model, sequential = _condition_model(), _condition_model()
-    batch = DiTDataCollator()(samples)
-    packed = model.process_condition(**batch)
-    expected = [sequential.process_condition(**DiTDataCollator()([sample])) for sample in samples]
-    torch.testing.assert_close(DiTTrainer._unpack_dict_of_list(packed), expected, rtol=0, atol=0)
-    torch.testing.assert_close(model.rng_state_dict(), sequential.rng_state_dict(), rtol=0, atol=0)
-    assert [target.shape for target in packed["image_training_target"]] == [(2, 8), (2, 8), (4, 8)]
-    assert packed["image_num_reference_rows"] == [0, 1, 4]
-    assert [item["x"].shape[0] for item in packed["image_inputs"]] == [2, 3, 8]
-    assert [item["prompt_embeds"].shape[1] for item in packed["image_inputs"]] == [3, 5, 2]
-
-    state = model.rng_state_dict()
-    next_batch = model.process_condition(**batch)
-    restored = _condition_model(seed=0, meta_init=True)
-    restored.load_rng_state_dict(state)
-    replayed = [restored.process_condition(**DiTDataCollator()([sample])) for sample in samples]
-    torch.testing.assert_close(DiTTrainer._unpack_dict_of_list(next_batch), replayed, rtol=0, atol=0)
-    torch.testing.assert_close(model.rng_state_dict(), restored.rng_state_dict(), rtol=0, atol=0)
-
-
-def test_i2i_requires_references_and_uses_deterministic_posterior(tmp_path):
+def test_i2i_transform_requires_references(tmp_path):
     Image.new("RGB", (32, 32)).save(tmp_path / "target.png")
     transform = build_data_transform("minimax_h3_image_i2i", data_dir=str(tmp_path))
     with pytest.raises(ValueError, match="reference_images"):
         transform({"image": "target.png", "prompt": "Edit it", "reference_images": "[]"}, source_name="example")
-
-    model = _condition_model()
-    model._vae = SimpleNamespace(
-        device=torch.device("cpu"),
-        spatial_compression_ratio=16,
-        config=SimpleNamespace(latents_mean=(0, 0), latents_std=(1, 1)),
-        encode=lambda pixels, return_dict: (SimpleNamespace(mode=lambda: torch.ones(1, 2, 2, 2)),),
-    )
-    state = model.rng_state_dict()
-    reference = model.encode_reference_images([Image.new("RGB", (32, 32))], sample_posterior=False)
-    torch.testing.assert_close(reference[0], torch.ones(1, 2, 2, 2))
-    torch.testing.assert_close(model.rng_state_dict(), state, rtol=0, atol=0)
-
-
-def test_i2i_condition_trains_tiny_transformer():
-    condition = _condition_model(meta_init=True)
-    cached = _cached_batch()
-    cached["prompt_embeds"] = [torch.zeros(1, 3, 8)]
-    cached["reference_latents"] = [[torch.ones(1, 2, 2, 4)]]
-    batch = condition.process_condition(**cached)
-    config = tiny_minimax_h3_config(
-        audio_enabled=False, num_pdd_heads=6, image_training=True, patch_size=(1, 2, 2), text_dim=8
-    )
-    config._set_ops_implementation(eager_ops_config())
-    model = MiniMaxH3DiTModel(config)
-    output = model(**batch)
-    assert output.predictions[0].shape == batch["image_training_target"].shape
-    assert torch.isfinite(output.loss["mse_image"])
-    output.loss["mse_image"].backward()
-    assert torch.count_nonzero(model.dit.video_patch_proj.weight.grad) > 0
 
 
 @pytest.mark.parametrize(
@@ -294,27 +176,53 @@ def test_t2i_schedule_matches_public_fp32_objective(seed, step, sigma, model_tim
     model = _condition_model(seed=seed, meta_init=True)
     batch = _cached_batch()
     result = model.process_condition(**batch)
-    image_inputs = result["image_inputs"]
 
-    assert image_inputs["pdd_step_index"] == pdd_index
-    torch.testing.assert_close(image_inputs["unique_timesteps"], torch.tensor([model_time]))
+    assert result["pdd_step_index"] == pdd_index
+    torch.testing.assert_close(result["unique_timesteps"], torch.tensor([model_time]))
     torch.testing.assert_close(result["image_loss_weight"], torch.tensor(weight))
-    torch.testing.assert_close(image_inputs["timestep_indices"], torch.zeros(5, dtype=torch.long))
-    torch.testing.assert_close(image_inputs["text_indices"], torch.arange(3))
-    torch.testing.assert_close(image_inputs["image_indices"], torch.arange(3, 5))
-    torch.testing.assert_close(image_inputs["token_tags"], torch.tensor([1, 1, 1, 0, 0]))
-    torch.testing.assert_close(image_inputs["prompt_embeds"], batch["prompt_embeds"][0])
-    assert image_inputs["position_ids"].shape == (5, 3)
-    assert image_inputs["position_ids"].dtype == torch.float32
+    torch.testing.assert_close(result["inverse_indices"], torch.zeros(5, dtype=torch.long))
+    torch.testing.assert_close(result["text_pos_info"]["position_ids"], torch.arange(3))
+    torch.testing.assert_close(result["img_pos_info"]["position_ids"], torch.arange(3, 5))
+    torch.testing.assert_close(result["token_tags"], torch.tensor([1, 1, 1, 0, 0]))
+    torch.testing.assert_close(result["prompt_embeds"], batch["prompt_embeds"][0][0])
+    assert result["img_position_ids"].shape == (1, 5, 3)
+    assert result["img_position_ids"].dtype == torch.float32
 
     generator = torch.Generator(device="cpu").manual_seed(seed)
     assert torch.randint(1000, (1,), generator=generator).item() == step
     clean_latents = batch["clean_latents"][0]
     noise = torch.randn(clean_latents.shape, generator=generator)
-    noised_latents = unpatchify_image_rows(image_inputs["x"], 2, 4, 2, (1, 2, 2))
-    target = unpatchify_image_rows(result["image_training_target"], 2, 4, 2, (1, 2, 2))
+    noised_latents = unpatchify_image_rows(result["x"], 2, 4, 2, (1, 2, 2))
+    target = unpatchify_image_rows(result["training_target"], 2, 4, 2, (1, 2, 2))
     torch.testing.assert_close(noised_latents, (1 - sigma) * clean_latents + sigma * noise)
     torch.testing.assert_close(target, noise - clean_latents)
+
+
+def test_t2i_schedule_uses_configured_release_heads():
+    model = _condition_model(seed=42, pdd_sigmas=(1.0, 0.65, 0.2, 0.0), meta_init=True)
+    result = model.process_condition(**_cached_batch())
+    assert result["pdd_step_index"] == 1
+    assert result["num_pdd_heads"] == 3
+
+
+def test_t2i_condition_accepts_optional_cached_reference_rows():
+    model = _condition_model()
+    batch = _cached_batch()
+    state = model.rng_state_dict()
+    t2i = model.process_condition(**batch)
+    model.load_rng_state_dict(state)
+    references = [torch.ones(1, 2, 2, 2), -torch.ones(1, 2, 2, 4)]
+    edit = model.process_condition(**batch, reference_latents=[references])
+
+    assert edit["cond_rows"] == 3
+    assert edit["x"].shape == (5, 8)
+    torch.testing.assert_close(edit["x"][3:], t2i["x"], rtol=0, atol=0)
+    torch.testing.assert_close(edit["training_target"], t2i["training_target"], rtol=0, atol=0)
+    torch.testing.assert_close(edit["inverse_indices"], torch.tensor([1, 1, 1, 0, 0, 0, 1, 1]))
+    torch.testing.assert_close(
+        edit["unique_timesteps"], torch.cat([torch.tensor([REFERENCE_MODEL_TIME]), t2i["unique_timesteps"]])
+    )
+    torch.testing.assert_close(edit["img_pos_for_infer_output_info"]["position_ids"], torch.arange(3, 8))
 
 
 def test_t2i_schedule_matches_h3_scheduler_at_all_training_steps():
@@ -338,8 +246,8 @@ def test_t2i_rng_checkpoint_replays_next_timestep_and_noise():
     restored_model.load_rng_state_dict(state)
     repeated = restored_model.process_condition(**batch)
 
-    assert not torch.equal(first["image_training_target"], second["image_training_target"])
-    assert not torch.equal(first["image_inputs"]["unique_timesteps"], second["image_inputs"]["unique_timesteps"])
+    assert not torch.equal(first["training_target"], second["training_target"])
+    assert not torch.equal(first["unique_timesteps"], second["unique_timesteps"])
     torch.testing.assert_close(second, repeated, rtol=0, atol=0)
 
 
@@ -353,8 +261,8 @@ def test_t2i_rng_uses_independent_data_parallel_streams(monkeypatch):
 
     batch = _cached_batch()
     assert not torch.equal(
-        first_rank.process_condition(**batch)["image_training_target"],
-        second_rank.process_condition(**batch)["image_training_target"],
+        first_rank.process_condition(**batch)["training_target"],
+        second_rank.process_condition(**batch)["training_target"],
     )
     state = second_rank.rng_state_dict()
     expected = second_rank.process_condition(**batch)
@@ -363,18 +271,69 @@ def test_t2i_rng_uses_independent_data_parallel_streams(monkeypatch):
     torch.testing.assert_close(resumed.process_condition(**batch), expected, rtol=0, atol=0)
 
 
-def test_t2i_rejects_invalid_training_geometry_and_microbatch():
+def test_image_microbatch_preserves_condition_rng_and_reference_order():
+    condition = _condition_model()
+    t2i = DiTTrainer._unpack_dict_of_list(_cached_batch())[0]
+    edit = {**t2i, "reference_latents": [t2i["clean_latents"].clone()]}
+    rows = [edit, t2i, edit]
+    saved = condition.rng_state_dict()
+    expected = [condition.process_condition(**DiTDataCollator()([row])) for row in rows]
+    expected_state = condition.rng_state_dict()
+    condition.load_rng_state_dict(saved)
+    actual = condition.process_condition(**DiTDataCollator()(rows))
+    assert actual["cond_rows"] == [2, 0, 2]
+    torch.testing.assert_close(actual, DiTDataCollator()(expected), rtol=0, atol=0)
+    torch.testing.assert_close(condition.rng_state_dict(), expected_state, rtol=0, atol=0)
+
+
+def test_t2i_rejects_invalid_training_geometry_and_misaligned_columns():
     with pytest.raises(ValueError, match="positive multiples of 32"):
         MiniMaxH3ImageConditionModelConfig(width=1000)
 
     model = _condition_model()
     batch = _cached_batch()
-    batch["text_token_tags"] *= 2
+    batch["clean_latents"] *= 2
     with pytest.raises(ValueError, match="aligned condition columns"):
         model.process_condition(**batch)
-    with pytest.raises(ValueError, match="nonempty aligned condition columns"):
-        model.process_condition(prompt_embeds=[], text_token_tags=[], clean_latents=[])
-    with pytest.raises(ValueError, match="aligned input and image columns"):
-        model.get_condition(["A rectangle", "Another rectangle"], [[]])
     with pytest.raises(ValueError, match="exactly one target image"):
         model.get_condition(["A rectangle"], [[]])
+    with pytest.raises(ValueError, match="aligned input and image columns"):
+        model.get_condition(["A rectangle"], [[]], reference_images=[])
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"height": 0}, "positive multiples of 32"),
+        ({"width": 48}, "positive multiples of 32"),
+        ({"pdd_sigmas": [1.0, 0.2, 0.5, 0.0]}, "must strictly decrease"),
+        ({"pdd_sigmas": [1.0, 0.5, 0.0], "num_pdd_heads": 6}, "2 transitions.*6 PDD heads"),
+        ({"num_pdd_heads": 2}, "6 transitions.*2 PDD heads"),
+    ],
+)
+def test_t2i_condition_config_rejects_invalid_load_overrides(tmp_path, overrides, error):
+    path = tmp_path / "condition.json"
+    _condition_model().config.to_json_file(path, use_diff=False)
+    with pytest.raises(ValueError, match=error):
+        MiniMaxH3ImageConditionModelConfig.from_pretrained(path, **overrides)
+
+
+def test_t2i_condition_config_uses_effective_load_overrides(tmp_path):
+    path = tmp_path / "condition.json"
+    saved = _condition_model().config
+    saved.to_json_file(path, use_diff=False)
+    restored = MiniMaxH3ImageConditionModelConfig.from_pretrained(path)
+    assert restored.pdd_sigmas == DEFAULT_SIGMAS and restored.num_pdd_heads == 6
+
+    overridden = MiniMaxH3ImageConditionModelConfig.from_pretrained(
+        path, height=512, width=256, pdd_sigmas=[1.0, 0.5, 0.0]
+    )
+    assert (overridden.height, overridden.width) == (512, 256)
+    assert overridden.pdd_sigmas == (1.0, 0.5, 0.0)
+    assert overridden.num_pdd_heads == 2
+
+
+@pytest.mark.parametrize("sigmas", [(1.0, 0.4, 0.6, 0.0), (1.0, 0.9, 0.1), (0.9, 0.4, 0.0)])
+def test_t2i_rejects_invalid_pdd_schedule(sigmas):
+    with pytest.raises(ValueError, match="PDD sigmas must strictly decrease from 1 to 0"):
+        MiniMaxH3ImageConditionModelConfig(pdd_sigmas=sigmas)

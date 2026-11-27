@@ -1,0 +1,14 @@
+# Cosmos3-Nano stage 1 of 2 builds the VAE only. Recompute is off: it has no decoder blocks.
+# Its frame settings must match
+# modules_train.yaml: they decide which frames are in the cached latents.
+cosmos3_vae:
+  model_path: cosmos3_vae
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+  model_config:
+    sample_fps: 5
+    min_frames: 5
+    max_frames: 117
+    frame_factor: 4
+    frame_factor_remainder: 1

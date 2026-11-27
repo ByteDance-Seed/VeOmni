@@ -474,6 +474,18 @@ full CPU tensors. Without a model, legacy conversion skips cropping; older padde
 checkpoints need model metadata to export logical rows. Optimizer state
 retains its runtime shapes. The checkpoint layer imports no model packages.
 
+For in-memory weight iteration via [`export_weights`](../../veomni/models/checkpoint/convert.py#L436),
+the model converter may also implement [`crop_hf_export_tensor(name, tensor)`](../../veomni/models/checkpoint/convert.py#L187)
+(for Qwen4-Exp, [`Qwen4ExpCheckpointTensorConverter.crop_hf_export_tensor`](../../veomni/models/transformers/qwen4_exp/checkpoint_tensor_converter.py#L107)):
+given an unprefixed weight FQN and its full unsharded matrix, it returns the
+logical-row slice `[0, logical_rows)` for retained non-expert tensors at the
+[`export_weights` call site](../../veomni/models/checkpoint/convert.py#L500). A
+missing method opts out and leaves exported tensors unchanged. Complete export
+is the default, including frozen tables. Callers that synchronize only trainable
+weights may pass `skip_frozen_ple=True`; the exporter then derives the frozen
+table names from `requires_grad` and omits them before unsharding `DTensor`
+shards, while retaining trainable PLE tables.
+
 See the [converter protocol](../../veomni/models/checkpoint/convert.py#L89)
 and [row-count lookup](../../veomni/checkpoint/row_crop.py#L15).
 
@@ -558,13 +570,10 @@ PLE 2D layout: rows=8 (ple), columns=8 (ple_fsdp), local=[V/8, E/8]
 | `veomni/optim/optimizer.py` | Classify persistent PLE DTensors into the `ple` optimizer bucket. |
 | `veomni/distributed/fsdp2/clip_grad_norm.py` | Verify two-axis norm reduction for persistent PLE shards. |
 | `veomni/models/transformers/qwen4_exp/parallel_plan.py` | Declare the persistent PLE shard and the disjoint EP expert shard. |
-| `qwen4_exp_*_patch_gen_config.py` | Implement GPU/NPU two-dimensional request/result routing. |
+| `veomni/models/transformers/qwen4_exp/modeling_qwen4_exp.py` | Implement GPU/NPU two-dimensional request/result routing. |
 | `tests/models/test_qwen4_exp_packing.py` | Packed-boundary output and gradient parity. |
 | `tests/parallel/ulysses/test_qwen4_exp_ulysses.py` | Ulysses lookup, halo, QSA, GDN, and VLM parity. |
 | `tests/e2e/test_e2e_parallel.py` | Two-device Qwen4-Exp VLM training smoke coverage. |
-
-Generated files under `veomni/models/transformers/qwen4_exp/generated/` must
-only be changed by running patchgen.
 
 ## Validation plan
 
@@ -629,8 +638,7 @@ The real-checkpoint deployment gate records:
 1. Add the persistent-shard plan metadata, mesh accessor, topology guards, and
    unit tests.
 2. Add two-dimensional streaming load and local DTensor materialization tests.
-3. Add the GPU and NPU PLE lookup implementation in patchgen sources and
-   regenerate generated modeling files.
+3. Add the GPU and NPU PLE lookup implementation in `veomni/models/transformers/qwen4_exp/modeling_qwen4_exp.py`.
 4. Add gradient scaling, optimizer classification, and gradient-norm parity
    tests.
 5. Add DCP model/optimizer save-resume and topology-reshard tests.

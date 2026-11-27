@@ -837,3 +837,209 @@ def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
     assert by_name["g"] is None
     assert by_name["beta"] is None
     assert "requires g and beta" in source
+
+
+def test_fla_npu_accepts_grouped_value_heads(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
+    """Hk < Hv must reach the AscendC kernel and grads keep the input heads."""
+    module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
+    seen: list[tuple[str, tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+
+    def fake_chunk_fwd(query, key, value, g, beta, scale, *args):
+        del beta, args
+        seen.append(("forward", tuple(query.shape), tuple(key.shape), tuple(value.shape)))
+        return g, value.transpose(1, 2).contiguous(), query.new_empty(0), None
+
+    def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, *args):
+        del a, initial_state, grad_output, args
+        seen.append(("backward", tuple(query.shape), tuple(key.shape), tuple(value.shape)))
+        return (
+            torch.zeros_like(query),
+            torch.zeros_like(key),
+            torch.zeros_like(value),
+            torch.zeros_like(beta),
+            torch.zeros_like(g),
+        )
+
+    monkeypatch.setattr(module, "_chunk_fwd", fake_chunk_fwd)
+    monkeypatch.setattr(module, "_chunk_bwd", fake_chunk_bwd)
+
+    torch.manual_seed(0)
+    batch, seq, key_heads, value_heads, head_dim = 1, 4, 2, 6, 128
+    query = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(batch, seq, value_heads, head_dim, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(batch, seq, value_heads, dtype=torch.float32, requires_grad=True)
+    beta = torch.randn(batch, seq, value_heads, dtype=torch.bfloat16, requires_grad=True)
+
+    entry = OpEntry(
+        "test_fla_npu_grouped_value_heads",
+        "standard",
+        "fla_npu",
+        module.forward,
+        module.backward,
+        description="Test grouped value heads",
+    )
+    output, _final_state = entry.wrapper(query, key, value, g, beta, use_qk_l2norm_in_kernel=True)
+    assert tuple(output.shape) == (batch, seq, value_heads, head_dim)
+    output.float().square().sum().backward()
+
+    assert tuple(query.grad.shape) == (batch, seq, key_heads, head_dim)
+    assert tuple(key.grad.shape) == (batch, seq, key_heads, head_dim)
+    assert tuple(value.grad.shape) == (batch, seq, value_heads, head_dim)
+    assert tuple(g.grad.shape) == (batch, seq, value_heads)
+    assert tuple(beta.grad.shape) == (batch, seq, value_heads)
+    expected = (
+        (batch, key_heads, seq, head_dim),
+        (batch, key_heads, seq, head_dim),
+        (batch, value_heads, seq, head_dim),
+    )
+    assert seen == [("forward", *expected), ("backward", *expected)]
+
+
+def test_fla_npu_rejects_value_head_ratio_above_four(_stub_npu_input_guard: None) -> None:
+    """Hv/Hk above the composite backward's [1, 4] domain must be refused."""
+    module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
+
+    batch, seq, key_heads, value_heads, head_dim = 1, 4, 1, 5, 128
+    query = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16)
+    key = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16)
+    value = torch.randn(batch, seq, value_heads, head_dim, dtype=torch.bfloat16)
+    g = torch.randn(batch, seq, value_heads, dtype=torch.float32)
+    beta = torch.randn(batch, seq, value_heads, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="1-4x the q/k head count"):
+        module.forward(query, key, value, g, beta)
+
+
+def test_fla_npu_chunk_table_cache_spans_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The host chunk table is built once per distinct boundary list."""
+    module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
+    module._chunk_indices_table.cache_clear()
+
+    built: list[tuple[int, ...]] = []
+    original = module._prepare_chunk_indices_list
+
+    def counting(cu_seqlens, chunk_size):
+        built.append(tuple(int(x) for x in cu_seqlens))
+        return original(cu_seqlens, chunk_size)
+
+    monkeypatch.setattr(module, "_prepare_chunk_indices_list", counting)
+
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    expected = original([0, 3, 6], 64)
+    for _ in range(3):
+        _, _, _, tables = module._ensure_varlen_metadata(None, cu_seqlens, 64)
+        assert tables["64"] == expected
+
+    assert built == [(0, 3, 6)]
+
+
+def _require_fla_npu() -> None:
+    """Skip unless the optional AscendC fla_npu package and an NPU exist."""
+    if not IS_NPU_AVAILABLE:
+        pytest.skip("fla_npu needs an Ascend NPU")
+    try:
+        import fla_npu  # noqa: F401
+    except Exception as error:  # pragma: no cover - optional dependency
+        pytest.skip(f"fla_npu is unavailable: {error}")
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(("key_heads", "value_heads"), [(2, 4), (2, 6)])
+def test_fla_npu_grouped_value_heads_match_expanded_reference(packed: bool, key_heads: int, value_heads: int) -> None:
+    """Grouped q/k heads must match the explicit-expansion reference kernel.
+
+    ``(2, 4)`` is the ratio-2 layout Qwen3.5 and Qwen4-Exp use by default;
+    ``(2, 6)`` keeps a non-power-of-two ratio inside the documented domain.
+    """
+    _require_fla_npu()
+    grouped_op = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
+    eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
+
+    torch.manual_seed(0)
+    head_dim = 128
+    ratio = value_heads // key_heads
+    lengths = (128, 96, 160)
+    total = sum(lengths)
+    device = torch.device("npu")
+
+    base = (
+        torch.randn(1, total, key_heads, head_dim, dtype=torch.bfloat16, device=device),
+        torch.randn(1, total, key_heads, head_dim, dtype=torch.bfloat16, device=device),
+        torch.randn(1, total, value_heads, head_dim, dtype=torch.bfloat16, device=device),
+        -torch.rand(1, total, value_heads, dtype=torch.float32, device=device) * 0.5,
+        torch.rand(1, total, value_heads, dtype=torch.bfloat16, device=device),
+    )
+    cu_seqlens = None
+    if packed:
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+    query_g, key_g, value_g, g_g, beta_g = make_grad_leaves(*base)
+    query_r, key_r, value_r, g_r, beta_r = make_grad_leaves(*base)
+
+    grouped_out, _ = grouped_op(
+        query_g,
+        key_g,
+        value_g,
+        g_g,
+        beta_g,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    # The eager reference rejects varlen inputs. Replay it segment by segment
+    # when the input is packed, and as one continuous sequence otherwise, so the
+    # recurrent state resets at exactly the same boundaries as the kernel.
+    expanded_query = query_r.repeat_interleave(ratio, dim=2)
+    expanded_key = key_r.repeat_interleave(ratio, dim=2)
+    reference_lengths = lengths if packed else (total,)
+    pieces = []
+    start = 0
+    for length in reference_lengths:
+        end = start + length
+        piece, _ = eager(
+            expanded_query[:, start:end],
+            expanded_key[:, start:end],
+            value_r[:, start:end],
+            g_r[:, start:end],
+            beta_r[:, start:end],
+            use_qk_l2norm_in_kernel=True,
+        )
+        pieces.append(piece)
+        start = end
+    reference_out = torch.cat(pieces, dim=1)
+
+    torch.testing.assert_close(
+        grouped_out.float(),
+        reference_out.float(),
+        atol=GDN_NPU_ATOL,
+        rtol=GDN_NPU_RTOL,
+        msg="grouped value-head output does not match the expanded reference",
+    )
+
+    grad_output = torch.randn_like(grouped_out)
+    grouped_out.backward(grad_output)
+    reference_out.backward(grad_output)
+
+    for name, actual, expected in (
+        ("q", query_g.grad, query_r.grad),
+        ("k", key_g.grad, key_r.grad),
+        ("v", value_g.grad, value_r.grad),
+        ("g", g_g.grad, g_r.grad),
+        ("beta", beta_g.grad, beta_r.grad),
+    ):
+        assert actual is not None, f"{name} has no grouped gradient"
+        assert expected is not None, f"{name} has no reference gradient"
+        torch.testing.assert_close(
+            actual.float(),
+            expected.float(),
+            atol=GDN_CHUNK_GRAD_ATOL,
+            rtol=GDN_CHUNK_GRAD_RTOL,
+            msg=f"{name} gradient does not match the expanded reference",
+        )

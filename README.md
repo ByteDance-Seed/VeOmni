@@ -31,6 +31,7 @@ Our guiding principles when building VeOmni are:
 </div>
 
 ## 🔥 Latest News
+- [2026/11] VeOmni now supports [HyperParallel](https://github.com/mindspore-ai/hyper-parallel) as an optional acceleration backend for training on Ascend SuperPoD.
 - [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](https://arxiv.org/abs/2508.02317) was accepted by AAAI 2026
 - [2025/09] We released VeOmni's first official version, [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75).
 - [2025/08] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
@@ -46,10 +47,12 @@ Our guiding principles when building VeOmni are:
 - Dynamic batching strategy, Omnidata processing
 - [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) for checkpoint.
 - Support for NVIDIA GPU, AMD ROCm, Ascend NPU, and Cambricon MLU training.
+- Optional [**HyperParallel**](docs/key_features/hyper_parallel.md) acceleration backend for Ascend SuperPoD training, providing FSDP/HSDP and distributed Muon.
 - Experiment tracking with wandb
 
 ## 📝 Upcoming Features and Changes
 
+- Proposed HyperParallel optimizations for Ascend NPU training, including high-performance modules and MegaMoE ([RFC #1413](https://github.com/ByteDance-Seed/VeOmni/issues/1413)).
 - VeOmni v0.2 Roadmap https://github.com/ByteDance-Seed/VeOmni/issues/268, https://github.com/ByteDance-Seed/VeOmni/issues/271
 - Vit balance tool https://github.com/ByteDance-Seed/VeOmni/issues/280
 - Validation dataset during training https://github.com/ByteDance-Seed/VeOmni/issues/247
@@ -78,6 +81,7 @@ Our guiding principles when building VeOmni are:
 | [Qwen3-MoE](https://huggingface.co/Qwen)                 | 30BA3B/235BA22B               | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml)                         |
 | [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b)    | 120B                          | [gpt_oss_120b_lora_ep4.yaml](configs/text/gpt_oss_120b_lora_ep4.yaml) |
 | [Qwen2-3 Omni](https://huggingface.co/Qwen)              | 7B/30BA3B                     | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml)   |
+| [Kimi K3](docs/examples/kimi_k3.md)                      | Checkpoint-dependent          | [kimi_k3_vl_ascendc.yaml](configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.yaml) |
 | [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
 | [MiniMax H3](docs/examples/minimax_h3.md)                | Checkpoint-dependent          | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml); [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) |
 | [MiniMax H3-Image](docs/examples/minimax_h3_image.md)    | Checkpoint-dependent          | T2I/edit inference; experimental online/offline packed T2I/edit fine-tuning  |

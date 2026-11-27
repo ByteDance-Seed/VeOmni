@@ -28,6 +28,9 @@ MiniMax-H3-Image/
 
 ## Text-to-image
 
+The pipeline requires `audio_enabled=False` (the default). An
+`audio_enabled=True` transformer override is rejected before loading weights.
+
 ```python
 import torch
 from veomni.models.diffusers.minimax_h3_image.inference import MiniMaxH3ImagePipeline
@@ -67,18 +70,22 @@ image.save("edit.png")
 
 ## Text-to-image fine-tuning
 
-The online and offline paths support fixed microbatches with `ulysses_size: 1`.
-They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the six released PDD heads remain frozen. Each training sigma selects the nearest release head, excluding the terminal zero. Both paths sample fresh noise and timesteps during training. The text encoder and VAE stay frozen: offline training reads their cached outputs; online training encodes each raw image/prompt before its DiT update. This is fine-tuning, not a reproduction of the original PDD distillation. Both T2I and reference-image editing support multi-sample packing as described below. Ulysses SP remains separate work.
+The online and offline recipes default to `micro_batch_size: 1`. Use [packed microbatches](#packed-microbatches) for multiple samples; keep `ulysses_size: 1`.
+They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the released PDD heads remain frozen. Image training uses the same H3 layout and DiT `forward()` as video, with one latent frame and no audio tokens. The image VAE and noise schedule are still image-specific.
+
+Both paths sample fresh noise and timesteps. The 1,000-step training schedule uses `shift=2.22`; each training sigma selects the nearest released sigma except the terminal zero. The resulting head buckets have unequal training weight, and their ranges extend beyond the exact inference sigmas. This is flow-matching fine-tuning, not a reproduction of the original PDD distillation. Reference-image editing uses the same objective.
 
 ### Prepare weights and data
 
-After downloading the release, prepare a training transformer directory. The original shards are linked by absolute path, not copied. Keep the release and its shards accessible at those paths on every training node.
+After downloading the release, prepare a training transformer directory. Preparation reads the number of heads from `pdd_fused_heads.safetensors` and requires an explicit, matching `sigmas` schedule in `pdd_config.json`. Only inference can fall back to the legacy schedule if it is missing. The original shards are linked by absolute path, not copied. Keep the release and its shards accessible at those paths on every training node.
 
 ```shell
 uv run python -m scripts.prepare_minimax_h3_image_t2i \
   --model-dir pretrained_models/MiniMax-H3-Image \
   --out-dir pretrained_models/MiniMax-H3-Image-t2i/transformer
 ```
+
+When migrating an older prepared checkpoint, prepare it again in a new directory. In both the online and offline training YAMLs, update `model.model_path` to that directory, `model.config_path` to its `config.json`, and `model.condition_model_path` to its `condition.json` together. The embedding YAML does not load the DiT weights; update only `model.config_path` and `model.condition_model_path` there.
 
 The example expects a CSV with `image,prompt` columns and paths relative to `data.mm_configs.data_dir`. The following pinned DiffSynth sample contains five images:
 
@@ -94,11 +101,15 @@ done
 
 Cache first on a device with enough room to hold the truncated BF16 text encoder (about 48 GiB of parameters), FP32 VAE, and their activations. The embedding run does not load the DiT. The cache stores text embeddings, token tags, and normalized VAE posterior modes. It contains serialized tensors; only load a cache you trust.
 
+For a training target, bilinear cover resizing preserves the source aspect ratio before center-cropping to the configured `height` and `width`. The crop fixes the canvas and can cut content near the edges. Training uses the VAE posterior mode so cache creation is deterministic and does not consume training noise RNG. Inference references serve a different purpose: they are resized by short-edge bounds with bicubic interpolation to preserve their composition, and use posterior samples as in the release.
+
+The eight-rank recipe below needs at least eight cached rows to form a complete data-parallel batch. Before running the embedding command, duplicate the five *data rows* in the CSV once, keeping a single header. If you already cached five rows, editing the CSV is not enough: rerun the embedding stage with the expanded CSV into a fresh `data.offline_embedding_save_dir` and point the offline training YAML's `data.train_path` there.
+
 ```shell
 NPROC_PER_NODE=1 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_t2i_embedding.yaml
 ```
 
-The second stage loads the DiT without the text encoder or VAE. The reference config uses FP32 throughout to preserve the release projections. With about 33B parameters, weights, gradients, and the two AdamW moments alone account for about 62 GiB per rank across eight ranks, before activations and FSDP2 all-gathers. This is a memory estimate, not a measured peak. The meta-initialized FSDP2 config needs at least two ranks. Set the global batch size to the number of data-parallel ranks for this smoke run. The iterable loader requires at least one cached row per data-parallel rank to form a complete batch. If using eight ranks with the five-image sample, duplicate the five *data rows* in the CSV before caching (keep one header).
+The second stage loads the DiT without the text encoder or VAE. The reference config uses FP32 throughout to preserve the release projections. With about 33B parameters, weights, gradients, and the two AdamW moments alone account for about 62 GiB per rank across eight ranks, before activations and FSDP2 all-gathers. This is a memory estimate, not a measured peak. The meta-initialized FSDP2 config needs at least two ranks. Set the global batch size to the number of data-parallel ranks for this smoke run.
 
 ```shell
 NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_t2i_offline.yaml \
@@ -111,9 +122,13 @@ The smoke config does not save weights. For longer runs, set a positive `train.c
 
 Use the prepared transformer and the same `image,prompt` CSV directly. The online path calls the frozen text encoder and VAE on every sample, then uses the same condition processing and loss as offline training. No embedding-cache stage is needed.
 
+The meter sees the raw prompts and images before encoding, so it reports zero MFU, token throughput, and `consumed_chunk_num` for this online recipe. This does not indicate a failed training step.
+
+The CUDA sync test checks for implicit synchronization calls. Copies of CPU noise, schedules, and input data can still stall during staging from pageable memory; passing this test does not establish copy/compute overlap.
+
 The online reference keeps the same FP32 DiT training policy as the offline config and additionally holds about 50.2 GiB of frozen encoder/VAE parameters on each rank. For eight ranks, the weights, gradients, and AdamW moments estimated above plus those encoders exceed 112 GiB per rank before activations and communication buffers. Use hardware with sufficient memory or increase the shard count; this full-parameter recipe does not fit an eight-rank 64 GiB node. Tiny-DiT online validation on a single 64 GiB Ascend NPU does not establish released-33B training capacity.
 
-As with offline training, the CSV must contain at least one row per data-parallel rank. For the eight-rank command below, duplicate the five sample rows once, keeping one header.
+As with offline training, the CSV must contain at least one row per data-parallel rank. If it still contains only the original five sample rows, duplicate them once and keep one header before running the eight-rank command.
 
 ```shell
 NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_t2i_online.yaml \
@@ -124,23 +139,52 @@ Both training configs use `dataset_repeat: true` and can run more updates by inc
 
 ## Reference-image editing fine-tuning
 
-The editing configs use the same prepared transformer as T2I. Supply `dataset/minimax_h3_image_edit/metadata.csv` with columns `image,prompt,reference_images`. `image` is the target image; `reference_images` is a JSON array of one or more reference-image paths, even when there is only one reference. Paths are relative to `dataset/minimax_h3_image_edit`. In CSV, double the JSON quotes, for example `"[""source.png""]"` for one reference. Use trusted image files and cache only data you trust. No editing dataset is bundled.
+Reuse the prepared transformer and its paired `config.json` and `condition.json` from the T2I recipe. The input CSV has `image,prompt,reference_images` columns. The `image` is the target, and `reference_images` is a JSON array of one or more paths. Paths are relative to `data.mm_configs.data_dir`.
 
-For each sample, the reference images appear in the Qwen3-VL text presentation and as VAE latents in the DiT's `[text | references | target]` sequence. Reference resizing matches inference; cached reference latents use posterior modes. The DiT applies the same 0.999 reference timestep as inference, supervises only the target image rows, and excludes reference rows from the MSE. The six PDD heads still follow the nearest-timestep SFT objective, not original PDD distillation.
+The pinned DiffSynth editing sample below has one target and two references. For an eight-rank smoke test, write eight copies of its data row **before** generating the cache. For your own dataset, provide at least one row per data-parallel rank. If you already cached fewer rows, rerun the embedding stage into a fresh `data.offline_embedding_save_dir` and update the offline YAML's `data.train_path`.
 
-The offline path caches text, target latents, and reference latents before training. The online path encodes them at every step:
+```shell
+dataset_url=https://modelscope.cn/datasets/DiffSynth-Studio/diffsynth_example_dataset/resolve/e1b8bcbb91db4097e6b595179238cb76556c8233/minimax_h3_image/MiniMax-H3-Image-Edit
+data_dir=dataset/minimax_h3_image_edit
+mkdir -p "$data_dir/edit"
+for file in metadata.json edit/image1.jpg edit/image_color.jpg edit/image2.jpg; do
+  curl -fsSL "$dataset_url/$file" -o "$data_dir/$file" || exit 1
+done
+uv run python - "$data_dir" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+data_dir = Path(sys.argv[1])
+(sample,) = json.loads((data_dir / "metadata.json").read_text(encoding="utf-8"))
+with (data_dir / "metadata.csv").open("w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow(["image", "prompt", "reference_images"])
+    writer.writerows([[sample["image"], sample["prompt"], json.dumps(sample["edit_image"])]] * 8)
+PY
+```
+
+References are resized as in inference, appear in the text encoder's visual prompt, and are encoded as normalized VAE posterior modes for training. The shared DiT applies the inference reference timestep of `0.999` to the reference rows and computes weighted MSE only over the target rows. Only load trusted caches.
 
 ```shell
 NPROC_PER_NODE=1 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_i2i_embedding.yaml
 NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_i2i_offline.yaml
+```
+
+The online recipe reads the same expanded raw CSV directly without generating a cache. As in T2I, the online meter sees inputs before encoding and reports zero MFU, token throughput, and `consumed_chunk_num`; this does not indicate a failed step.
+
+The CUDA sync check covers VeOmni's H3 condition and DiT code, not the delegated Qwen3-VL vision encoder. Pageable host-memory transfers can still stall during staging.
+
+```shell
 NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_i2i_online.yaml
 ```
 
-The default eight-rank smoke runs require at least eight editing examples, with one row per data-parallel rank. Set a positive `train.checkpoint.save_steps` for longer runs. Each reference adds text and DiT tokens as well as VAE encoding work; size the device memory for the reference count and resolution. Full-parameter released-checkpoint editing training has not been validated on GPU or NPU.
+The [T2I memory estimates](#offline-training-cache-and-run-one-step) do not include the extra tokens and VAE work for each reference. Full-parameter released-checkpoint editing training has not been validated.
 
 ## Packed microbatches
 
-Set `train.micro_batch_size` above one in any T2I or editing online/offline training config to pack samples inside the model. The existing examples default to one. For example, two samples per microbatch and a global batch of 16 use:
+Set `train.micro_batch_size` above one in a T2I or editing online/offline training config. The model packs the samples automatically. For two samples per microbatch and a global batch of 16, use:
 
 ```yaml
 train:
@@ -149,17 +193,13 @@ train:
   dyn_bsz: false
 ```
 
-The global batch must be divisible by `micro_batch_size * dp_size`. With eight data-parallel ranks this example takes one packed microbatch per update; with one rank it accumulates eight. Keep the same global batch when comparing packed training to `micro_batch_size: 1`.
+The global batch must be divisible by `micro_batch_size * dp_size`. On eight data-parallel ranks, this example takes one packed microbatch per update; on one rank it accumulates eight. Prepare at least 16 data rows for the eight-rank example **before** caching, or before training if using the online recipe. When comparing throughput to `micro_batch_size: 1`, keep the same global batch size.
 
-The model concatenates `[text_0 | references_0 | target_0 | text_1 | references_1 | target_1 | ...]` without padding between samples. Main-DiT and text-refiner attention each receive their own cumulative sequence lengths. Positions remain sample-local, while timestep indices are offset into the concatenated timestep table. Each sample keeps its own sampled timestep, PDD head, reference-row crop, and loss weight. The returned `mse_image` is the mean of per-sample weighted target losses, so larger images do not receive more weight just because they contain more rows. Gradient accumulation then preserves the same sample weighting as singleton microbatches.
+The model concatenates samples without padding between them and supplies separate attention boundaries to the shared DiT and text refiner. Positions remain sample-local; timestep indices are offset into the combined timestep table. Each sample keeps its own PDD head and loss weight. The returned loss averages the per-sample weighted MSE over target rows only, and predictions remain separate per sample. Condition processing consumes noise and timesteps in sample order.
 
-Cached samples may have different target sizes, aspect ratios, text lengths, and reference counts. Existing homogeneous T2I or editing caches need no conversion, and batched offline embedding writes one cache row per sample. To combine T2I and editing cache shards, first give every row and shard the same columns: T2I rows must store a serialized empty list in `reference_latents`, rather than an Arrow null or a missing column. The existing Parquet loader does not merge incompatible cache schemas.
+Offline caches may mix target sizes, aspect ratios, text lengths, and reference counts. Existing homogeneous caches need no conversion. To mix T2I and editing shards, give the shards the same columns, and serialize an empty list in `reference_latents` for each T2I row instead of using a missing column or an Arrow null. The online path still crops targets to `condition_model_cfg.height` and `width`; the frozen encoder and VAE process each sample independently. Only the DiT is packed.
 
-Online target preprocessing still crops to `condition_model_cfg.height` and `width`; reference images retain their individual sizes. The frozen text encoder and VAE encode samples independently. Only the DiT execution is packed.
-
-Single-sample condition processing keeps its existing dictionary format. Multiple samples return aligned lists of `image_inputs`, `image_training_target`, `image_loss_weight`, and `image_num_reference_rows`; the model returns one target prediction tensor per sample. The condition RNG consumes samples in input order, including their reference noise, and its saved state resumes the same stream across microbatch groupings.
-
-Keep `cast_forward_inputs: false` to preserve FP32 timesteps and position precision. FlashAttention 2/3 backends use variable-length attention for packed segments; eager/SDPA executes attention separately inside each segment while sharing the main DiT projections and MLP work. The text refiner keeps its per-sample arithmetic. This change supports fixed microbatches with `dyn_bsz: false` and `ulysses_size: 1`; token-budget scheduling, sequence parallelism, and full-model memory validation are separate work.
+Keep `cast_forward_inputs: false`, `dyn_bsz: false`, and `ulysses_size: 1`. FlashAttention 2/3 backends use variable-length attention; eager/SDPA keeps attention within each sample. Multi-sample packing does not support sequence parallelism or block offload.
 
 ## Notes
 

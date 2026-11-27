@@ -1,7 +1,7 @@
 model:
   model_path: pretrained_models/MiniMax-H3-Image-t2i/transformer
   config_path: pretrained_models/MiniMax-H3-Image-t2i/transformer/config.json
-  condition_model_path: configs/model_configs/minimax_h3_image/condition.json
+  condition_model_path: pretrained_models/MiniMax-H3-Image-t2i/transformer/condition.json
   condition_model_cfg:
     base_model_path: pretrained_models/MiniMax-H3-Image
     height: 1024

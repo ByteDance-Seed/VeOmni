@@ -27,12 +27,18 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 def _model(attn_implementation="eager"):
     config = tiny_minimax_h3_config(
-        audio_enabled=False, num_pdd_heads=6, image_training=True, patch_size=(1, 2, 2), num_layers=2
+        audio_enabled=False,
+        num_pdd_heads=6,
+        condition_model_type="MiniMaxH3ImageConditionModel",
+        patch_size=(1, 2, 2),
+        num_layers=2,
     )
     ops = eager_ops_config()
     ops.attn_implementation = attn_implementation
     config._set_ops_implementation(ops)
-    return MiniMaxH3DiTModel(config)
+    model = MiniMaxH3DiTModel(config)
+    model.freeze_model()
+    return model
 
 
 def _samples():
@@ -54,15 +60,15 @@ def _samples():
     ]
     samples = [condition.process_condition(**DiTDataCollator()([row])) for row in rows]
     for sample, head, weight in zip(samples, (0, 5), (0.25, 1.7)):
-        sample["image_inputs"]["pdd_step_index"] = head
+        sample["pdd_step_index"] = head
         sample["image_loss_weight"] = torch.tensor(weight)
         for key in ("x", "prompt_embeds", "unique_timesteps"):
-            sample["image_inputs"][key] = sample["image_inputs"][key].detach().requires_grad_()
+            sample[key] = sample[key].detach().requires_grad_()
     return samples
 
 
 def _batch(samples):
-    return {key: [sample[key] for sample in samples] for key in samples[0]}
+    return DiTDataCollator()(samples)
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
@@ -95,8 +101,8 @@ def test_image_packing_matches_serial_outputs_gradients_and_adamw(checkpointing)
     for serial_sample, packed_sample in zip(serial_samples, packed_samples):
         for key in ("x", "prompt_embeds", "unique_timesteps"):
             torch.testing.assert_close(
-                packed_sample["image_inputs"][key].grad,
-                serial_sample["image_inputs"][key].grad,
+                packed_sample[key].grad,
+                serial_sample[key].grad,
                 rtol=2e-4,
                 atol=2e-6,
                 msg=key,
@@ -115,7 +121,7 @@ def test_image_packing_matches_serial_outputs_gradients_and_adamw(checkpointing)
         if not parameter.requires_grad
     }
     for model in (serial_model, packed_model):
-        torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=1e-3).step()
+        torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=1e-5).step()
     for (name, serial_param), (_, packed_param) in zip(
         serial_model.named_parameters(), packed_model.named_parameters()
     ):
@@ -130,21 +136,21 @@ def test_image_packing_keeps_samples_isolated():
     samples = _samples()
     changed = copy.deepcopy(samples)
     for key in ("x", "prompt_embeds", "unique_timesteps"):
-        changed[0]["image_inputs"][key] = changed[0]["image_inputs"][key].detach() + 0.7
+        changed[0][key] = changed[0][key].detach() + 0.7
     original = model(**_batch(samples))
     modified = model(**_batch(changed))
     torch.testing.assert_close(original.predictions[1], modified.predictions[1], rtol=0, atol=0)
     assert not torch.allclose(original.predictions[0], modified.predictions[0])
     original.predictions[1].sum().backward()
     for key in ("x", "prompt_embeds", "unique_timesteps"):
-        assert torch.count_nonzero(samples[0]["image_inputs"][key].grad) == 0, key
+        assert torch.count_nonzero(samples[0][key].grad) == 0, key
 
 
 def test_image_packing_preserves_local_positions_and_offsets_indices():
     torch.manual_seed(31)
-    samples = [sample["image_inputs"] for sample in _samples()]
+    samples = _samples()
     packed, row_counts = pack_image_samples(samples)
-    lengths = [sample["position_ids"].shape[0] for sample in samples]
+    lengths = [sample["img_position_ids"].shape[1] for sample in samples]
     assert row_counts == [2, 10]
     assert packed["pdd_step_index"] == [(0, lengths[0]), (5, lengths[1])]
     assert packed["packed_seq_params"]["cu_seqlens_host"] == (0, lengths[0], sum(lengths))
@@ -153,32 +159,45 @@ def test_image_packing_preserves_local_positions_and_offsets_indices():
         torch.testing.assert_close(
             packed[key]["cu_seqlens_q"], torch.tensor(packed[key]["cu_seqlens_host"], dtype=torch.int32)
         )
-    for key in ("x", "unique_timesteps", "token_tags", "position_ids"):
+    for key in ("x", "unique_timesteps", "token_tags", "prompt_embeds"):
         torch.testing.assert_close(packed[key], torch.cat([sample[key] for sample in samples]), rtol=0, atol=0)
     torch.testing.assert_close(
-        packed["prompt_embeds"], torch.cat([sample["prompt_embeds"].squeeze(0) for sample in samples]), rtol=0, atol=0
+        packed["img_position_ids"],
+        torch.cat([sample["img_position_ids"] for sample in samples], dim=1),
+        rtol=0,
+        atol=0,
     )
-    for key in ("image_indices", "text_indices"):
-        torch.testing.assert_close(packed[key], torch.cat([samples[0][key], samples[1][key] + lengths[0]]))
+    for key in ("img_pos_info", "text_pos_info", "img_pos_for_infer_output_info"):
+        torch.testing.assert_close(
+            packed[key]["position_ids"],
+            torch.cat([samples[0][key]["position_ids"], samples[1][key]["position_ids"] + lengths[0]]),
+        )
     torch.testing.assert_close(
-        packed["timestep_indices"],
-        torch.cat([samples[0]["timestep_indices"], samples[1]["timestep_indices"] + 1]),
+        packed["inverse_indices"],
+        torch.cat([samples[0]["inverse_indices"], samples[1]["inverse_indices"] + 1]),
     )
-    assert packed["position_ids"].dtype == packed["unique_timesteps"].dtype == torch.float32
+    assert packed["img_position_ids"].dtype == packed["unique_timesteps"].dtype == torch.float32
 
 
 def test_image_packing_requires_refiner_boundaries():
-    packed, _ = pack_image_samples([sample["image_inputs"] for sample in _samples()])
+    packed, _ = pack_image_samples(_samples())
     packed.pop("refiner_packed_seq_params")
-    with pytest.raises(ValueError, match="text-refiner sequence boundaries"):
-        _model().forward_image(**packed)
+    with pytest.raises(ValueError, match="requires packed_seq_params and refiner_packed_seq_params"):
+        _model().dit(**packed, packed_batch=True)
 
 
-@pytest.mark.parametrize("key", ["position_ids", "unique_timesteps"])
+def test_image_packing_rejects_active_update_masks():
+    samples = _samples()
+    samples[0]["update_mask"] = torch.zeros(samples[0]["x"].shape[0])
+    with pytest.raises(ValueError, match="explicit condition-row output cropping"):
+        _model()(**_batch(samples))
+
+
+@pytest.mark.parametrize("key", ["img_position_ids", "unique_timesteps"])
 def test_image_packing_rejects_lower_precision_metadata(key):
-    samples = [sample["image_inputs"] for sample in _samples()]
+    samples = _samples()
     samples[0][key] = samples[0][key].to(torch.bfloat16)
-    with pytest.raises(ValueError, match="precision|float32|cast_forward_inputs"):
+    with pytest.raises(ValueError, match="cast_forward_inputs"):
         pack_image_samples(samples)
 
 

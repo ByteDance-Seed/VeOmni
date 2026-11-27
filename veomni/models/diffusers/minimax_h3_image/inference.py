@@ -9,7 +9,6 @@ its audio branch.
 
 from __future__ import annotations
 
-import json
 import os
 from itertools import chain
 from pathlib import Path
@@ -26,19 +25,21 @@ from veomni.utils.device import get_device_type, get_torch_device
 from ..minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 from ..minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 from .layout import (
-    DEFAULT_SIGMAS,
     MINIMAX_H3_IMAGE_TAG,
-    REFERENCE_NOISE_AUG,
     build_image_packed_sequence,
     get_image_canvas_size,
     patchify_image_latents,
     unpatchify_image_rows,
 )
-from .layout import resize_reference as _resize_reference
 from .minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
     MiniMaxH3ImageConditionModelConfig,
 )
-from .minimax_h3_image_condition.modeling_minimax_h3_image_condition import MiniMaxH3ImageConditionModel
+from .minimax_h3_image_condition.modeling_minimax_h3_image_condition import (
+    REFERENCE_MODEL_TIME,
+    MiniMaxH3ImageConditionModel,
+)
+from .minimax_h3_image_condition.modeling_minimax_h3_image_condition import resize_reference as _resize_reference
+from .pdd import DEFAULT_SIGMAS, load_pdd_release
 
 
 logger = logging.get_logger(__name__)
@@ -80,7 +81,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         self.patch_size = (1, 2, 2)
         self.vae_spatial_compression_ratio = 16
         self.latent_channels = 24
-        self.reference_noise_aug = REFERENCE_NOISE_AUG
+        self.reference_noise_aug = REFERENCE_MODEL_TIME
         self.max_sequence_length = 4096
 
     @staticmethod
@@ -102,6 +103,10 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         transformer_config_kwargs: dict | None = None,
         ops_implementation=None,
     ) -> "MiniMaxH3ImagePipeline":
+        transformer_config_kwargs = dict(transformer_config_kwargs or {})
+        transformer_config_kwargs.setdefault("audio_enabled", False)
+        if transformer_config_kwargs["audio_enabled"]:
+            raise ValueError("MiniMax-H3-Image requires audio_enabled=False.")
         model_path = str(Path(model_path))
         pipe = MiniMaxH3ImagePipeline(device=device, torch_dtype=torch_dtype)
         if ops_implementation is None and pipe.device.type == "cpu":
@@ -118,27 +123,14 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
                 chunk_gated_delta_rule_implementation="eager",
             )
 
-        pdd_path = os.path.join(model_path, "pdd_fused_heads.safetensors")
-        if not os.path.isfile(pdd_path):
-            raise FileNotFoundError(f"MiniMax-H3-Image PDD heads not found: {pdd_path}")
-        from safetensors.torch import load_file
-
-        pdd_state = load_file(pdd_path)
-        num_pdd_heads = int(pdd_state["video_out.weight"].shape[0])
-        pdd_config_path = os.path.join(model_path, "pdd_config.json")
-        sigmas = DEFAULT_SIGMAS
-        if os.path.isfile(pdd_config_path):
-            with open(pdd_config_path) as handle:
-                sigmas = json.load(handle).get("sigmas", DEFAULT_SIGMAS)
-        if len(sigmas) - 1 != num_pdd_heads:
-            raise ValueError(
-                f"Sigma schedule has {len(sigmas) - 1} transitions but the checkpoint has {num_pdd_heads} PDD heads."
-            )
+        pdd_state, sigmas = load_pdd_release(model_path)
+        num_pdd_heads = pdd_state["video_out.weight"].shape[0]
         pipe.scheduler = MiniMaxH3ImageScheduler(sigmas)
 
         condition_cfg = dict(condition_model_cfg or {})
         condition_cfg.setdefault("base_model_path", model_path)
         condition_cfg.setdefault("skip_encoder_load", False)
+        condition_cfg.update(pdd_sigmas=sigmas, num_pdd_heads=num_pdd_heads)
         condition_config = MiniMaxH3ImageConditionModelConfig(**condition_cfg)
         condition_config._apply_ops_overrides(ops_implementation=ops_implementation, _validate=False)
         condition_model = MiniMaxH3ImageConditionModel._from_config(condition_config)
@@ -153,9 +145,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
             pipe.vae_spatial_compression_ratio = pipe.vae.spatial_compression_ratio
             pipe.latent_channels = pipe.vae.config.latent_channels
 
-        transformer_config_kwargs = dict(transformer_config_kwargs or {})
         transformer_config_kwargs.setdefault("num_pdd_heads", num_pdd_heads)
-        transformer_config_kwargs.setdefault("audio_enabled", False)
         transformer_config_path = os.path.join(model_path, "transformer", "config.json")
         dit_config = MiniMaxH3DiTModelConfig.from_pretrained(
             transformer_config_path, _validate_ops=False, **transformer_config_kwargs
@@ -163,7 +153,6 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         dit_config._apply_ops_overrides(ops_implementation=ops_implementation, _validate=False)
         with init_empty_weights():
             pipe.dit = MiniMaxH3DiTModel._from_config(dit_config, torch_dtype=torch_dtype)
-        pipe._keep_dit_fp32_modules()
         load_model_weights(pipe.dit, os.path.join(model_path, "transformer"), init_device="cpu")
         pipe.dit.eval()
         pipe._load_pdd_heads(pdd_state)
@@ -182,20 +171,8 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
                 f"Transformer has {len(final_layer.pdd_out)} PDD heads but the checkpoint has {weight.shape[0]}."
             )
         for index, head in enumerate(final_layer.pdd_out):
-            head.weight.data = weight[index].clone()
-            head.bias.data = bias[index].clone()
-
-    def _keep_dit_fp32_modules(self) -> None:
-        """Preserve the released checkpoint's FP32 projections across loading."""
-        modules = (
-            self.dit.dit.video_patch_proj,
-            self.dit.dit.time_embedder,
-            self.dit.dit.final_layer.video_out,
-            self.dit.dit.final_layer.pdd_out,
-        )
-        for module in modules:
-            if module is not None:
-                module.to(torch.float32)
+            head.weight.data = weight[index].to(head.weight, copy=True)
+            head.bias.data = bias[index].to(head.bias, copy=True)
 
     @staticmethod
     def _parameter_on_device(parameter: torch.Tensor, device: torch.device) -> bool:
@@ -325,7 +302,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
                     unique_timesteps = torch.tensor([timestep], dtype=torch.float32, device=self.device)
                     timestep_indices = torch.zeros(sequence_length, dtype=torch.long, device=self.device)
 
-                noise_pred = self.dit.forward_image(
+                noise_pred = self.dit(
                     x=rows,
                     prompt_embeds=prompt_embeds,
                     unique_timesteps=unique_timesteps,
