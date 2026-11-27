@@ -96,14 +96,14 @@ class _RecordingGdnOp:
         return value + (query.sum() + key.sum() + g.sum() + beta.sum()) * 0, state
 
 
-def _make_config(model_name: str):
+def _make_config(model_name: str, *, value_heads: int = 16):
     common = dict(
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=1,
         layer_types=["linear_attention"],
         linear_num_key_heads=4,
-        linear_num_value_heads=16,
+        linear_num_value_heads=value_heads,
         linear_key_head_dim=8,
         linear_value_head_dim=8,
         linear_conv_kernel_dim=4,
@@ -117,10 +117,10 @@ def _make_config(model_name: str):
     raise ValueError(f"Unsupported model_name={model_name!r}")
 
 
-def _build_layer(model_name: str, impl: str, calls: list[dict[str, object]]):
+def _build_layer(model_name: str, impl: str, calls: list[dict[str, object]], *, value_heads: int = 16):
     from tests.models.compare import eager_ops_config
 
-    config = _make_config(model_name)
+    config = _make_config(model_name, value_heads=value_heads)
     as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     if model_name == "qwen3_5":
         layer = Qwen3_5GatedDeltaNet(config, layer_idx=0)
@@ -263,6 +263,54 @@ def test_gdn_grouped_heads_dispatch_contract(
         assert call["v_contiguous"] is True
         assert call["g_shape"] == (1, expected_seq_len, local_v_heads)
         assert call["beta_shape"] == (1, expected_seq_len, local_v_heads)
+
+
+@pytest.mark.parametrize("ratio", [2, 4, 5, 8])
+def test_qwen4_fla_npu_expands_unsupported_grouped_ratios(ratio):
+    calls: list[dict[str, object]] = []
+    layer = _build_layer("qwen4_exp", "fla_npu", calls, value_heads=4 * ratio)
+    output = layer(torch.randn(1, 6, 64, requires_grad=True))
+    output.sum().backward()
+    assert len(calls) == 1
+    expected_heads = 4 if ratio <= 4 else 4 * ratio
+    assert calls[0]["q_shape"] == (1, 6, expected_heads, 8)
+    assert calls[0]["k_shape"] == (1, 6, expected_heads, 8)
+    assert calls[0]["v_shape"] == (1, 6, 4 * ratio, 8)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("ratio", [5, 8])
+def test_qwen4_fla_npu_expanded_ratio_preserves_outputs_and_gradients(ratio, packed):
+    class DifferentiableGdn:
+        def __init__(self, impl):
+            self.impl = impl
+            self.query = None
+            self.key = None
+
+        def __call__(self, query, key, value, g, beta, *args, **kwargs):
+            assert query.shape == key.shape == value.shape
+            query.retain_grad()
+            key.retain_grad()
+            self.query, self.key = query, key
+            return value + query * key + (g + beta).unsqueeze(-1), None
+
+    candidate = _build_layer("qwen4_exp", "fla_npu", [], value_heads=4 * ratio)
+    reference = _build_layer("qwen4_exp", "fla", [], value_heads=4 * ratio)
+    reference.load_state_dict(candidate.state_dict())
+    candidate.veomni_chunk_gated_delta_rule = DifferentiableGdn("fla_npu")
+    reference.veomni_chunk_gated_delta_rule = DifferentiableGdn("fla")
+    x = torch.randn(1, 6, 64)
+    inputs = [x.clone().requires_grad_(), x.clone().requires_grad_()]
+    boundaries = torch.tensor([0, 3, 6], dtype=torch.int32) if packed else None
+    outputs = [layer(value, cu_seq_lens_q=boundaries) for layer, value in zip((candidate, reference), inputs)]
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+    for output in outputs:
+        output.square().sum().backward()
+    torch.testing.assert_close(inputs[0].grad, inputs[1].grad, atol=0, rtol=0)
+    for actual, expected in zip(candidate.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(actual.grad, expected.grad, atol=0, rtol=0)
+    assert candidate.veomni_chunk_gated_delta_rule.query.grad.abs().sum() > 0
+    assert candidate.veomni_chunk_gated_delta_rule.key.grad.abs().sum() > 0
 
 
 def test_gdn_precomputed_states_always_expand_qk_heads(

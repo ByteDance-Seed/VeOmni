@@ -20,9 +20,6 @@ without importing the exchange helpers.
 
 from __future__ import annotations
 
-# Imported by value. Tests that simulate an NPU host patch this module's name,
-# not ``veomni.utils.device.IS_NPU_AVAILABLE``. The NPU allow-list below is
-# deepseek_v4 only; ``CONTEXT_PARALLEL_MODEL_TYPES`` also admits qwen4_exp on GPU.
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -37,16 +34,19 @@ _NPU_CP_DSA_IMPLEMENTATIONS = {
 def check_cp_platform_support(config: object) -> None:
     """Refuse context-parallel setups this release cannot run.
 
-    Ascend implements context parallelism for DeepSeek-V4 only, and there only
-    ``eager`` and ``cann`` DSA selections. GPU runs are not filtered here.
+    Ascend implements context parallelism for Qwen4-Exp and DeepSeek-V4.
+    DeepSeek-V4 CP supports the ``eager`` and ``cann`` DSA selections.
     """
     if not IS_NPU_AVAILABLE:
         return
 
     model_type = getattr(config, "model_type", None)
+    if model_type == "qwen4_exp":
+        return
     if model_type != "deepseek_v4":
         raise NotImplementedError(
-            "Context parallelism is GPU-only in this release except for deepseek_v4; set cp_size=1 on Ascend/NPU runs."
+            "Context parallelism on Ascend/NPU is currently implemented for Qwen4-Exp and deepseek_v4 only; "
+            "set cp_size=1 on Ascend/NPU runs."
         )
 
     # Fail closed: a missing tree cannot be judged, so it is not admitted.
@@ -57,7 +57,7 @@ def check_cp_platform_support(config: object) -> None:
         )
 
     for field, implementations in _NPU_CP_DSA_IMPLEMENTATIONS.items():
-        implementation = getattr(ops_config, field)
+        implementation = getattr(ops_config, field, None)
         if implementation not in implementations:
             allowed = " or ".join(sorted(implementations))
             raise NotImplementedError(

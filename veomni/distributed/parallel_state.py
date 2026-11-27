@@ -78,9 +78,12 @@ class ParallelState:
     extra_parallel_flat_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
     skip_sp_gather_between_modules: bool = False
+    allow_hybrid_cp: bool = False
     extra_parallel_only: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.allow_hybrid_cp, bool):
+            raise ValueError(f"allow_hybrid_cp must be a boolean; got {self.allow_hybrid_cp!r}.")
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
@@ -94,7 +97,7 @@ class ParallelState:
         if self.ulysses_size < 1:
             raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
-        if self.cp_size > 1 and self.ulysses_size > 1:
+        if self.cp_size > 1 and self.ulysses_size > 1 and not self.allow_hybrid_cp:
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "
                 f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
@@ -514,6 +517,7 @@ def _init_parallel_state(
     name: Optional[str] = "base",
     npu_ep_hccl_buffer_mib: Optional[int] = None,
     npu_ep_hccl_expansion_mode: Optional[str] = None,
+    allow_hybrid_cp: bool = False,
 ) -> "ParallelState":
     """
     Initialize a parallel state, register it under ``name``, and set it as the
@@ -540,6 +544,9 @@ def _init_parallel_state(
     with the same topology hands back this same object.
     """
     global _PARALLEL_STATE
+
+    if not isinstance(allow_hybrid_cp, bool):
+        raise ValueError(f"allow_hybrid_cp must be a boolean; got {allow_hybrid_cp!r}.")
 
     if dp_mode == "hyper_fsdp2":
         hyper_adapter = getattr(sys.modules.get("hyper_parallel.integration.veomni.adapter"), "_ADAPTER", None)
@@ -596,6 +603,7 @@ def _init_parallel_state(
         pp_size,
         cp_size,
         ulysses_size,
+        allow_hybrid_cp,
         dp_mode,
         device_type,
         include_sp_in_fsdp,
@@ -742,6 +750,7 @@ def _init_parallel_state(
         pp_size=pp_size,
         cp_size=cp_size,
         ulysses_size=ulysses_size,
+        allow_hybrid_cp=allow_hybrid_cp,
         dp_mode=dp_mode,
         device_type=device_type,
         include_sp_in_fsdp=include_sp_in_fsdp,
@@ -782,6 +791,7 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         pp_size=accelerator.pp_size,
         cp_size=accelerator.cp_size,
         ulysses_size=accelerator.ulysses_size,
+        allow_hybrid_cp=getattr(accelerator, "allow_hybrid_cp", False),
         extra_parallel_sizes=extra_parallel_sizes,
         extra_parallel_placement_innermost=extra_parallel_placement_innermost,
         extra_parallel_names=extra_parallel_names,

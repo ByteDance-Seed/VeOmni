@@ -30,6 +30,7 @@ from veomni.distributed.parallel_state import get_parallel_state, is_parallel_st
 from veomni.models.loader import get_loader
 from veomni.models.registry import get_model_config, get_model_processor
 from veomni.utils import logging
+from veomni.utils.env import get_env
 
 
 if TYPE_CHECKING:
@@ -95,6 +96,24 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
+    state = get_parallel_state()
+    model_type = getattr(config, "model_type", None)
+    if model_type in CONTEXT_PARALLEL_MODEL_TYPES and get_env("MODELING_BACKEND") == "hf":
+        raise NotImplementedError(f"{model_type} Context Parallelism requires the VeOmni modeling backend.")
+    if model_type == "qwen4_exp":
+        vision_config = getattr(config, "vision_config", None)
+        vision_heads = (
+            vision_config.get("num_heads")
+            if isinstance(vision_config, dict)
+            else getattr(vision_config, "num_heads", None)
+        )
+        if isinstance(vision_heads, int) and vision_heads % state.sp_size != 0:
+            raise ValueError(
+                f"Qwen4-Exp vision heads ({vision_heads}) must be divisible by "
+                f"the combined sequence-parallel size ({state.sp_size})."
+            )
+    if getattr(state, "ulysses_size", 1) > 1 and model_type != "qwen4_exp":
+        raise NotImplementedError("Combined Ulysses/CP is currently implemented for Qwen4-Exp only.")
     check_cp_platform_support(config)
 
     from .seed_omni.modules.module_configuration_base import OmniModuleConfig
@@ -105,7 +124,6 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
         if getattr(config, "_supports_context_parallel", False) or inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
             return
 
-    model_type = getattr(config, "model_type", None)
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
         return
 
