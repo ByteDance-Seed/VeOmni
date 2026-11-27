@@ -792,6 +792,9 @@ def test_build_foundation_model_requires_ops_config():
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
     cfg = eager_ops_config()
+    if model_case.model_type == "HunyuanVideo15Model":
+        # Native attention is dense SDPA and rejects eager/veomni_eager.
+        cfg.attn_implementation = "sdpa"
     model = build_foundation_model(
         model_case.config_factory(model_case.architectures[0]),
         torch_dtype="float32",

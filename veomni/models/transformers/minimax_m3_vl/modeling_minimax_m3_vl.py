@@ -144,29 +144,40 @@ def _minimax_m3_indexer_project(indexer, hidden_states, position_embeddings):
         )
 
 
-def _require_varlen_attention(attention_implementation, *, num_segments, ulysses_enabled, attention_name, causal):
-    """Reject a backend that would leak future tokens, mix packed sequences or skip the Ulysses exchange.
+def _accepts_mask_free_attention(attention_implementation: str, *, ulysses_enabled: bool) -> bool:
+    """Return whether this backend can run MiniMax attention without an explicit mask.
 
-    MiniMax attention passes no mask, so only a varlen backend keeps packed
-    sequences (media inputs or text samples) apart, and only the VeOmni
-    ``veomni_*`` adapters run the Ulysses all-to-all; anything else silently
-    attends across sequences or within the local shard only. ``causal``
-    attention (the dense language layers) needs the varlen backend even for a
-    single sequence: eager attention, for one, applies no causal mask itself.
+    ``veomni_eager`` builds causal visibility from ``module.is_causal``, splits
+    packed ``cu_seqlens``, and gathers under Ulysses. The short name ``eager``
+    uses that kernel but refuses an active Ulysses group. Flash varlen backends
+    keep the same VeOmni-adapter requirement under Ulysses.
     """
-    # This mask-free model requires FlashAttention's varlen contract; other
-    # attention implementations need their own mask preparation.
-    varlen_backend = attention_implementation.removeprefix("veomni_") in (
+    bare = attention_implementation.removeprefix("veomni_")
+    veomni_adapter = attention_implementation.startswith("veomni_")
+    if bare == "eager":
+        return not ulysses_enabled or veomni_adapter
+    return bare in (
         "flash_attention_2",
         "flash_attention_2_hub",
         "flash_attention_3",
         "flash_attention_3_hub",
         "flash_attention_4",
-    ) and (not ulysses_enabled or attention_implementation.startswith("veomni_"))
-    if not varlen_backend and (causal or num_segments > 1 or ulysses_enabled):
+    ) and (not ulysses_enabled or veomni_adapter)
+
+
+def _require_varlen_attention(attention_implementation, *, num_segments, ulysses_enabled, attention_name, causal):
+    """Reject a backend that would leak future tokens, mix packed sequences or skip the Ulysses exchange.
+
+    MiniMax attention passes no mask. ``veomni_eager`` and Flash varlen backends
+    keep packed sequences apart and, for dense language layers, apply causal
+    visibility. Only a ``veomni_*`` adapter runs the Ulysses all-to-all.
+    """
+    if _accepts_mask_free_attention(attention_implementation, ulysses_enabled=ulysses_enabled):
+        return
+    if causal or num_segments > 1 or ulysses_enabled:
         requirement = "causal masking" if causal else "multiple packed sequences"
         raise ValueError(
-            f"MiniMax M3 VL {attention_name} needs a varlen FlashAttention backend (flash_attention_2/3/4) for "
+            f"MiniMax M3 VL {attention_name} needs a varlen FlashAttention backend (flash_attention_2/3/4 or veomni_eager) for "
             f"{requirement}, and its VeOmni veomni_* adapter under Ulysses, got {attention_implementation!r}."
         )
 
@@ -503,43 +514,6 @@ class MiniMaxM3VLRotaryEmbedding(nn.Module):
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
@@ -1137,8 +1111,8 @@ class MiniMaxM3VLVisionAttention(nn.Module):
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        # The vision tower has no grouped-query attention; the shared eager kernel
-        # still expects this attribute to drive its (no-op) `repeat_kv`.
+        # The vision tower has no grouped-query attention. The shared eager kernel
+        # reads head counts, and this attribute keeps the HF attention interface.
         self.num_key_value_groups = 1
         # Bind instance-local attention VeomniOp
         self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)

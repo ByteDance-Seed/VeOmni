@@ -154,6 +154,42 @@ def test_minimax_m3_vl_packed_attention_matches_separate_samples(layer_type):
     torch.testing.assert_close(packed_grad, torch.cat((first_grad, second_grad), dim=1))
 
 
+def test_minimax_m3_vl_dense_eager_packed_matches_separate_samples():
+    """veomni_eager causal-masks and splits packed cu_seqlens, so it matches per-sample eager."""
+    model = modeling.MiniMaxM3VLTextModel(_text_config(modeling, layer_types=["full_attention"])).eval()
+    model.config._attn_implementation = "veomni_eager"
+    reference = _upstream_text_model(model)
+    hidden_size = model.config.hidden_size
+    first = torch.randn(1, 2, hidden_size)
+    second = torch.randn(1, 3, hidden_size)
+    packed = torch.cat((first, second), dim=1)
+
+    with torch.no_grad():
+        actual = model(
+            inputs_embeds=packed,
+            position_ids=torch.tensor([[0, 1, 0, 1, 2]]),
+            cu_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
+            cu_seq_lens_k=torch.tensor([0, 2, 5], dtype=torch.int32),
+            max_length_q=3,
+            max_length_k=3,
+            use_cache=False,
+        ).last_hidden_state
+        expected = torch.cat(
+            [
+                reference(
+                    inputs_embeds=sample,
+                    attention_mask=torch.ones(1, sample.shape[1], dtype=torch.long),
+                    position_ids=torch.arange(sample.shape[1]).unsqueeze(0),
+                    use_cache=False,
+                ).last_hidden_state
+                for sample in (first, second)
+            ],
+            dim=1,
+        )
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_minimax_m3_vl_sparse_layers_never_bind_the_standard_attention():
     """Each layer binds only the operators its layer type calls."""
     model = modeling.MiniMaxM3VLTextModel(
@@ -178,16 +214,18 @@ def test_minimax_m3_vl_sparse_layers_never_bind_the_standard_attention():
 @pytest.mark.parametrize(
     ("attn_implementation", "cu_seq_lens", "ulysses_enabled", "rejected"),
     [
-        ("eager", [0, 2, 5], False, True),
+        ("eager", [0, 2, 5], False, False),
+        ("veomni_eager", [0, 2, 5], True, False),
         ("eager", [0, 5], True, True),
         ("flash_attention_2", [0, 5], True, True),
-        ("eager", [0, 5], False, True),
+        ("eager", [0, 5], False, False),
         ("sdpa", [0, 5], False, True),
         ("flash_attention_2", [0, 5], False, False),
         ("veomni_flash_attention_2", [0, 2, 5], True, False),
     ],
     ids=[
         "eager_packed",
+        "veomni_eager_ulysses",
         "eager_ulysses",
         "non_sp_varlen_ulysses",
         "eager_single_sequence",
@@ -397,7 +435,8 @@ _ONE_MEDIUM = [[1, 2, 2]]
 @pytest.mark.parametrize(
     ("attn_implementation", "grid_thw_list", "ulysses_enabled", "rejected"),
     [
-        ("eager", _TWO_MEDIA, False, True),
+        ("eager", _TWO_MEDIA, False, False),
+        ("veomni_eager", _TWO_MEDIA, True, False),
         ("eager", _ONE_MEDIUM, True, True),
         ("flash_attention_2", _ONE_MEDIUM, True, True),
         ("eager", _ONE_MEDIUM, False, False),
@@ -406,6 +445,7 @@ _ONE_MEDIUM = [[1, 2, 2]]
     ],
     ids=[
         "eager_multiple_media",
+        "veomni_eager_ulysses",
         "eager_ulysses",
         "non_sp_varlen_ulysses",
         "eager_single_medium",

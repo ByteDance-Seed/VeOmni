@@ -256,9 +256,11 @@ def eager_attention_forward(
     if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
         raise ValueError("Eager attention does not support query/key/value tensors with zero dimensions.")
 
-    parallel_state = get_parallel_state()
+    # skip_ulysses callers, including MiniMax segment attention, run inside a
+    # process group that has no VeOmni ParallelState. Do not construct one.
     ulysses_enabled = should_apply_ulysses(skip_ulysses=skip_ulysses)
     if ulysses_enabled:
+        parallel_state = get_parallel_state()
         query, key, value, query_head_count = prepare_ulysses_qkv(
             query.transpose(1, 2),
             key.transpose(1, 2),
