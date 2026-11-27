@@ -321,8 +321,10 @@ def test_npu_fused_attention_matches_eager_forward_and_backward(dtype, num_group
     expected_grads = torch.autograd.grad(expected, npu_inputs, grad_output)
     actual_grads = torch.autograd.grad(actual, npu_inputs, grad_output)
     tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    # Match the NPU QSA test's BF16 tolerance against the CPU FP32 reference.
+    cpu_rtol = 3e-2 if dtype == torch.bfloat16 else tolerance
     for result, same_device, cpu in zip(
         (actual, *actual_grads), (expected, *expected_grads), (reference, *reference_grads)
     ):
         torch.testing.assert_close(result.float(), same_device.float(), atol=tolerance, rtol=tolerance)
-        torch.testing.assert_close(result.float().cpu(), cpu, atol=tolerance, rtol=tolerance)
+        torch.testing.assert_close(result.float().cpu(), cpu, atol=tolerance, rtol=cpu_rtol)
