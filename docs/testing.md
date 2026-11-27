@@ -99,8 +99,7 @@ tests/
 │
 ├── utils/                          # Misc utility tests
 │   ├── test_count_flops.py                       # FLOPs estimation
-│   ├── test_ep_sharded_expert_stream_load.py     # ep_sharded_stream_load per-rank per-expert stacking (CPU)
-│   ├── test_extra_parallel_clip_grad_norm.py      # Grad clipping with EP/EMB dims (8 GPUs)
+│   ├── test_extra_parallel.py                    # ExtraParallel: stream load (CPU/2 GPUs) + grad clipping (CPU/4/8 GPUs)
 │   ├── test_helper.py                             # EnvironMeter utility (8 GPUs)
 │   ├── test_model_loader.py                       # Model loading (4 GPUs)
 │   ├── test_npu_setup.py                          # NPU environment validation
@@ -197,7 +196,7 @@ contracts beside the maintained implementation.
 
 **Models covered**:
 - Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3, deepseek_v4, glm_moe_dsa (`eager` attention only)
-- VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
+- VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe, minimax_m3_vl (HF reference on `eager` attention)
 - Omni: qwen2_5_omni, qwen3_omni_moe
 
 Most eager and registry coverage runs on CPU. Tests for optimized operators or

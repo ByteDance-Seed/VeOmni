@@ -10,34 +10,32 @@ import triton.language as tl
 from .utils import prepare_chunk_indices, exp
 
 
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
-})
-@triton.jit(do_not_specialize=['T', 'B', 'NT'])
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.jit(do_not_specialize=["T", "B", "NT"])
 def prepare_wy_repr_bwd_kernel(
-        k,
-        v,
-        beta,
-        g,
-        A,
-        dw,
-        du,
-        dk,
-        dv,
-        dbeta,
-        dg,
-        cu_seqlens,
-        chunk_indices,
-        T,
-        B,
-        H: tl.constexpr,
-        K: tl.constexpr,
-        V: tl.constexpr,
-        NT,
-        BT: tl.constexpr,
-        BK: tl.constexpr,
-        BV: tl.constexpr,
-        IS_VARLEN: tl.constexpr
+    k,
+    v,
+    beta,
+    g,
+    A,
+    dw,
+    du,
+    dk,
+    dv,
+    dbeta,
+    dg,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    B,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    NT,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
 ):
     core_id = tl.program_id(0)
     total_cores = tl.num_programs(0)
@@ -56,7 +54,10 @@ def prepare_wy_repr_bwd_kernel(
     for idx in range(start_idx, start_idx + chunks_this_pid):
         for i_b in range(B):
             if IS_VARLEN:
-                i_n, i_t = tl.load(chunk_indices + idx * 2).to(tl.int32), tl.load(chunk_indices + idx * 2 + 1).to(tl.int32)
+                i_n, i_t = (
+                    tl.load(chunk_indices + idx * 2).to(tl.int32),
+                    tl.load(chunk_indices + idx * 2 + 1).to(tl.int32),
+                )
                 bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
                 T = eos - bos
             else:
@@ -74,7 +75,9 @@ def prepare_wy_repr_bwd_kernel(
 
                 p_beta = tl.make_block_ptr(beta + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))
                 p_g = tl.make_block_ptr(g + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))
-                p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (BT, T), (1, H * BT), (0, i_t * BT), (BT, BT), (0, 1))
+                p_A = tl.make_block_ptr(
+                    A + (bos * H + i_h) * BT, (BT, T), (1, H * BT), (0, i_t * BT), (BT, BT), (0, 1)
+                )
 
                 b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
                 b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
@@ -86,9 +89,15 @@ def prepare_wy_repr_bwd_kernel(
                 b_dg = tl.zeros([BT], dtype=tl.float32)
 
                 for i_k in range(tl.cdiv(K, BK)):
-                    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                    p_dk = tl.make_block_ptr(dk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                    p_dw = tl.make_block_ptr(dw + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+                    p_k = tl.make_block_ptr(
+                        k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+                    )
+                    p_dk = tl.make_block_ptr(
+                        dk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+                    )
+                    p_dw = tl.make_block_ptr(
+                        dw + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+                    )
                     b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
                     b_k_beta_g = (b_k * b_beta[:, None] * b_g_exp[:, None]).to(b_k.dtype)
                     b_dw = tl.load(p_dw, boundary_check=(0, 1), padding_option="zero")
@@ -97,13 +106,21 @@ def prepare_wy_repr_bwd_kernel(
                     b_dk = b_dk_beta_g * b_beta[:, None] * b_g_exp[:, None]
                     m_k = i_k * BK + tl.arange(0, BK) < K
                     b_dbeta += tl.sum(tl.where(m_k[None, :], b_dk_beta_g * b_k * b_g_exp[:, None], 0), 1)
-                    b_dg += tl.sum(tl.where(m_k[None, :], b_dk_beta_g * b_k * b_g_exp[:, None] * b_beta[:, None], 0), 1)
+                    b_dg += tl.sum(
+                        tl.where(m_k[None, :], b_dk_beta_g * b_k * b_g_exp[:, None] * b_beta[:, None], 0), 1
+                    )
                     tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
 
                 for i_v in range(tl.cdiv(V, BV)):
-                    p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-                    p_dv = tl.make_block_ptr(dv + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-                    p_du = tl.make_block_ptr(du + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+                    p_v = tl.make_block_ptr(
+                        v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+                    )
+                    p_dv = tl.make_block_ptr(
+                        dv + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+                    )
+                    p_du = tl.make_block_ptr(
+                        du + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+                    )
                     b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
                     b_v_beta = (b_v * b_beta[:, None]).to(b_v.dtype)
                     b_du = tl.load(p_du, boundary_check=(0, 1), padding_option="zero")
@@ -122,8 +139,12 @@ def prepare_wy_repr_bwd_kernel(
                 b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
                 for i_k in range(tl.cdiv(K, BK)):
-                    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                    p_dk = tl.make_block_ptr(dk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+                    p_k = tl.make_block_ptr(
+                        k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+                    )
+                    p_dk = tl.make_block_ptr(
+                        dk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+                    )
                     b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
                     b_dk = tl.load(p_dk, boundary_check=(0, 1), padding_option="zero")
                     b_k_beta = (b_k * b_beta[:, None]).to(b_k.dtype)
@@ -143,35 +164,37 @@ def prepare_wy_repr_bwd_kernel(
                 tl.store(p_dbeta, b_dbeta.to(p_dbeta.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'USE_GK': lambda args: args['gk'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
-})
-@triton.jit(do_not_specialize=['T', 'B', 'NT'])
+@triton.heuristics(
+    {
+        "USE_G": lambda args: args["g"] is not None,
+        "USE_GK": lambda args: args["gk"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T", "B", "NT"])
 def recompute_w_u_fwd_kernel(
-        k,
-        v,
-        beta,
-        w,
-        u,
-        A,
-        g,
-        gk,
-        cu_seqlens,
-        chunk_indices,
-        T_tmp,
-        B,
-        H: tl.constexpr,
-        K: tl.constexpr,
-        V: tl.constexpr,
-        NT,
-        BT: tl.constexpr,
-        BK: tl.constexpr,
-        BV: tl.constexpr,
-        USE_G: tl.constexpr,
-        USE_GK: tl.constexpr,
-        IS_VARLEN: tl.constexpr
+    k,
+    v,
+    beta,
+    w,
+    u,
+    A,
+    g,
+    gk,
+    cu_seqlens,
+    chunk_indices,
+    T_tmp,
+    B,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    NT,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_G: tl.constexpr,
+    USE_GK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
 ):
     core_id = tl.program_id(0)
     total_cores = tl.num_programs(0)
@@ -190,9 +213,11 @@ def recompute_w_u_fwd_kernel(
     for idx in range(start_idx, start_idx + chunks_this_pid):
         for i_b in range(B):
             for i_h in range(0, H):
-
                 if IS_VARLEN:
-                    i_n, i_t = tl.load(chunk_indices + idx * 2).to(tl.int32), tl.load(chunk_indices + idx * 2 + 1).to(tl.int32)
+                    i_n, i_t = (
+                        tl.load(chunk_indices + idx * 2).to(tl.int32),
+                        tl.load(chunk_indices + idx * 2 + 1).to(tl.int32),
+                    )
                     bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
                     offset = bos + i_h * T_max
                     T = eos - bos
@@ -205,12 +230,18 @@ def recompute_w_u_fwd_kernel(
                 p_beta = tl.make_block_ptr(beta + offset, (T,), (1,), (i_t * BT,), (BT,), (0,))
                 b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
 
-                p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+                p_A = tl.make_block_ptr(
+                    A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+                )
                 b_A = tl.load(p_A, boundary_check=(0, 1), padding_option="zero")
 
                 for i_v in range(tl.cdiv(V, BV)):
-                    p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-                    p_u = tl.make_block_ptr(u + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+                    p_v = tl.make_block_ptr(
+                        v + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+                    )
+                    p_u = tl.make_block_ptr(
+                        u + (bos * H + i_h) * V, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+                    )
                     b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
                     b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
                     b_u = tl.dot(b_A, b_vb, allow_tf32=False)
@@ -221,27 +252,33 @@ def recompute_w_u_fwd_kernel(
                     b_g = tl.exp(tl.load(p_g, boundary_check=(0,), padding_option="zero"))
 
                 for i_k in range(tl.cdiv(K, BK)):
-                    p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                    p_w = tl.make_block_ptr(w + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+                    p_k = tl.make_block_ptr(
+                        k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+                    )
+                    p_w = tl.make_block_ptr(
+                        w + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+                    )
                     b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
                     b_kb = b_k * b_beta[:, None]
                     if USE_G:
                         b_kb *= b_g[:, None]
                     if USE_GK:
-                        p_gk = tl.make_block_ptr(gk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+                        p_gk = tl.make_block_ptr(
+                            gk + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+                        )
                         b_kb *= tl.exp(tl.load(p_gk, boundary_check=(0, 1), padding_option="zero"))
                     b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
                     tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
 def recompute_w_u_fwd(
-        k: torch.Tensor,
-        v: torch.Tensor,
-        beta: torch.Tensor,
-        A: torch.Tensor,
-        g: Optional[torch.Tensor] = None,
-        gk: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.LongTensor] = None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    g: Optional[torch.Tensor] = None,
+    gk: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
@@ -281,15 +318,15 @@ def recompute_w_u_fwd(
 
 
 def prepare_wy_repr_bwd(
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        A: torch.Tensor,
-        dw: torch.Tensor,
-        du: torch.Tensor,
-        cu_seqlens: Optional[torch.LongTensor],
-        chunk_size: int = 64,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    dw: torch.Tensor,
+    du: torch.Tensor,
+    cu_seqlens: Optional[torch.LongTensor],
+    chunk_size: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = chunk_size

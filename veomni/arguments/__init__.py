@@ -19,7 +19,6 @@ from .arguments_types import (
     CheckpointConfig,
     DataArguments,
     DataloaderConfig,
-    Float8TrainingConfig,
     FSDPConfig,
     GradientCheckpointingConfig,
     InferArguments,

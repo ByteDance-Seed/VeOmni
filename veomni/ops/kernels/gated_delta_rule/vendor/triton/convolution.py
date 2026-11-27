@@ -148,7 +148,7 @@ def causal_conv1d_fwd_kernel(
         if HAS_BIAS:
             b_y += tl.load(bias + o_d, mask=m_d).to(tl.float32)
 
-        if ACTIVATION == 'swish' or ACTIVATION == 'silu':  # pylint: disable=consider-using-in
+        if ACTIVATION == "swish" or ACTIVATION == "silu":  # pylint: disable=consider-using-in
             b_y = b_y * tl.sigmoid(b_y)
 
         if HAS_RESIDUAL:
@@ -311,7 +311,9 @@ def causal_conv1d_bwd_kernel(
                 b_dy = tl.load(p_dy, boundary_check=(0, 1)).to(tl.float32)
 
                 if ACTIVATION == "swish" or ACTIVATION == "silu":  # pylint: disable=consider-using-in
-                    p_y = tl.make_block_ptr(y + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT * W, BD), (1, 0))
+                    p_y = tl.make_block_ptr(
+                        y + bos * D, (T_len, D), (D, 1), (i_t * BT, i_d * BD), (BT * W, BD), (1, 0)
+                    )
                     b_y = tl.load(p_y, boundary_check=(0, 1)).to(tl.float32)
 
             for i_w in tl.static_range(0, W):

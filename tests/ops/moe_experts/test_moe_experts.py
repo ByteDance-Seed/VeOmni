@@ -696,9 +696,9 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     calls = []
     original = swiglu.merged_swiglu_forward
 
-    def record(gate_input, up):
+    def record(gate_input, up, alpha=None):
         calls.append(gate_input.shape)
-        return original(gate_input, up)
+        return original(gate_input, up, alpha)
 
     def run():
         inputs = [value.detach().clone().requires_grad_() for value in (x, gate, w1, w2)]
@@ -726,9 +726,11 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     ep_grads = torch.autograd.grad(ep_out.float().square().mean(), ep_inputs)
     assert calls == [(tokens * top_k, intermediate), (tokens, intermediate)]
 
-    monkeypatch.setattr(swiglu, "merged_swiglu_forward", lambda gate_input, up: torch.ops.aten.silu(gate_input) * up)
+    monkeypatch.setattr(
+        swiglu, "merged_swiglu_forward", lambda gate_input, up, alpha=None: torch.ops.aten.silu(gate_input) * up
+    )
 
-    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None):
+    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None, alpha=None):
         silu = torch.ops.aten.silu(gate_input)
         grad_gate = torch.ops.aten.silu_backward(grad * up, gate_input)
         grad_up = silu * grad
@@ -1553,7 +1555,7 @@ def test_a_fused_row_delegates_a_non_silu_activation_to_eager(impl):
     ``rtol=0, atol=0`` here rather than a loose tolerance. They lose nothing by it:
     those rows do bf16 math and ignore ``expert_dtype``.
 
-    ``deepgemm_fp8`` is deliberately absent. Its GEMM is FP8, so handing the call
+    ``deepgemm`` is deliberately absent. Its GEMM is FP8, so handing the call
     away would skip the quantization and train the experts in bf16 under a config
     that said otherwise -- it refuses instead, covered below.
 
@@ -1782,7 +1784,7 @@ def test_absent_clamp_masks_are_never_inverted():
 def test_a_quantizing_row_refuses_an_activation_it_cannot_evaluate():
     """Neither quantizing row may quietly fall back to the model dtype.
 
-    ``qat`` and ``deepgemm_fp8`` round the expert GEMMs, so an activation they cannot
+    ``qat`` and ``deepgemm`` round the expert GEMMs, so an activation they cannot
     evaluate has no correct answer: handing it to a reference row, or to the model's
     own ``act_fn``, would train the experts at full precision while the config claimed
     quantization. Both refuse, and both say which selection to use instead.
@@ -1802,7 +1804,7 @@ def test_a_quantizing_row_refuses_an_activation_it_cannot_evaluate():
     routing = torch.softmax(torch.randn(tokens, top_k), dim=-1).to(torch.bfloat16)
     empty = gate_up.new_empty(0)
 
-    for row, name in ((qat, "qat"), (deepgemm, "deepgemm_fp8")):
+    for row, name in ((qat, "qat"), (deepgemm, "deepgemm")):
         with pytest.raises(ValueError, match=f"moe_implementation='{name}'"):
             row.wrapper(
                 x,

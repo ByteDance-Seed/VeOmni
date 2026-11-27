@@ -75,6 +75,7 @@ veomni/
 │   ├── platform/       GPU/NPU/MLU availability requirements
 │   ├── install.py      Idempotent process-wide attention integration
 │   ├── batch_invariant/  Scoped deterministic ATen patch
+│   ├── layout/         Tensor layout helpers outside the op registry
 │   ├── qat/            Fake-quantization primitives called by the qat rows
 │   │                   (DeepSeek-V4 FP8/FP4 TileLang)
 │   └── kernels/        Registered per-op/variant eager and optimized rows
@@ -105,6 +106,23 @@ veomni/
 ### FlexAttention package
 
 Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
+
+## Optional HyperParallel Integration
+
+FSDP/HSDP and Muon are selected independently:
+
+```yaml
+model:
+  accelerator:
+    fsdp_config:
+      fsdp_mode: hyper_fsdp2
+  optimizer:
+    type: hyper_muon
+```
+
+Text and VLM trainers load the adapter before model construction; native jobs
+do not require HyperParallel. Normal trainer teardown removes the patch.
+The supported training entry points are the Text and VLM trainers.
 
 ## Trainer Hierarchy
 
@@ -233,6 +251,12 @@ Modeling passes `config.ops_config.<field>` directly to `VeomniOp`. The attentio
 `veomni_sdpa`. On NPU, unweighted RMSNorm supports only `eager`; explicit
 `torch_npu`/`npu` is rejected rather than remapped across variants.
 
+MiniMax M3 sparse layers call two packed operators in sequence.
+`minimax_sparse_indexer` selects key blocks per KV group and
+`minimax_sparse_attention` consumes those indices. Both padded attention
+backends build the token mask per KV group before applying PyTorch eager or
+Ascend fused attention.
+
 The public configuration field remains `model.ops_implementation`. Trainer and
 inference entry points pass it to the model builder as
 `ops_implementation`; changing the config field would break existing CLI
@@ -269,10 +293,10 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
-   - `moe_experts/standard/deepgemm_fp8` uses the same dispatch with
+   - `moe_experts/standard/deepgemm` uses the same dispatch with
      Hopper/Blackwell FP8 grouped forward/dgrad/wgrad in `ops/kernels/moe_experts/`.
      FSDP2 and EP communication retain their configured precision. Quantized
-     weights are invocation-local; see `docs/design/deepgemm_fp8_moe.md`.
+     weights are invocation-local; see `docs/design/deepgemm_moe.md`.
 6. Qwen4-Exp PLE is a model-specific exception: its embedding tables remain
    persistent DTensors on the full `(ple_fsdp, ple)` mesh with placements
    `[Shard(1), Shard(0)]`. FSDP2 ignores those parameters, and PLE routes sparse

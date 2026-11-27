@@ -19,8 +19,6 @@ interleaved gate/up layout with bias and ``alpha`` / ``limit``. Eager is
 the HF expert loop (regular autograd). Fused rows wrap the local Functions.
 """
 
-from torch import nn
-
 from ...platform import (
     NVIDIA_SM70_PLUS,
     NVIDIA_SM90_PLUS,
@@ -33,6 +31,8 @@ from ...platform import (
 from ...registry import register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
+from .kimi_k3 import eager as kimi_k3_eager
+from .kimi_k3 import fused_npu as kimi_k3_fused_npu
 from .shared import unpermute
 from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
@@ -41,6 +41,9 @@ from .standard import npu as standard_npu
 from .standard import qat as standard_qat
 from .standard import quack as standard_quack
 from .standard import triton as standard_triton
+from .swiglu_oai import eager as swiglu_oai_eager
+from .swiglu_oai import npu as swiglu_oai_npu
+from .swiglu_oai import triton as swiglu_oai_triton
 
 
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
@@ -51,14 +54,14 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 #: expert-LoRA request on one of these must be refused rather than silently
 #: falling back to a full-precision ``eager`` base.
 #:
-#: ``deepgemm_fp8`` belongs here for the same reason as ``qat``: its
+#: ``deepgemm`` belongs here for the same reason as ``qat``: its
 #: ``GroupedLinear`` runs the FP8 GEMM in forward, dgrad *and* wgrad. Leaving it
 #: out let a non-SwiGLU activation reach ``merged_experts_act_fn_forward`` -- plain
 #: ``F.linear`` in the model dtype -- and train the routed experts unquantized
-#: while the config said ``deepgemm_fp8``. The remaining rows (``fused_triton``,
+#: while the config said ``deepgemm``. The remaining rows (``fused_triton``,
 #: ``fused_quack``, ``fused_npu``, ``fused_mlu``, ``eager``) do bf16 math and
-#: ignore ``expert_dtype``, so falling back changes nothing for them.
-QUANTIZING_IMPLS = frozenset({"qat", "deepgemm_fp8"})
+#: ignore ``dtype``, so falling back changes nothing for them.
+QUANTIZING_IMPLS = frozenset({"qat", "deepgemm"})
 
 
 register_op(
@@ -143,7 +146,7 @@ register_op(
 register_op(
     "moe_experts",
     "standard",
-    "deepgemm_fp8",
+    "deepgemm",
     description="DeepGEMM blockwise FP8 expert forward, input gradients and weight gradients",
     wrapper=standard_deepgemm.wrapper,
     requirement=GpuKernelRequirement(
@@ -178,4 +181,53 @@ register_op(
     wrapper=gpt_oss_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("quack",),
+)
+
+
+register_op(
+    "moe_experts",
+    "kimi_k3",
+    "eager",
+    description="PyTorch routed SituGLU MoE experts (Kimi K3)",
+    wrapper=kimi_k3_eager.wrapper,
+)
+
+register_op(
+    "moe_experts",
+    "kimi_k3",
+    "fused_npu",
+    description="NPU group-GEMM situ fused MoE experts (Kimi K3 SituGLU, EP-aware)",
+    wrapper=kimi_k3_fused_npu.wrapper,
+    requirement=NpuKernelRequirement(),
+    requires=("triton",),
+    default=True,
+)
+
+register_op(
+    "moe_experts",
+    "swiglu_oai",
+    "eager",
+    description="PyTorch SwiGLU-OAI MoE experts with merged gate/up weights",
+    wrapper=swiglu_oai_eager.wrapper,
+)
+
+register_op(
+    "moe_experts",
+    "swiglu_oai",
+    "fused_triton",
+    description="Triton grouped-GEMM SwiGLU-OAI MoE experts",
+    wrapper=swiglu_oai_triton.wrapper,
+    requirement=_GPU_SM70_OR_ROCM,
+    requires=("triton",),
+    default=True,
+)
+
+register_op(
+    "moe_experts",
+    "swiglu_oai",
+    "fused_npu",
+    description="torch_npu grouped-GEMM SwiGLU-OAI MoE experts",
+    wrapper=swiglu_oai_npu.wrapper,
+    requirement=NpuKernelRequirement(),
+    default=True,
 )

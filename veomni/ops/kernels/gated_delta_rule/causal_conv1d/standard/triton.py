@@ -71,8 +71,8 @@ def forward(
     if cu_seqlens is None:
         cu_seqlens = unused_like(x, dtype=torch.int32)
     elif cu_seqlens.device != x.device:
-        # ``veomni.models.auto`` leaves ``cu_seq_lens_q`` on CPU for NPU fusion
-        # attention. This kernel indexes ``cu_seqlens`` on ``x.device``.
+        # Host-resident ``cu_seqlens`` can arrive from collators or tests;
+        # this kernel indexes ``cu_seqlens`` on ``x.device``.
         cu_seqlens = _stage_boundaries(cu_seqlens, x.device)
 
     weight_wd = weight.transpose(0, 1).contiguous()

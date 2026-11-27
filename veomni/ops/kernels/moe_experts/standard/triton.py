@@ -386,6 +386,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         swiglu_limit=None,
         assume_distinct_experts=False,
         activation="silu",
+        swiglu_alpha=None,
     ):
         """Scatter, merged fc1 GEMM, gated activation, fc2, gather."""
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
@@ -429,7 +430,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # same way the split-fc1 forward does it, so ``forward`` and ``backward``
         # cannot disagree about which function was applied.
         if is_silu(activation):
-            fc1_activation = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
+            fc1_activation = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output, swiglu_alpha)
         else:
             fc1_activation = _expert_activation(fc1_1_output, activation) * fc1_2_output
 
@@ -455,6 +456,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
         ctx.activation = activation
+        ctx.swiglu_alpha = swiglu_alpha
         ctx.max_expert_tokens = max_expert_tokens
         # These intermediates are cheap to recompute in backward and do not
         # need to remain live for the entire forward-to-backward interval.
@@ -537,6 +539,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 grad_fc1_activation,
                 mask_fc1_1 if swiglu_limit is not None else None,
                 mask_fc1_2 if swiglu_limit is not None else None,
+                ctx.swiglu_alpha,
             )
         else:
             gate_grad = activation_backward(grad_fc1_activation * fc1_2_output, fc1_1_output, ctx.activation)
@@ -610,6 +613,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             None,  # swiglu_limit
             None,  # assume_distinct_experts
             None,  # activation
+            None,  # swiglu_alpha
         )
 
 
@@ -625,6 +629,7 @@ def group_gemm_fused_moe_forward(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     activation: str = "silu",
+    swiglu_alpha: float | None = None,
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -672,6 +677,7 @@ def group_gemm_fused_moe_forward(
                 fc2_weight,
                 swiglu_limit,
                 activation,
+                swiglu_alpha,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
@@ -702,6 +708,7 @@ def group_gemm_fused_moe_forward(
                 swiglu_limit,
                 assume_distinct_experts,
                 activation,
+                swiglu_alpha,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
@@ -734,7 +741,7 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     block_size: int = 128,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
     activation: str = "silu",
 ) -> Tensor:
     """Call the Triton fused MoE Function. Empty weights are ``None``.
@@ -743,8 +750,7 @@ def wrapper(
     first; the activation is evaluated from its name alone, through ATen for the served
     set and ``ACT2FN`` otherwise.
     """
-
-    del block_size, expert_dtype
+    del block_size, dtype
     # Empty tensor = unused layout. Registry args stay tensors.
     return group_gemm_fused_moe_forward(
         num_experts,

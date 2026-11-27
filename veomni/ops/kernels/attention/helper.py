@@ -14,6 +14,7 @@
 
 """Shared helpers for attention adapters and mask builders."""
 
+import weakref
 from collections.abc import Callable
 
 import torch
@@ -21,6 +22,70 @@ import torch
 
 _SDPA_CU_SEQLENS_KEYS = ("cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "cu_seq_lens_q", "cu_seq_lens_k")
 _SDPA_PACKED_METADATA_KEYS = (*_SDPA_CU_SEQLENS_KEYS, "max_length_q", "max_length_k", "max_seqlen_q", "max_seqlen_k")
+_FA_CU_SEQLENS_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "cu_seqlens_q", "cu_seqlens_k")
+# One forward usually carries one or two distinct cu_seqlens tensors, shared by
+# Q and K and reused across layers. 16 is that budget, not a prefix-cache size.
+# The list is unlocked and process-global: interleaved forwards still return
+# the right copy or miss and copy again. They do not corrupt each other.
+_NPU_HOST_CU_SEQLENS_CACHE_MAX = 16
+# Trainable tensors key on ``_version``. Inference tensors have no version
+# counter, so they key on storage identity and are not rewritten in place.
+# Shape and dtype stay in that key so two views of one storage do not collide.
+_HostCacheKey = int | tuple[int, tuple[int, ...], torch.dtype]
+_NPU_HOST_CU_SEQLENS_CACHE: list[tuple[weakref.ref[torch.Tensor], _HostCacheKey, torch.Tensor]] = []
+
+
+def _host_cache_key(tensor: torch.Tensor) -> _HostCacheKey:
+    """Key a host copy without reading ``_version`` on an inference tensor."""
+    if tensor.is_inference():
+        return (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
+    return tensor._version
+
+
+def _cached_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a CPU copy of ``tensor``, reusing a cached copy across layers."""
+    if tensor.device.type == "cpu":
+        return tensor
+    key = _host_cache_key(tensor)
+    alive: list[tuple[weakref.ref[torch.Tensor], _HostCacheKey, torch.Tensor]] = []
+    cached: torch.Tensor | None = None
+    for ref, cached_key, cpu_tensor in _NPU_HOST_CU_SEQLENS_CACHE:
+        owner = ref()
+        if owner is None:
+            continue
+        alive.append((ref, cached_key, cpu_tensor))
+        if owner is tensor and cached_key == key:
+            cached = cpu_tensor
+    if cached is not None:
+        _NPU_HOST_CU_SEQLENS_CACHE[:] = alive
+        return cached
+    cpu_tensor = tensor.detach().cpu()
+    alive.append((weakref.ref(tensor), key, cpu_tensor))
+    if len(alive) > _NPU_HOST_CU_SEQLENS_CACHE_MAX:
+        alive = alive[-_NPU_HOST_CU_SEQLENS_CACHE_MAX:]
+    _NPU_HOST_CU_SEQLENS_CACHE[:] = alive
+    return cpu_tensor
+
+
+def ensure_npu_host_cu_seqlens(kwargs: dict, device_type: str) -> dict:
+    """Cache host copies of FlashAttention varlen ``cu_seq_lens_*`` on Ascend NPU.
+
+    Ascend ``npu_fusion_attention`` consumes host-resident cumulative lengths.
+    Hugging Face's own NPU flash attention already copies these tensors to the
+    host. This helper keeps that copy so one forward does not repeat the
+    transfer at every layer. Inference tensors have no ``_version``, so those
+    copies are keyed by storage identity instead.
+    """
+    if device_type != "npu":
+        return kwargs
+    updated: dict | None = None
+    for key in _FA_CU_SEQLENS_KEYS:
+        value = kwargs.get(key)
+        if torch.is_tensor(value) and value.device.type != "cpu":
+            if updated is None:
+                updated = dict(kwargs)
+            updated[key] = _cached_cpu_tensor(value)
+    return kwargs if updated is None else updated
 
 
 def has_isolating_attention_mask(attention_mask: torch.Tensor | None) -> bool:
