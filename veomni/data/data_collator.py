@@ -43,6 +43,18 @@ from ..utils.seqlen_pos_transform_utils import (
 MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 
 
+@dataclass(frozen=True)
+class SerializablePureCollatorHook:
+    """A picklable wrapper for a metadata hook audited to have no mutable state."""
+
+    func: Callable
+    checkpoint_collator_identity: str
+    supports_rng_free_collation = True
+
+    def __call__(self, *args, **kwargs):
+        return self.func(*args, **kwargs)
+
+
 logger = logging.get_logger(__name__)
 
 _LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"

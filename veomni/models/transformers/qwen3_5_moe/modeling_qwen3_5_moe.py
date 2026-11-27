@@ -3226,10 +3226,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         return partial(get_position_id, Qwen3_5MoeModel.get_rope_index, fake_model)
 
     def get_metadata_collate_func(self):
-        # collate_multimodal_metadata is a module-level helper (added via
-        # add_helper) — a bare function reference is picklable for the DataLoader
-        # workers; the Qwen3.5-VL-MoE ViT formula needs no model config.
-        return collate_multimodal_metadata
+        # The helper derives metadata from the batch without RNG or model state.
+        from veomni.data.data_collator import SerializablePureCollatorHook
+
+        return SerializablePureCollatorHook(collate_multimodal_metadata, "veomni:qwen3.5-moe-metadata-v1")
 
     # ── Expert parallel plan ─────────────────────────────────────────────────────
     def get_parallel_plan(self):
