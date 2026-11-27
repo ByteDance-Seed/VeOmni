@@ -37,7 +37,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ..distributed.parallel_state import get_parallel_state
-from ..models.checkpoint.weights import BroadcastMetadata, _dispatch_parameter
+from ..models.checkpoint.weights import BroadcastMetadata, _dispatch_parameter, _get_communication_device
 from ..utils import logging
 from ..utils.device import get_device_type
 from .state_dict import insert_adapter_name, load_adapter_state_dict
@@ -176,12 +176,15 @@ def rank0_load_and_broadcast_lora_weights(
         return
 
     global_rank = get_parallel_state().global_rank
-    torch_device = torch.device(init_device)
+    # CPU offload controls parameter residency, not the collective device.
+    # Match base-weight loading: NCCL/HCCL broadcasts use the accelerator.
+    torch_device = _get_communication_device(init_device)
+    dtensor_to_cpu = init_device == "cpu"
 
     count_tensor = torch.tensor(
         [len(adapter_sd)],
         dtype=torch.int64,
-        device=torch_device if torch_device.type != "cpu" else torch.device("cpu"),
+        device=torch_device,
     )
     dist.broadcast(count_tensor, src=0)
     num_keys = int(count_tensor.item())
@@ -214,7 +217,9 @@ def rank0_load_and_broadcast_lora_weights(
         logger.info_rank0(
             f"{name=}, {shape=}, {dtype=}, broadcast time (ms): {1000 * (time.perf_counter() - start_time)}"
         )
-        _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan=parallel_plan)
+        _dispatch_parameter(
+            model, name, tensor, dtensor_factory, parallel_plan=parallel_plan, dtensor_to_cpu=dtensor_to_cpu
+        )
         if parameter_names_to_load is not None:
             parameter_names_to_load.discard(name)
         del tensor
