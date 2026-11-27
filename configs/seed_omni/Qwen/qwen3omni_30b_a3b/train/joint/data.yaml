@@ -18,13 +18,10 @@
 # training on part of the batch; and it has no thinker target either once the
 # speech is out of the sequence, so the graph would score nothing at all.
 #
-# The corpus is the model's own speech (`scripts/seed_omni/qwen3omni_build_talker_corpus.py`
-# records it, `qwen3omni_filter_talker_corpus.py` quality-gates it), which makes
-# this self-distillation: enough to make the round runnable, not enough to push
-# the talker past where it started. A TTS corpus of the same row shape is the
-# substitute for a run whose output should be a better talker.
+# Point `sources` at a TTS or self-speech corpus matching the
+# `voice_assistant_talker` row shape.
 sources:
-  - /mnt/hdfs/veomni/datasets/qwen3omni_talker_selfspeech
+  - qwen3omni_talker_selfspeech
 names:
   - voice_assistant_talker
 schedule:

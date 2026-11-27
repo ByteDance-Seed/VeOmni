@@ -1,9 +1,11 @@
-# Joint round: every module is declared, and nothing is frozen.
+# Joint round: every module is declared; thinker + talker are trainable and the
+# codec stays frozen (``Qwen3OmniCodec.freeze_model`` always freezes it).
 #
-# The two single-round lists each freeze one half — `train/thinker/modules_train.yaml`
-# omits the talker and codec entirely, `train/talker/modules_train.yaml` freezes
-# the four thinker modules. Here all six are declared and trainable, because the
-# graph in `graph_train.yaml` carries both losses.
+# The two single-round lists each omit or freeze one half —
+# `train/thinker/modules_train.yaml` omits the talker and codec entirely,
+# `train/talker/modules_train.yaml` freezes the four thinker modules. Here all
+# six are declared and the five non-codec modules train together under
+# `graph_train.yaml`.
 #
 # The two `model_config` flags are what the talker reads and cannot produce for
 # itself; leaving either off does not fail silently, the talker names the missing
@@ -28,6 +30,9 @@ qwen3omni_text_encoder:
     # carrier holds embeddings here, so this is the only place the ids still
     # exist — captured before the backbone's scatter overwrites them.
     publish_talker_prompt: true
+    # Matches `infer/audio_output/modules.yaml` and `train/talker/modules_train.yaml`
+    # so training and speech inference share the same opening speech-persona turn.
+    add_speech_system_prompt: true
 
 qwen3omni_llm:
   model_path: qwen3omni_llm

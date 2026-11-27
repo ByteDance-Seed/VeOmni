@@ -1,29 +1,34 @@
-# VeOmni training / inference config for OmniModel V2 — Qwen3-Omni-30B-A3B-Instruct.
+# VeOmni training / inference config for OmniModel — Qwen3-Omni-30B-A3B-Instruct.
 #
 # Prerequisite — split the upstream checkpoint. Qwen3-Omni ships no audio
 # tokenizer, so the codec's encoder half comes from a second checkpoint:
-#   python scripts/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-Omni-30B-A3B-Instruct \
-#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct \
-#     --extra mimi_path=/mnt/hdfs/veomni/models/kyutai/mimi
+#   python scripts/seed_omni/convert_model.py \
+#     --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+#     --output_dir Qwen3-Omni-30B-A3B-Instruct-split \
+#     --extra mimi_path=kyutai/mimi
 #
 # Produces six module sub-folders under model.model_path (audio / vision /
 # text_encoder / llm / talker / codec).
 #
 # Speech output (single-process eager, one GPU):
 #   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/base.yaml \
-#     --model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/thinker_only/modules.yaml \
+#     --model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/audio_output/modules.yaml \
 #     --model.model_config.infer_type audio_output \
 #     --infer.prompt "Hello! Please say this sentence out loud." \
 #     --infer.output_dir qwen3omni_out
 #
-# Text reply only, talker not run: --model.model_config.infer_type thinker_only
+# Text reply only (talker and codec not built):
+#   --model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/thinker_only/modules.yaml \
+#   --model.model_config.infer_type thinker_only
 #
 # Launch thinker training (omni understanding SFT):
 #   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/base.yaml
+#
+# `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
+# local paths this job can read before training.
 
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
+  model_path: Qwen3-Omni-30B-A3B-Instruct-split
   model_config:
     modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/graph_train.yaml
@@ -92,9 +97,8 @@ data:
     pin_memory: true
     prefetch_factor: 2
   mm_configs:
-    # Qwen3-Omni can consume a video's audio track, but the modules reject it
-    # for now (see the guard in the vision preprocessor), so decode video
-    # without audio and feed speech as its own `type="audio"` item.
+    # Time-interleaved in-video audio is not wired yet: decode video without its
+    # audio track and feed speech as its own `type="audio"` item.
     use_audio_in_video: false
     fps: 2.0
     min_frames: 4

@@ -124,8 +124,8 @@ needs both:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct \
+  --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --output_dir Qwen3-Omni-30B-A3B-Instruct-split \
   --extra mimi_path=kyutai/mimi
 ```
 
@@ -169,10 +169,12 @@ python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/t
   --infer.output_dir qwen3omni_out
 ```
 
-* `--model.model_config.infer_type thinker_only` for a text reply with the
-  speech half left out — any text-out evaluation (transcription, VQA, knowledge
-  questions) scores that, and the 3.6B talker plus a vocoder pass per sample is
-  wasted there.
+* For a text reply with the speech half left out, switch both
+  `--model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/thinker_only/modules.yaml`
+  and `--model.model_config.infer_type thinker_only` — any text-out evaluation
+  (transcription, VQA, knowledge questions) scores that, and omitting the speech
+  modules avoids loading the 3.6B talker/vocoder and keeps
+  `add_speech_system_prompt` off.
 * `thinker_only` also isolates faults: if it is right and `audio_output` is not,
   the fault is in the bridge or the talker, not the thinker.
 * The audio scenario needs `add_speech_system_prompt: true` on
@@ -216,7 +218,15 @@ tolerance rather than bit equality.
 
 ```bash
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
+  --model.model_path /path/to/Qwen3-Omni-30B-A3B-Instruct-split
+```
+
+For joint thinker + talker fine-tuning in one backward pass (requires a corpus
+carrying both assistant text and assistant speech, see §4):
+
+```bash
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/joint/base.yaml \
+  --model.model_path /path/to/Qwen3-Omni-30B-A3B-Instruct-split
 ```
 
 The backbone is MoE, so `qwen3omni_llm` declares an expert parallel plan
@@ -256,8 +266,9 @@ silently: the talker names the flag it is missing.
 
 ### Audio on the carrier
 
-`audio_utils.load_audio` returns a clip at whatever rate the file holds and
-`AudioMetadata` records that rate; each module then converts to its own. The
+`veomni/data/seed_omni/utils/audio.py` (`load_audio` / `fetch_audios`) returns a
+clip at whatever rate the file holds and `AudioMetadata` records that rate; each
+module then converts to its own. The
 split exists because the two modules reading a conversation disagree — the
 thinker's tower wants 16 kHz and the codec that tokenises assistant speech wants
 24 kHz — so any rate the data layer picked would be wrong for one of them, and a
@@ -320,7 +331,7 @@ trace.
 
 ```bash
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/talker/base.yaml \
-  --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
+  --model.model_path /path/to/Qwen3-Omni-30B-A3B-Instruct-split
 ```
 
 `train/talker/graph_train.yaml` has two roots, because the talker needs two
@@ -422,7 +433,9 @@ speaker table, codec ids, patch/merge sizes) in a CPU-sized configuration, so
 the suite runs whole without weights.
 
 ```bash
-pytest tests/seed_omni/modules/qwen3omni/ tests/seed_omni/test_shipped_training_graphs.py
+pytest tests/seed_omni/modules/qwen3omni/ \
+  tests/seed_omni/test_shipped_training_graphs.py \
+  tests/seed_omni/test_shipped_generation_graphs.py
 ```
 
 One case decodes the prompt back to text to read the speech-span boundaries, so
@@ -431,10 +444,12 @@ when no mirror is staged.
 
 `test_qwen3omni_accel_align.py` composes the thinker graph under FSDP2 and
 compares it against the monolithic `Qwen3OmniMoeThinkerForConditionalGeneration`
-on loss, every parameter gradient and the AdamW update. Two modes: `sp1`
+on loss, every parameter gradient and the AdamW update. Three modes: `sp1`
 (`dp=2`, one conversation per rank, router objective off) for the FSDP and
-sharding plumbing, and `sp2_router` (`dp=1`, the same packed batch on both
-ranks, objective on) for the graph hook's router gather. The objective is off in
+sharding plumbing, `sp2` (`dp=1`, the same packed batch on both ranks, router
+objective on) for the graph hook's router gather, and `sp2_skip_gather` (`dp=1`,
+`skip_sp_gather_between_modules=True`, router objective on) for direct SP shard
+handoff. The objective is off in
 the SP=1 mode because it is a product of two per-batch means and so is not
 reproducible across a data-parallel split — measured at up to 2.4x on the
 gradients, which would be compared as a failure rather than as the different

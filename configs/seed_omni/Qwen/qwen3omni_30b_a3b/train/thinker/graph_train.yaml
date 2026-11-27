@@ -8,7 +8,7 @@
 #
 # The talker and codec are absent on purpose: this trains the thinker only.
 # Talker training needs (text, audio-code) pairs, which is a separate graph
-# built on `qwen3omni_codec.encode_wav` as the audio tokenizer.
+# built on `qwen3omni_codec.encode` as the audio tokenizer.
 - { from: qwen3omni_audio,                to: qwen3omni_llm }                  # speech/sound embeds -> carrier
 - { from: qwen3omni_vision,               to: qwen3omni_llm }                  # image/video embeds -> carrier
 - { from: qwen3omni_text_encoder.encode,  to: qwen3omni_llm }                  # chat-template tokenise + wte

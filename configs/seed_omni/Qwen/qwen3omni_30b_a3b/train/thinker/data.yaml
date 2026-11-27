@@ -8,10 +8,10 @@
 # matching neither the tower (16 kHz) nor the codec (24 kHz), which is why the
 # data layer declares each clip's rate instead of normalising it.
 sources:
-  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
-  - /mnt/hdfs/user_dir/dataset/LLaVA-Video-178K_0_30_s_academic_v0_1
-  - /mnt/hdfs/veomni/datasets/voice_assistant
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
+  - sharegpt4v_cap_100k
+  - LLaVA-Video-178K
+  - voice_assistant
+  - tulu-3-sft-mixture
 names:
   - sharegpt4v_cap_100k
   - llava_video

@@ -2,8 +2,8 @@
 #
 # The two single-round graphs train one half each, with the other frozen:
 #
-#   train/graph_train.yaml         thinker only, text CE, talker absent
-#   train/talker/graph_train.yaml talker only, thinker frozen, no text CE
+#   train/thinker/graph_train.yaml  thinker only, text CE, talker absent
+#   train/talker/graph_train.yaml   talker only, thinker frozen, no text CE
 #
 # This graph runs both losses over the same batch. That is what the upstream
 # model does in a single fine-tuning pass, and it is the only arrangement where

@@ -1,4 +1,4 @@
-# VeOmni joint training config for OmniModel V2 — Qwen3-Omni-30B-A3B-Instruct.
+# VeOmni joint training config for OmniModel — Qwen3-Omni-30B-A3B-Instruct.
 #
 # Trains the thinker and the talker together: one backward carries the text CE
 # and the talker's semantic+residual CE. The single-round launchers next door
@@ -12,9 +12,9 @@
 # Prerequisite — the same split checkpoint the two rounds use, including the
 # Mimi encoder half:
 #   python scripts/seed_omni/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-Omni-30B-A3B-Instruct \
-#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct \
-#     --extra mimi_path=/mnt/hdfs/veomni/models/kyutai/mimi
+#     --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+#     --output_dir Qwen3-Omni-30B-A3B-Instruct-split \
+#     --extra mimi_path=kyutai/mimi
 #
 # Launch:
 #   bash train.sh tasks/omni/train_omni.py \
@@ -25,9 +25,12 @@
 # `train/thinker/data.yaml` has the text but no assistant speech; `train/talker/data.yaml`
 # has the speech but its text is the transcript of the same turn, which is what
 # the thinker is scored on here. See this directory's `data.yaml`.
+#
+# `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
+# local paths this job can read before training.
 
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
+  model_path: Qwen3-Omni-30B-A3B-Instruct-split
   model_config:
     modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/joint/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/joint/graph_train.yaml

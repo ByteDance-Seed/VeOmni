@@ -1,4 +1,4 @@
-# VeOmni talker-training config for OmniModel V2 — Qwen3-Omni-30B-A3B-Instruct.
+# VeOmni talker-training config for OmniModel — Qwen3-Omni-30B-A3B-Instruct.
 #
 # Trains the speech head only. The thinker (audio / vision / text_encoder / llm)
 # is frozen and runs to produce the talker's prefill; the codec turns the
@@ -7,30 +7,26 @@
 # Prerequisite — split the upstream checkpoint, exactly as for thinker training.
 # Qwen3-Omni ships no audio tokenizer, so the codec's encoder half comes from a
 # second checkpoint, and this round *requires* it (the thinker round does not):
-#   python scripts/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-Omni-30B-A3B-Instruct \
-#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct \
-#     --extra mimi_path=/mnt/hdfs/veomni/models/kyutai/mimi
+#   python scripts/seed_omni/convert_model.py \
+#     --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+#     --output_dir Qwen3-Omni-30B-A3B-Instruct-split \
+#     --extra mimi_path=kyutai/mimi
 #
 # Launch:
 #   bash train.sh tasks/omni/train_omni.py \
 #     configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/talker/base.yaml
 #
-# The corpus this points at is the model's own speech, built in two passes —
-# `scripts/seed_omni/qwen3omni_build_talker_corpus.py` records it, then
-# `qwen3omni_filter_talker_corpus.py` transcribes every clip back through the
-# audio tower and drops the rows whose speech does not say their text
-# (`--score`, then `--apply --min-overlap 0.6`). The second pass is not
-# optional: the generator's own filters read metadata and cannot hear that a
-# clip is fluent noise.
+# The corpus must carry both the assistant's text and its spoken waveform
+# (see `data.yaml` and `voice_assistant_talker` in
+# `veomni/data/seed_omni/preprocess.py`). If you generate a self-distillation
+# corpus from the speech graph, quality-gate it by transcribing clips back
+# through the `thinker_only` graph and filtering low text-overlap rows.
 #
-# Being the model's own speech makes this self-distillation, which is enough to
-# make the round runnable and overfittable but cannot teach the talker anything
-# it does not already say. Swap in a TTS corpus of the same row shape for a run
-# whose output is meant to be a better talker. See `data.yaml`.
+# `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
+# local paths this job can read before training.
 
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
+  model_path: Qwen3-Omni-30B-A3B-Instruct-split
   model_config:
     modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/talker/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/talker/graph_train.yaml

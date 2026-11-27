@@ -11,26 +11,21 @@
 #     what the thinker said, so the text is the speech-span content, not
 #     optional context.
 #
-# `meta["sampling_rate"]` is handled for you: the data layer declares whatever
-# rate the file holds and `Qwen3OmniCodecPreprocessor` resamples to the codec's
-# 24 kHz on the worker. What a new source must not do is normalise the rate away
-# — the tower wants 16 kHz and the codec 24 kHz, so "the rate" is ambiguous
-# across this graph, and a wrong one retunes every target code.
+# `meta["audio_metadata"].sampling_rate` is handled for you: the data layer
+# declares whatever rate the file holds and `Qwen3OmniCodecPreprocessor`
+# resamples to the codec's 24 kHz on the worker. What a new source must not do
+# is normalise the rate away — the tower wants 16 kHz and the codec 24 kHz, so
+# "the rate" is ambiguous across this graph, and a wrong one retunes every
+# target code.
 #
-# `qwen3omni_talker_selfspeech` is the model answering out loud, recorded by
-# `scripts/seed_omni/qwen3omni_build_talker_corpus.py`. Its text and waveform
-# are the same utterance by construction, which is the one property this round
-# actually requires — but the speech is the checkpoint's own, so training on it
-# is self-distillation and cannot push the talker past where it started. It is
-# here to make the round runnable and to overfit a sample end to end. For a run
-# whose output is meant to be a better talker, point this at a TTS corpus with
-# the same row shape (see `voice_assistant_talker_preprocess`) and drop this
-# source.
+# Point `sources` at a TTS or self-speech corpus matching the
+# `voice_assistant_talker` row shape (`veomni/data/seed_omni/preprocess.py`):
+# a text question plus an assistant turn carrying both its text and its audio.
 #
 # No shipped source can substitute: `voice_assistant` is the opposite shape
 # (spoken question, text answer), so its clip is a user-side encoder input.
 sources:
-  - /mnt/hdfs/veomni/datasets/qwen3omni_talker_selfspeech
+  - qwen3omni_talker_selfspeech
 names:
   - voice_assistant_talker
 schedule:
