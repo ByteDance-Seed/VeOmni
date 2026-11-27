@@ -238,7 +238,7 @@ reads bf16 rather than the fp32 master shard.
 
 | Key | Published by | Carried on |
 |-----|--------------|------------|
-| `thinker_embed` / `thinker_hidden` | `qwen3omni_llm.forward` post-hook | `item.meta`, one slice per **backbone-input** row (`is_backbone_input`) |
+| `thinker_embed` / `thinker_hidden` | `qwen3omni_llm.forward` post-hook | `item.meta`, one slice per **thinker-input** row (`carrier.is_thinker_input`) |
 | `qwen3omni_talker_prompt` | `qwen3omni_text_encoder.encode` post-hook | `item.meta` on the sample's first backbone row |
 | `qwen3omni_talker_labels` | `qwen3omni_codec.encode` post-hook | `item.meta` on the assistant audio row |
 
@@ -271,13 +271,14 @@ backbone's packed sequence.
 
 Every packer, every hidden-state scatter, the text encoder's decode walk, the
 talker's segment view and the rebuilt token ids skip it by one shared predicate,
-`veomni.models.seed_omni.utils.conversation.is_backbone_input`. They index the
-same sequence by position, so a row skipped by one and kept by another would
-shift every row after it. The row says so itself: the chat template sets
-`meta["_not_backbone_input"]` when it defers the speech target out of the
-sequence. Deriving the rule from `role`/`type` instead would not work — the same
-`type="audio"` row is an *input* on the user's side and a *target* on the
-assistant's, and only the row itself can say which it is.
+`veomni.models.seed_omni.modules.qwen3omni.carrier.is_thinker_input`. They index
+the same sequence by position, so a row skipped by one and kept by another would
+shift every row after it. The predicate is derived from the row's own `type`,
+`role` and `is_dummy` — there is no marker key on `meta`. It lives in this family
+rather than in `utils.conversation` because the rule it encodes is this family's
+convention: the same `type="audio"` row is an *input* on the user's side and a
+*target* on the assistant's, so `role` is what separates them, and only a
+family that lays its turns out this way can say which is which.
 
 That asymmetry is also why the talker's `prompt_length` is not simply the sum of
 the segments. At inference the prompt ends at the generation prompt and the trace

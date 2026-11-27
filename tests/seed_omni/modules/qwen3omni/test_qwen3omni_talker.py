@@ -1805,3 +1805,56 @@ def test_a_single_modality_batch_keeps_its_mask_full_width():
 
     assert mask.size(1) == full, f"mask must span the packed row, got {mask.size(1)} for {full}"
     assert deepstack is None
+
+
+def test_the_mask_length_skips_the_assistant_speech():
+    """The assistant's waveform is a talker label and never enters this backbone.
+
+    `full_len` sizes the visual mask, so counting that row made the mask thousands
+    of rows wide against a few dozen real ones — and the DeepStack indexing then
+    ran past its own tensors. The predicate has to be the packer's, which is
+    `is_thinker_input`, not merely "not a dummy".
+    """
+    from unittest import mock
+
+    from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN
+
+    module = _accelerated_llm()
+    hidden = module.config.text_config.hidden_size
+
+    question = ConversationItem(
+        type="text",
+        value=torch.randn(4, hidden),
+        role="user",
+        meta={_OMNI_TOKEN_LEN: 4, "labels": torch.zeros(4, dtype=torch.long)},
+    )
+    answer_text = ConversationItem(
+        type="text",
+        value=torch.randn(3, hidden),
+        role="assistant",
+        meta={_OMNI_TOKEN_LEN: 3, "labels": torch.zeros(3, dtype=torch.long)},
+    )
+    # A waveform-length row: it must contribute nothing to the packed sequence.
+    spoken = ConversationItem(
+        type="audio",
+        value=torch.zeros(24000, 8),
+        role="assistant",
+        meta={_OMNI_TOKEN_LEN: 24000},
+    )
+
+    seen = {}
+
+    def capture(embeds, masks, deepstack, *, full_len):
+        seen["full_len"] = full_len
+        return embeds, torch.zeros(1, full_len, dtype=torch.bool), None
+
+    with mock.patch.object(module, "_normalize_visual_inputs", side_effect=capture):
+        with mock.patch(
+            "veomni.models.seed_omni.modules.qwen3omni.llm.accelerated.accelerated.get_parallel_state"
+        ) as ps:
+            ps.return_value.sp_size = 1
+            ps.return_value.fsdp_enabled = False
+            ps.return_value.skip_sp_gather_between_modules = False
+            module.forward_pre(method="forward", conversation_list=[[question, answer_text, spoken]])
+
+    assert seen["full_len"] == 7, f"expected the 4+3 thinker rows only, got {seen['full_len']}"

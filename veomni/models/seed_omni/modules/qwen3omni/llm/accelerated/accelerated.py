@@ -107,7 +107,15 @@ class TrainingMixin(TrainingModuleMixin):
         # The packed row's length, independent of whether the values arrived
         # already sliced: the mask and the DeepStack schedule below are always
         # expressed over the full row and narrowed once by the SP slice.
-        full_len = sum(item_token_len(item) for sample in conversation_list for item in sample if not item.is_dummy)
+        #
+        # ``is_thinker_input``, not merely "not dummy": the assistant's speech is a
+        # talker label that never enters this backbone, and the packer skips it.
+        # Counting it here sized the mask by the waveform's sample count, which in
+        # the talker and joint graphs is thousands of rows against a few dozen real
+        # ones — the DeepStack indexing then ran off the end.
+        full_len = sum(
+            item_token_len(item) for sample in conversation_list for item in sample if is_thinker_input(item)
+        )
 
         # Normalize the visual side to always-real tensors: the SP input-slice branch
         # below slices ``visual_pos_masks`` and indexes the per-layer DeepStack embeds,
@@ -138,9 +146,8 @@ class TrainingMixin(TrainingModuleMixin):
             # sliced in both modes.
             group, sp_size, sp_rank = ps.sp_group, ps.sp_size, ps.sp_rank
 
-            full_len = sum(
-                item_token_len(item) for sample in conversation_list for item in sample if not item.is_dummy
-            )
+            # Same length the mask above was built over; recomputing it here would
+            # be a second chance to disagree with the packer.
             self._sp_own_len = full_len
             # Same length, but tracked apart from ``_sp_own_len``: the router loss
             # gathers its own tensor set and is consumed before the hidden-state
@@ -267,7 +274,11 @@ class TrainingMixin(TrainingModuleMixin):
             self._conversation_carrier = None
             self._pack_inputs_embeds_shape = None
             self._sp_own_len = None
-            window_lengths = [item_token_len(item) for sample in conversation for item in sample if not item.is_dummy]
+            # The same predicate the packer used, so the split lands on the same
+            # segments it concatenated.
+            window_lengths = [
+                item_token_len(item) for sample in conversation for item in sample if is_thinker_input(item)
+            ]
             if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
                 hidden_states = hidden_states.squeeze(0)
             scatter_hidden_states(
