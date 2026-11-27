@@ -28,19 +28,40 @@ from ..shared.activation import is_silu
 from ..shared.swiglu import swiglu_oai
 
 
+def _can_rematerialize_expert_weight():
+    """Avoid retaining a cast copy only when no saved-tensor hook is active.
+
+    In particular, activation offload hooks must not copy an FSDP-managed
+    unsharded FP32 parameter as though it were an activation. The hook query is
+    private to PyTorch; unknown versions conservatively keep the original path.
+    """
+    try:
+        return torch._C._autograd._top_saved_tensors_default_hooks(False) is None
+    except Exception:  # noqa: BLE001 - unknown hook APIs must keep the existing path
+        return False
+
+
 class GmmFunction(torch.autograd.Function):
     """NPU grouped matmul with dgrad and wgrad."""
 
     @staticmethod
-    def forward(ctx, x, weight, group_list):
+    def forward(ctx, x, weight, group_list, fp32_wgrad=False, rematerialize_weight=False):
         """Grouped matmul ``x @ weight`` per expert."""
         import torch_npu
 
-        ctx.save_for_backward(x, weight)
+        # Cast inside the autograd Function so its weight input stays FP32.
+        # Casting before the Function would make autograd round its gradient
+        # to BF16, even if the grouped GEMM itself returned FP32.
+        ctx.fp32_wgrad = fp32_wgrad
+        if fp32_wgrad and (weight.dtype != torch.float32 or x.dtype != torch.bfloat16):
+            raise ValueError("FP32 expert wgrad requires FP32 expert weight and BF16 activations")
+        compute_weight = weight.to(x.dtype) if ctx.fp32_wgrad else weight
+        ctx.rematerialize_weight = fp32_wgrad and rematerialize_weight and _can_rematerialize_expert_weight()
+        ctx.save_for_backward(x, weight if ctx.rematerialize_weight else compute_weight)
         ctx.group_list = group_list
 
         fwd_output = torch_npu.npu_grouped_matmul(
-            [x], [weight], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=1
+            [x], [compute_weight], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=1
         )[0]
         return fwd_output
 
@@ -52,14 +73,16 @@ class GmmFunction(torch.autograd.Function):
         input_tensor, weight = ctx.saved_tensors
         group_list = ctx.group_list
 
+        if ctx.rematerialize_weight:
+            weight = weight.to(input_tensor.dtype)
         weight = torch.transpose(weight, 1, 2)
         grad_input = torch_npu.npu_grouped_matmul(
             [grad_output], [weight], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=1
         )[0]
 
         grad_weight = torch_npu.npu_grouped_matmul(
-            [input_tensor.T],
-            [grad_output],
+            [input_tensor.float().contiguous().T if ctx.fp32_wgrad else input_tensor.T],
+            [grad_output.float() if ctx.fp32_wgrad else grad_output],
             bias=None,
             group_list=group_list,
             split_item=3,
@@ -67,12 +90,15 @@ class GmmFunction(torch.autograd.Function):
             group_list_type=1,
         )[0]
 
-        return grad_input, grad_weight, None
+        if ctx.fp32_wgrad and grad_weight.dtype != torch.float32:
+            raise RuntimeError("FP32 expert weight-gradient GEMM did not return FP32")
+
+        return (grad_input, grad_weight, None, None, None)[: len(ctx.needs_input_grad)]
 
 
-def npu_group_gemm(x, weight, group_list):
+def npu_group_gemm(x, weight, group_list, fp32_wgrad=False, rematerialize_weight=False):
     """Apply ``GmmFunction`` to ``(x, weight, group_list)``."""
-    output = GmmFunction.apply(x, weight, group_list)
+    output = GmmFunction.apply(x, weight, group_list, fp32_wgrad, rematerialize_weight)
     return output
 
 
@@ -146,6 +172,7 @@ def _npu_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
+    fp32_wgrad: bool = False,
 ) -> torch.Tensor:
     """NPU single-device fused MoE forward pass (non-EP).
 
@@ -161,16 +188,27 @@ def _npu_fused_moe_forward(
     tokens_per_expert = torch.histc(selected_experts, bins=num_experts, min=0, max=num_experts)
 
     fc1_weight = _fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight).transpose(1, 2)
-    intermediate_hidden_states = npu_group_gemm(permuted_hidden_states, fc1_weight, tokens_per_expert)
+    intermediate_hidden_states = npu_group_gemm(
+        permuted_hidden_states, fc1_weight, tokens_per_expert, fp32_wgrad, fc1_1_2_weight is not None
+    )
     intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit, swiglu_alpha)
-    output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert)
+    output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert, fp32_wgrad)
     # NPU unpermute applies routing after fc2. Equivalent for a biasless down
     # projection; bf16 rounding can differ from the pre-fc2 fused order.
     hidden_states = torch_npu.npu_moe_token_unpermute(output, row_ids_map, probs=routing_weights)
     return hidden_states
 
 
-def _npu_expert_math(permute_tokens, cumsum, fc1_weight, fc2_weight, swiglu_limit=None, swiglu_alpha=None):
+def _npu_expert_math(
+    permute_tokens,
+    cumsum,
+    fc1_weight,
+    fc2_weight,
+    swiglu_limit=None,
+    swiglu_alpha=None,
+    fp32_wgrad=False,
+    rematerialize_weight=False,
+):
     """Two Ascend grouped GEMMs with the gated activation between them.
 
     Takes the shape ``dispatch_to_ep_class`` provides, so the all-to-all plumbing is
@@ -183,9 +221,9 @@ def _npu_expert_math(permute_tokens, cumsum, fc1_weight, fc2_weight, swiglu_limi
     internally and ``_deepgemm_expert_math`` does explicitly.
     """
     counts = cumsum_to_counts(cumsum)
-    intermediate = npu_group_gemm(permute_tokens, fc1_weight, counts)
+    intermediate = npu_group_gemm(permute_tokens, fc1_weight, counts, fp32_wgrad, rematerialize_weight)
     activated = _swiglu(intermediate, swiglu_limit, swiglu_alpha)
-    return npu_group_gemm(activated, fc2_weight, counts)
+    return npu_group_gemm(activated, fc2_weight, counts, fp32_wgrad)
 
 
 def npu_ep_fused_moe_forward(
@@ -200,6 +238,7 @@ def npu_ep_fused_moe_forward(
     ep_group: dist.ProcessGroup | None = None,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
+    fp32_wgrad: bool = False,
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
 
@@ -217,6 +256,8 @@ def npu_ep_fused_moe_forward(
         fc2_weight.transpose(1, 2),
         swiglu_limit,
         swiglu_alpha,
+        fp32_wgrad,
+        fc1_1_2_weight is not None,
     )
 
 
@@ -232,6 +273,7 @@ def npu_fused_moe_forward(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
     swiglu_alpha: float | None = None,
+    fp32_wgrad: bool = False,
 ):
     """NPU fused MoE entry. Branches on EP."""
     # Router scores stay float32. Cast before the fused scale so the NPU GEMM
@@ -255,6 +297,7 @@ def npu_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
+            fp32_wgrad=fp32_wgrad,
         )
     else:
         final_hidden_states = _npu_fused_moe_forward(
@@ -268,6 +311,7 @@ def npu_fused_moe_forward(
             fc1_1_2_weight,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
+            fp32_wgrad=fp32_wgrad,
         )
     return final_hidden_states
 
@@ -287,9 +331,12 @@ def wrapper(
     block_size: int = 128,
     dtype: str = "fp8",
     activation: str = "silu",
+    fp32_wgrad: bool = False,
 ) -> Tensor:
     """Call the NPU fused MoE path. Empty weights are ``None``."""
     if not is_silu(activation):
+        if fp32_wgrad:
+            raise ValueError("FP32 expert wgrad requires a SiLU activation on the fused_npu MoE backend")
         # This kernel computes SiLU inside the grouped GEMM, so another activation has
         # no seam here. The ``eager`` row runs the reference expert loop, which also
         # owns the expert-parallel dispatch those sharded weights need.
@@ -323,4 +370,5 @@ def wrapper(
         fc1_1_2_weight if fc1_1_2_weight.numel() else None,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
+        fp32_wgrad=fp32_wgrad,
     )

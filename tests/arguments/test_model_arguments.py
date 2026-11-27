@@ -74,6 +74,15 @@ def test_state_offload_rejects_fsdp_cpu_offload():
         )
 
 
+def test_state_offload_rejects_selective_extra_parallel_cpu_offload():
+    with pytest.raises(ValueError, match="cannot be combined with selective ExtraParallel CPU offload"):
+        ModelArguments(
+            model_path="weights",
+            optimizer=OptimizerConfig(state_offload="cpu"),
+            accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(cpu_offload_extra_parallel_names=["ep"])),
+        )
+
+
 def test_optimizer_selection_is_validated_before_model_loading():
     with pytest.raises(ValueError, match="Unknown model.optimizer.type"):
         OptimizerConfig(type="admaw")
