@@ -65,12 +65,43 @@ def test_state_offload_rejects_non_adamw_types_and_unknown_values():
         OptimizerConfig(type="anyprecision_adamw", state_offload="cpu")
 
 
+@pytest.mark.parametrize("offload", ["none", "cpu"])
+def test_optimizer_state_offload_supports_both_positional_apis(offload):
+    assert OptimizerConfig("adamw", offload).state_offload == offload
+    assert OptimizerConfig("adamw", offload).lr == 5e-5
+    legacy = OptimizerConfig("adamw", offload, 0.02, 0.003, 0.001)
+    assert (legacy.state_offload, legacy.lr, legacy.lr_min, legacy.lr_start) == (offload, 0.02, 0.003, 0.001)
+    assert OptimizerConfig("adamw", 0.02, state_offload=offload).lr == 0.02
+    with pytest.raises(TypeError, match="multiple values for argument 'state_offload'"):
+        OptimizerConfig("adamw", offload, state_offload=offload)
+
+
+def test_optimizer_positional_metadata_matches_upstream():
+    import inspect
+
+    assert OptimizerConfig.__match_args__[:3] == ("type", "state_offload", "lr")
+    config = OptimizerConfig("adamw", "cpu", 0.02)
+    match config:
+        case OptimizerConfig(kind, offload, lr):
+            assert (kind, offload, lr) == ("adamw", "cpu", 0.02)
+    inspect.signature(OptimizerConfig).bind("adamw", "cpu", lr=0.02)
+
+
 def test_state_offload_rejects_fsdp_cpu_offload():
     with pytest.raises(ValueError, match="cannot be combined"):
         ModelArguments(
             model_path="weights",
             optimizer=OptimizerConfig(state_offload="cpu"),
             accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(offload=True)),
+        )
+
+
+def test_state_offload_rejects_selective_extra_parallel_cpu_offload():
+    with pytest.raises(ValueError, match="cannot be combined with selective ExtraParallel CPU offload"):
+        ModelArguments(
+            model_path="weights",
+            optimizer=OptimizerConfig(state_offload="cpu"),
+            accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(cpu_offload_extra_parallel_names=["ep"])),
         )
 
 

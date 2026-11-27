@@ -16,7 +16,7 @@
 
 from .chunk_logprobs import chunk_logprobs_function
 from .chunk_topk_distill import chunk_topk_distill_function
-from .cross_entropy_loss import ForCausalLMLoss, ForSequenceClassificationLoss
+from .cross_entropy_loss import ForCausalLMLoss, ForSequenceClassificationLoss, pop_loss_weights
 from .load_balancing_loss import load_balancing_loss
 
 
@@ -26,4 +26,5 @@ __all__ = [
     "chunk_logprobs_function",
     "chunk_topk_distill_function",
     "load_balancing_loss",
+    "pop_loss_weights",
 ]

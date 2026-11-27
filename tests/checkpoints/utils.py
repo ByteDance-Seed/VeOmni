@@ -116,7 +116,9 @@ def get_checkpoint_test_command(
         "--model.optimizer.max_grad_norm 1.0",
         f"--train.max_steps {max_steps}",
         "--train.checkpoint.manager dcp",
-        "--train.checkpoint.save_async True",
+        # ExtraParallel FSDP builds a MultiOptimizer whose proven DCP path is
+        # synchronous. Keep ordinary non-EP cases exercising async saving.
+        f"--train.checkpoint.save_async {ep_size == 1}",
         f"--train.checkpoint.save_hf_weights {save_hf_weights}",
     ]
     # HSDP: split the FSDP dim into (dp_replicate, dp_shard). dp_shard is

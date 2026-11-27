@@ -18,6 +18,43 @@ The multimodal data pipeline lives in `veomni/data/multimodal/` and handles:
 
 All processing parameters are configured through the `mm_configs` section in your YAML config.
 
+## Per-message loss weights for Qwen-VL
+
+For `sharegpt4v_sft` and `sharegpt4v_captioner_sft` samples consumed by the
+Qwen2-VL or Qwen3-VL template, an assistant turn may set binary `loss_mask`
+and a `loss_weight` between 0 and 1. For example:
+
+```json
+{"conversations": [
+  {"from": "human", "value": "<image>Describe this image."},
+  {"from": "gpt", "value": "A short response.", "loss_mask": 1, "loss_weight": 0.25},
+  {"from": "gpt", "value": "Not supervised.", "loss_mask": 0}
+], "images": ["image.jpg"], "source": "sharegpt4v_sft"}
+```
+
+The weight scales each supervised token's cross-entropy and the weighted mean
+uses the sum of token weights. A zero mask excludes the turn. Missing weights
+default to the binary mask. Fractional weights are currently supported only by the `qwen4_exp` VLM model and require
+the `chunk_loss` cross entropy implementation. Other models reject weighted batches. Batches containing MTP labels are not supported. Other
+multimodal preprocessors reject a supplied weight rather than discarding it.
+Router auxiliary loss with fractional loss weights is not supported and is rejected.
+Uncollated list-valued micro-batches, including the RL trainer path, reject
+weighted loss; ordinary unweighted RL batches continue to use their normal path.
+Channel loss remains an unweighted per-source CE metric; it does not represent
+the weighted optimization objective.
+An entire step with no supervised target mass is rejected before the optimizer
+runs, avoiding momentum or weight decay without data supervision. Weighted DPO
+is not supported and is rejected.
+Distributed training also coordinates loader and validation failures before
+forward: this standalone path adds one small world all-reduce per SFT step and
+two per DPO step. Measure the effect on the target interconnect; the stacked
+padding-safe path can reuse its existing preflight instead. In single-process
+SFT, marked padding is excluded from the loss and metrics, and its model
+forward/backward is skipped. Distributed loaders must not inject padded
+micro-batches. Distributed main-process dynamic batching requires
+`drop_last=True` until tail step counts can be coordinated. DPO, Omni and DiT
+reject marked padding.
+
 ## Image Resolution Control
 
 Images are resized by `smart_resize` to satisfy three constraints simultaneously:
@@ -188,6 +225,55 @@ data:
 | 64 frames | Each frame up to 602112 px | Each frame up to min(602112, 2889523/64*2) ≈ 90297 px |
 
 With `video_total_pixels`, longer videos automatically get lower per-frame resolution to stay within the token budget.
+
+## Checkpoint identity for metadata collator hooks
+
+`SerializablePureCollatorHook` in `veomni.data.data_collator` wraps a model's
+metadata hook with two declarations intended for checkpoint compatibility:
+
+- `supports_rng_free_collation = True` declares that the wrapped hook derives
+  its metadata without consuming random state or depending on mutable state.
+- `checkpoint_collator_identity` is a stable, versioned string identifying
+  the hook's collation semantics, such as `veomni:qwen4-exp-metadata-v1`.
+
+Only the hook's author or maintainer should make the RNG-free declaration,
+after auditing the function and its dependencies for deterministic output and
+the absence of Python, NumPy, Torch, or other RNG consumption and mutable
+external state. The hook may update the supplied batch with its derived
+metadata; this does not imply that other transforms, the complete collator, or
+the data source are RNG-free. Wrapping a callable does not check the claim.
+
+Keep an identity stable for behavior-preserving refactors. Change its version
+when the same batch and collation inputs can produce incompatible metadata,
+for example after changing metadata layout, boundary semantics, or a
+behavior-affecting configuration not otherwise captured in the identity. A
+new identity identifies the changed behavior; it does not itself migrate or
+validate an older checkpoint.
+
+The wrapper and its `func` must be pickleable where DataLoader workers are
+started or restored. Prefer an importable module-level function, keep its module
+available to new processes, and test a pickle round trip; wrapping a closure,
+lambda, or unpickleable captured object does not make it pickleable. Qwen3.5,
+Qwen3.5-MoE, and Qwen4-Exp use these wrappers for their model-provided hooks on
+both GPU and NPU paths.
+
+`VLMTrainer._build_collate_fn` obtains the optional hook from
+`model.get_metadata_collate_func()` and passes it to `MainCollator`. Without
+sequence parallelism, `PackingCollator` invokes it after packing and passes
+zero image/video SP-padding counts. With sequence parallelism,
+`SequenceParallelCollator` invokes it after SP padding and slicing, passing
+the actual padding counts for `pixel_values` and `pixel_values_videos`.
+`sp_pad` maps those keys to the number of appended patch rows. The hook receives
+`(batch, sp_pad)` and updates the batch in place.
+
+The `cyclic_packed` loader's `_StatelessMainCollator` requires the RNG-free
+declaring `SerializablePureCollatorHook` wrapper and incorporates the hook
+identity into its checkpoint contract.
+Other loaders may not consume these declarations. The markers are author
+attestations, not a proof that the hook, its dependencies, or the data source
+are pure; they do not by themselves establish exact training recovery.
+See the [checkpoint guide](checkpoint.md) for the available save and restore
+workflows.
 
 ## Audio Processing
 

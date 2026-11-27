@@ -120,6 +120,10 @@ class TrainerTest(BaseTrainer):
         self.args.data.train_path = self.tmp_train_path
         self.args.data.enable_multisource = True
         self.args.data.dataset_name = "veomni_weighted_multisource"
+        # This fixture owns the fixed input files and deterministic transform;
+        # opt into the same exact-replay contract required by real resumes.
+        self.args.data.resume_input_contract = "sha256:" + "1" * 64
+        self.args.data.resume_input_deterministic = True
 
         self.args.train.num_train_epochs = 3
 
@@ -140,7 +144,7 @@ class TrainerTest(BaseTrainer):
         dist.barrier()
 
         state = cast(WeightedMultiSourceDataset, self.train_dataset).state_dict()
-        assert state["version"] == 0
+        assert state["version"] == 1
         assert state["topology"]["stopping_strategy"] == "all_exhausted"
         assert state["topology"]["level"] == "token"
         assert state["topology"]["source_names"] == self.multisource_names
@@ -237,6 +241,14 @@ class TrainerTest(BaseTrainer):
 
     def resume_train(self):
         self.is_resume_train = True
+        # A fresh process builds an unadvanced dataset before loading its
+        # saved epoch. Reusing the completed trainer's dataset would instead
+        # retain the final epoch and correctly fail the exact-resume preflight.
+        self._build_dataset()
+        self._build_dataloader()
+        # This data-only fixture never wrote model DCP; keep its output separate
+        # instead of pretending the saved trainer cursor is a complete step.
+        self.args.train.checkpoint.save_path = os.path.join(self.args.train.checkpoint.save_path, "resumed")
         super().train()
 
     def destroy_distributed(self):
@@ -415,7 +427,7 @@ def test_state_dict_structure():
         source_ids=["id_a", "id_b"],
     )
     state = dataset.state_dict()
-    assert state["version"] == 0
+    assert state["version"] == 1
     assert state["topology"]["source_ids"] == ["id_a", "id_b"]
     assert sorted(state["runtime"]["avg_len_sum"].keys()) == ["id_a", "id_b"]
     assert sorted(state["runtime"]["avg_len_count"].keys()) == ["id_a", "id_b"]
@@ -448,7 +460,9 @@ def test_exhausted_state_save_restore_and_elastic():
         stopping_strategy="all_exhausted",
         source_ids=["id_a", "id_b"],
     )
-    dataset_new.load_state_dict(state)
+    # The mock does not attest source identity; this tests explicit non-exact
+    # migration rather than the strict continuation contract.
+    dataset_new.load_state_dict(state, reconcile_policy="allow_add_remove")
     assert dataset_new._exhausted == [True, False]
 
     # Scenario 2: Add a new source - new source should default to False
@@ -499,7 +513,8 @@ def test_exhausted_state_backward_compatible():
         },
     }
 
-    dataset.load_state_dict(old_state)
+    # A caller may explicitly migrate old metadata without claiming exact order.
+    dataset.load_state_dict(old_state, reconcile_policy="allow_add_remove")
     assert dataset._exhausted == [False, False]
 
 
