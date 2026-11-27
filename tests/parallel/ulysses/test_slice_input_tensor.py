@@ -2,7 +2,9 @@ import pytest
 import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.distributed.sequence_parallel import comm as sp_comm
 from veomni.distributed.sequence_parallel import data as sp_data
+from veomni.distributed.sequence_parallel import utils as sp_utils
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -41,3 +43,34 @@ class TestSliceInputTensor:
         result = sp_data.slice_input_tensor(x, dim=1, padding=True, padding_value=9, group=None)
         expected = torch.tensor([[5, 9]])
         assert torch.equal(result, expected)
+
+
+class TestRemoveLastRankPadding:
+    """Unit tests for remove_last_rank_padding."""
+
+    @staticmethod
+    def _shards(monkeypatch, unpad_dim_size, sp_world):
+        padded = -(-unpad_dim_size // sp_world) * sp_world
+        full = torch.arange(padded).reshape(1, padded)
+        local_len = padded // sp_world
+        out = []
+        for rank in range(sp_world):
+            monkeypatch.setattr(sp_utils, "get_ulysses_sequence_parallel_rank", lambda g, r=rank: r)
+            local = full[:, rank * local_len : (rank + 1) * local_len]
+            out.append(sp_utils.remove_last_rank_padding(local, dim=1, unpad_dim_size=unpad_dim_size, group=object()))
+        return out
+
+    @pytest.mark.parametrize("unpad_dim_size, sp_world", [(8, 4), (10, 4), (1, 4), (5, 4), (7, 2)])
+    def test_shards_concat_to_unpadded_sequence(self, monkeypatch, unpad_dim_size, sp_world):
+        shards = self._shards(monkeypatch, unpad_dim_size, sp_world)
+        assert torch.equal(torch.cat(shards, dim=1), torch.arange(unpad_dim_size).reshape(1, -1))
+
+    def test_divisible_last_rank_keeps_data(self, monkeypatch):
+        # Previously the last rank dropped sp_world real tokens when no padding existed.
+        shards = self._shards(monkeypatch, unpad_dim_size=8, sp_world=4)
+        assert [s.shape[1] for s in shards] == [2, 2, 2, 2]
+
+
+def test_context_parallel_world_size_defaults_to_one_without_dist(monkeypatch):
+    monkeypatch.setattr(sp_comm.dist, "is_initialized", lambda: False)
+    assert sp_comm.get_context_parallel_world_size() == 1
