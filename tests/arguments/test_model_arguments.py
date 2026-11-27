@@ -86,6 +86,70 @@ def test_optimizer_selection_is_validated_before_model_loading():
     assert ModelArguments(model_path="weights", optimizer=OptimizerConfig(type="anyprecision_adamw"))
 
 
+def test_fsdp_turbo_config_validation_and_exclusions(monkeypatch):
+    from veomni.arguments import FSDPTurboConfig, MixedPrecisionConfig, TorchCompileConfig
+
+    default_cfg = FSDPTurboConfig()
+    assert default_cfg.forward_prefetch_depth == 1
+    assert default_cfg.backward_prefetch_depth == 1
+    assert default_cfg.max_inflight_all_gathers == 2
+    assert default_cfg.max_inflight_reductions == 2
+    assert default_cfg.prefetch_wait_a2a is False
+    assert default_cfg.backward_prefetch_on_moe_input is False
+
+    zero_cfg = FSDPTurboConfig(forward_prefetch_depth=0, backward_prefetch_depth=0)
+    assert zero_cfg.forward_prefetch_depth == 0
+    assert zero_cfg.backward_prefetch_depth == 0
+
+    for bad_kwargs, match in (
+        ({"forward_prefetch_depth": True}, "non-negative integer"),
+        ({"backward_prefetch_depth": -1}, "non-negative integer"),
+        ({"max_inflight_all_gathers": 0}, "positive integer"),
+        ({"max_inflight_reductions": False}, "positive integer"),
+        ({"prefetch_wait_a2a": "false"}, "must be bool"),
+        ({"backward_prefetch_on_moe_input": 1}, "must be bool"),
+        ({"backward_prefetch_depth": 0, "backward_prefetch_on_moe_input": True}, "backward_prefetch_depth >= 1"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            FSDPTurboConfig(**bad_kwargs)
+
+    assert FSDPConfig(fsdp_mode="turbo_fsdp2", expert_fsdp_shard_dim=0).expert_fsdp_shard_dim == 0
+    with pytest.raises(ValueError, match="extra_parallel_only"):
+        FSDPConfig(fsdp_mode="turbo_fsdp2", extra_parallel_only=True)
+    with pytest.raises(ValueError, match="expert_weight_fp8_all_gather"):
+        FSDPConfig(fsdp_mode="turbo_fsdp2", expert_weight_fp8_all_gather=True)
+    with pytest.raises(ValueError, match="low_precision_reduce_scatter_comm"):
+        FSDPConfig(
+            fsdp_mode="turbo_fsdp2",
+            low_precision_reduce_scatter_comm=True,
+            mixed_precision=MixedPrecisionConfig(param_dtype="bfloat16", reduce_dtype="bfloat16"),
+        )
+    with pytest.raises(AssertionError, match="init_device: meta"):
+        AcceleratorConfig(init_device="npu", fsdp_config=FSDPConfig(fsdp_mode="turbo_fsdp2"))
+    with pytest.raises(ValueError, match="torch_compile"):
+        AcceleratorConfig(
+            fsdp_config=FSDPConfig(fsdp_mode="turbo_fsdp2"),
+            torch_compile=TorchCompileConfig(enable=True),
+        )
+    with pytest.raises(ValueError, match="require ep_size > 1"):
+        AcceleratorConfig(
+            ep_size=1,
+            fsdp_config=FSDPConfig(
+                fsdp_mode="turbo_fsdp2",
+                fsdp_turbo=FSDPTurboConfig(prefetch_wait_a2a=True),
+            ),
+        )
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    valid_moe = AcceleratorConfig(
+        ep_size=2,
+        fsdp_config=FSDPConfig(
+            fsdp_mode="turbo_fsdp2",
+            fsdp_turbo=FSDPTurboConfig(prefetch_wait_a2a=True, backward_prefetch_on_moe_input=True),
+        ),
+    )
+    assert valid_moe.fsdp_config.fsdp_turbo.prefetch_wait_a2a is True
+
+
 @pytest.mark.parametrize(
     "kwargs,compile_enabled",
     [

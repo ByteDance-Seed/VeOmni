@@ -695,8 +695,38 @@ def validate_low_precision_reduce_scatter_comm(
 
 def validate_expert_fsdp_shard_dim(dim, *, fsdp_mode="fsdp2"):
     """Validate an explicit expert FSDP placement independently of its optimizer."""
-    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode not in ("fsdp2", "hyper_fsdp2")):
+    if dim is not None and (
+        type(dim) is not int or dim not in (0, 1) or fsdp_mode not in ("fsdp2", "hyper_fsdp2", "turbo_fsdp2")
+    ):
         raise ValueError("expert_fsdp_shard_dim must be null, 0 or 1 and requires FSDP2.")
+
+
+@dataclass
+class FSDPTurboConfig:
+    """Optional FSDPTurbo controls under the shared FSDP configuration."""
+
+    forward_prefetch_depth: int = 1
+    backward_prefetch_depth: int = 1
+    max_inflight_all_gathers: int = 2
+    max_inflight_reductions: int = 2
+    prefetch_wait_a2a: bool = False
+    backward_prefetch_on_moe_input: bool = False
+
+    def __post_init__(self):
+        for name in ("forward_prefetch_depth", "backward_prefetch_depth"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"fsdp_turbo.{name} must be a non-negative integer.")
+        for name in ("max_inflight_all_gathers", "max_inflight_reductions"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"fsdp_turbo.{name} must be a positive integer.")
+        for name in ("prefetch_wait_a2a", "backward_prefetch_on_moe_input"):
+            value = getattr(self, name)
+            if type(value) is not bool:
+                raise ValueError(f"fsdp_turbo.{name} must be bool.")
+        if self.backward_prefetch_on_moe_input and self.backward_prefetch_depth < 1:
+            raise ValueError("fsdp_turbo.backward_prefetch_on_moe_input requires backward_prefetch_depth >= 1.")
 
 
 @dataclass
@@ -724,7 +754,7 @@ class HyperParallelFSDPConfig:
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2", "eager"] = field(
+    fsdp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2", "turbo_fsdp2", "eager"] = field(
         default="fsdp2",
         metadata={
             "help": (
@@ -825,18 +855,30 @@ class FSDPConfig:
         },
     )
     hyper_parallel: HyperParallelFSDPConfig = field(default_factory=HyperParallelFSDPConfig)
+    fsdp_turbo: FSDPTurboConfig = field(default_factory=FSDPTurboConfig)
 
     def __post_init__(self):
-        if self.fsdp_mode not in ("ddp", "fsdp2", "hyper_fsdp2", "eager"):
+        if self.fsdp_mode not in ("ddp", "fsdp2", "hyper_fsdp2", "turbo_fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
                 "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
-                "'hyper_fsdp2', 'ddp', or 'eager'."
+                "'hyper_fsdp2', 'turbo_fsdp2', 'ddp', or 'eager'."
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
         if not isinstance(self.expert_weight_fp8_all_gather, bool):
             raise ValueError("expert_weight_fp8_all_gather must be a boolean.")
+        if self.fsdp_mode == "turbo_fsdp2":
+            if self.extra_parallel_only:
+                raise ValueError("fsdp_config.extra_parallel_only is not supported with fsdp_mode='turbo_fsdp2'.")
+            if self.expert_weight_fp8_all_gather:
+                raise ValueError(
+                    "fsdp_config.expert_weight_fp8_all_gather is not supported with fsdp_mode='turbo_fsdp2'."
+                )
+            if self.low_precision_reduce_scatter_comm:
+                raise ValueError(
+                    "fsdp_config.low_precision_reduce_scatter_comm is not supported with fsdp_mode='turbo_fsdp2'."
+                )
         validate_expert_fsdp_shard_dim(self.expert_fsdp_shard_dim, fsdp_mode=self.fsdp_mode)
         validate_low_precision_reduce_scatter_comm(
             self.low_precision_reduce_scatter_comm, self.mixed_precision, fsdp_mode=self.fsdp_mode
@@ -1014,6 +1056,14 @@ class AcceleratorConfig:
         ep_size = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ep", 1)
         if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
             raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
+        if self.fsdp_config.fsdp_mode == "turbo_fsdp2":
+            if self.torch_compile.enable:
+                raise ValueError("torch_compile is not supported with fsdp_mode='turbo_fsdp2'.")
+            turbo_cfg = self.fsdp_config.fsdp_turbo
+            if (turbo_cfg.prefetch_wait_a2a or turbo_cfg.backward_prefetch_on_moe_input) and ep_size <= 1:
+                raise ValueError(
+                    "fsdp_turbo.prefetch_wait_a2a and fsdp_turbo.backward_prefetch_on_moe_input require ep_size > 1."
+                )
 
         # world_size and dp_size are plain attributes rather than fields: an omni model
         # builds one of these per module, and a field would let asdict() round-trip a
@@ -1072,7 +1122,7 @@ class AcceleratorConfig:
             self.dp_shard_size = self.dp_size
 
     def _validate_init_device(self):
-        if self.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2"):
+        if self.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2", "turbo_fsdp2"):
             assert self.init_device == "meta", "Please use model.accelerator.init_device: meta for FSDP2 training"
         else:
             # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a

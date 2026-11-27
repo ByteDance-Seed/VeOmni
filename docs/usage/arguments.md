@@ -724,7 +724,7 @@ configured and never round-trip through a saved config.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| fsdp_mode | `Literal["ddp", "fsdp2", "hyper_fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"hyper_fsdp2"` selects HyperParallel FSDP/HSDP for training, excluding SeedOmni. `"eager"` skips every wrapper for the single-process Omni inference path (`_init_eager_inference`). |
+| fsdp_mode | `Literal["ddp", "fsdp2", "hyper_fsdp2", "turbo_fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"hyper_fsdp2"` selects HyperParallel FSDP/HSDP and `"turbo_fsdp2"` selects FSDPTurbo FSDP2 for training, excluding SeedOmni. `"eager"` skips every wrapper for the single-process Omni inference path (`_init_eager_inference`). |
 | fsdp_scope | `Literal["module", "model"]` | `"module"` | SeedOmni: `"module"` wraps each OmniModule independently; `"model"` wraps the composed `OmniModel` once (one FSDP tree). Wrap targets are each child's `_no_split_modules` scoped as `{child}.{ClassName}`; leftover params unshard on `OmniModel.forward()`. Per-module DDP / ExtraParallel / `init_device` / SP-CP-TP-PP overlays are unused under `"model"` (module YAML is not rewritten); the top-level accelerator topology is used. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
@@ -737,6 +737,7 @@ configured and never round-trip through a saved config.
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 | hyper_parallel | `HyperParallelFSDPConfig` | — | Hyper FSDP communication and prefetch settings; see below. |
+| fsdp_turbo | `FSDPTurboConfig` | — | FSDPTurbo communication queue and prefetch settings; see below. |
 
 Set `low_precision_reduce_scatter_comm: true` to communicate gradients in `mixed_precision.param_dtype`
 while keeping `mixed_precision.reduce_dtype: float32`. There is no separate communication-dtype setting;
@@ -896,6 +897,20 @@ See [HyperParallel](../key_features/hyper_parallel.md) for installation and conf
 | forward_prefetch_depth | `int` | `1` | Number of following blocks to prefetch when `forward_prefetch` is enabled. |
 | backward_prefetch_depth | `int` | `1` | Number of blocks to prefetch in backward execution order. |
 | reduce_comm_interval | `int` | `1` | Gradient-reduction communication wait interval. |
+
+#### FSDPTurboConfig
+
+`model.accelerator.fsdp_config.fsdp_turbo.*` — controls for `turbo_fsdp2`.
+See [FSDPTurbo](../key_features/fsdp_turbo.md) for installation and configuration.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| forward_prefetch_depth | `int` | `1` | Number of following blocks to prefetch when `forward_prefetch` is enabled (`>= 0`; `0` disables forward prefetch). |
+| backward_prefetch_depth | `int` | `1` | Number of preceding blocks to prefetch in backward (`>= 0`; `0` disables all backward prefetch including PyTorch FSDP2's default). |
+| max_inflight_all_gathers | `int` | `2` | Maximum concurrent All-Gather copy-outs in flight (`>= 1`). |
+| max_inflight_reductions | `int` | `2` | Maximum concurrent gradient reductions in flight (`>= 1`). |
+| prefetch_wait_a2a | `bool` | `False` | Order prefetch All-Gather streams behind the latest MoE expert All-to-All event (requires `ep_size > 1`). |
+| backward_prefetch_on_moe_input | `bool` | `False` | Trigger MoE-layer backward prefetch from the MoE input gradient hook after reverse dispatch All-to-All (requires `ep_size > 1` and `backward_prefetch_depth >= 1`). |
 
 ### MixedPrecisionConfig
 

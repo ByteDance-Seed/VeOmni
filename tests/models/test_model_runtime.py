@@ -99,6 +99,48 @@ def test_missing_hyper_has_install_hint(monkeypatch):
             trainer(SimpleNamespace(model=model))
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_native_runtime_does_not_require_fsdp_turbo(monkeypatch):
+    monkeypatch.setitem(sys.modules, "fsdp_turbo.integration.veomni", None)
+    setup = Mock(side_effect=RuntimeError("Runtime setup reached."))
+    monkeypatch.setattr(VeOmniModelRuntime, "setup", setup)
+    with pytest.raises(RuntimeError, match="Runtime setup reached"):
+        VeOmniModelRuntime(ModelArguments(model_path="somewhere"), train=train_args())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_unactivated_fsdp_turbo_runtime_raises_clear_error(monkeypatch):
+    monkeypatch.setitem(sys.modules, "fsdp_turbo.integration.veomni.adapter", None)
+    model = ModelArguments(
+        model_path="somewhere",
+        accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="turbo_fsdp2")),
+    )
+    with pytest.raises(ValueError, match="FSDPTurbo must be activated by TextTrainer or VLMTrainer"):
+        VeOmniModelRuntime(model, train=train_args())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_missing_fsdp_turbo_has_install_hint(monkeypatch):
+    from veomni.trainer.text_trainer import TextTrainer
+    from veomni.trainer.vlm_trainer import VLMTrainer
+
+    original_import = builtins.__import__
+
+    def import_without_turbo(name, *args, **kwargs):
+        if name == "fsdp_turbo.integration.veomni":
+            raise ModuleNotFoundError("No module named 'fsdp_turbo'", name="fsdp_turbo")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_turbo)
+    model = ModelArguments(
+        model_path="somewhere",
+        accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="turbo_fsdp2")),
+    )
+    for trainer in (TextTrainer, VLMTrainer):
+        with pytest.raises(ImportError, match="Add `--extra turbo`"):
+            trainer(SimpleNamespace(model=model))
+
+
 @pytest.fixture
 def single_rank_group(tmp_path):
     """One rank on the local accelerator, enough to drive the parallelize path."""

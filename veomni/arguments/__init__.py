@@ -20,6 +20,7 @@ from .arguments_types import (
     DataArguments,
     DataloaderConfig,
     FSDPConfig,
+    FSDPTurboConfig,
     GradientCheckpointingConfig,
     InferArguments,
     MixedPrecisionConfig,

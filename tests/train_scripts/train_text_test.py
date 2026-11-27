@@ -30,6 +30,10 @@ class TestTextTrainer(TextTrainer):
             from hyper_parallel import HSDPModule
 
             assert isinstance(self.base.model.model, HSDPModule)
+        if args.model.accelerator.fsdp_config.fsdp_mode == "turbo_fsdp2":
+            from fsdp_turbo.distributed.fine_grained_fully_shard.state import FSDPState as TurboFSDPState
+
+            assert isinstance(self.base.model.model._get_fsdp_state(), TurboFSDPState)
         if args.model.optimizer.type == "hyper_muon":
             from hyper_parallel.core.optimizer.muon import Muon
 
