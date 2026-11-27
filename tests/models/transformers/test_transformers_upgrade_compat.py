@@ -12,7 +12,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models import build_config
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -21,15 +20,18 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 _TOY_CONFIGS = Path(__file__).parents[2] / "toy_config"
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
-def test_deepseek_v4_indexer_matches_hf_model_and_optimizer_keys(backend):
+def test_deepseek_v4_indexer_matches_hf_model_and_optimizer_keys():
     from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Indexer
 
-    modeling = importlib.import_module(
-        f"veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_{backend}"
-    )
+    modeling = importlib.import_module("veomni.models.transformers.deepseek_v4.modeling_deepseek_v4")
     config = build_config(_TOY_CONFIGS / "deepseek_v4_toy", ops_implementation=make_eager_ops_config())
     indexer = modeling.DeepseekV4Indexer(config)
+    hca = modeling.DeepseekV4HCACompressor(config)
+    csa = modeling.DeepseekV4CSACompressor(config)
+    assert indexer.position_bias._veomni_fsdp_shard_dim == 1
+    assert hca.position_bias._veomni_fsdp_shard_dim == 1
+    assert csa.position_bias._veomni_fsdp_shard_dim == 1
+    assert csa.indexer.position_bias._veomni_fsdp_shard_dim == 1
     expected = {
         "position_bias",
         "kv_proj.weight",
@@ -52,11 +54,7 @@ def test_deepseek_v4_indexer_matches_hf_model_and_optimizer_keys(backend):
 
 
 def _make_omni_thinker(family, prefix):
-    # Qwen2.5-Omni uses one shared generated module on both accelerators.
-    backend = "npu" if IS_NPU_AVAILABLE and family == "qwen3_omni_moe" else "gpu"
-    modeling = importlib.import_module(
-        f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_{backend}"
-    )
+    modeling = importlib.import_module(f"veomni.models.transformers.{family}.modeling_{family}")
     cls = getattr(modeling, f"{prefix}ThinkerForConditionalGeneration")
     model = object.__new__(cls)
     torch.nn.Module.__init__(model)

@@ -10,7 +10,7 @@ model:
     cross_entropy_loss_implementation: chunk_loss
     rms_norm_implementation: torch_npu
     rotary_pos_emb_implementation: torch_npu
-    swiglu_mlp_implementation: eager
+    gated_mlp_implementation: eager
     load_balancing_loss_implementation: eager
     rms_norm_gated_implementation: torch_npu
     causal_conv1d_implementation: triton
@@ -42,7 +42,7 @@ model:
     lr_decay_style: cosine
     max_grad_norm: 1.0
   broadcast_model_weights_from_rank0: false
-  ep_sharded_stream_load: true
+  extra_parallel_stream_load: true
   accelerator:
     init_device: meta
     ulysses_size: 1

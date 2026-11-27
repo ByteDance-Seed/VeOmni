@@ -281,23 +281,18 @@ def test_indexer_loss_reads_the_bound_handles_not_the_global_config(
                 _indexer_loss_enabled(module)
 
 
-def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it():
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu
+def test_the_cann_indexer_backend_refuses_the_objective_rather_than_dropping_it():
+    from veomni.ops.kernels.dsa.indexer.deepseek_v4 import cann as cann_indexer
 
-    with pytest.raises(NotImplementedError, match="dsa_indexer_loss is not implemented on NPU"):
-        npu.DeepseekV4CSACompressor.forward(
-            None,
-            hidden_states=None,
-            q_residual=None,
-            position_ids=None,
-            past_key_values=None,
-            layer_idx=0,
-            build_indexer_loss=True,
-        )
+    q = torch.randn(4, 1, 2, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 1, 8, dtype=torch.bfloat16)
+    weights = torch.randn(4, 1, 2, dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="dsa_indexer_loss is not implemented for the 'cann'"):
+        cann_indexer.wrapper(q, k, weights, compress_ratio=4, topk=1, require_score_grad=True)
 
 
 def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest.MonkeyPatch):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
 
@@ -343,7 +338,7 @@ def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest
         lambda **kwargs: (torch.tensor(2.0), None, None),
     )
     monkeypatch.setattr(
-        "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
+        "veomni.models.transformers.deepseek_v4.modeling_deepseek_v4.get_parallel_state",
         lambda: SimpleNamespace(sp_enabled=False),
     )
 
@@ -356,7 +351,7 @@ def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest
 
 
 def test_the_flag_is_refused_when_no_layer_can_build_a_kl(monkeypatch: pytest.MonkeyPatch):
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gpu
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gpu
 
     config = DeepseekV4Config(
         vocab_size=32,
@@ -441,7 +436,7 @@ def _install_term_attention(attention, index_score: torch.Tensor, target: torch.
 
 
 def _build_indexed_model(monkeypatch: pytest.MonkeyPatch):
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gpu
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gpu
 
     config = _tiny_mixed_layer_config()
     config._set_ops_implementation(eager_ops_config())
@@ -514,7 +509,7 @@ def test_indexer_kl_survives_decoder_layer_checkpoint(monkeypatch: pytest.Monkey
 
 
 def test_two_csa_layers_sum_the_objective_and_mean_the_metric(monkeypatch: pytest.MonkeyPatch):
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gpu
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gpu
 
     config = _tiny_mixed_layer_config()
     config.num_hidden_layers = 2

@@ -442,7 +442,7 @@ class DeepseekV4CheckpointTensorConverter:
     merged tensors once all experts for a given (layer, projection) are collected.
 
     Implements ``fused_expert_target`` / ``for_expert_range`` so
-    ``ep_sharded_stream_load`` can read only this rank's experts (including their
+    ``extra_parallel_stream_load`` can read only this rank's experts (including their
     FP4/FP8 scale companions) and stack the local ``[E/ep, ...]`` slice.
 
     Args:

@@ -57,6 +57,13 @@ from tests.ops.tol import (
 )
 from tests.ops.utils import make_grad_leaves
 from veomni.ops import resolve_op
+from veomni.ops.kernels.rms_norm.deepseek_v4 import eager as deepseek_v4_eager
+from veomni.ops.kernels.rms_norm.deepseek_v4 import torch_npu as deepseek_v4_npu
+from veomni.ops.kernels.rms_norm.offset import eager as offset_eager
+from veomni.ops.kernels.rms_norm.offset import torch_npu as offset_npu
+from veomni.ops.kernels.rms_norm.standard import eager as standard_eager
+from veomni.ops.kernels.rms_norm.standard import liger_kernel as standard_liger
+from veomni.ops.kernels.rms_norm.standard import torch_npu as standard_npu
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
@@ -492,3 +499,156 @@ def test_liger_grouped_delegates_to_eager(variant: str):
     out_o.backward(grad_output)
     assert torch.equal(x_e.grad, x_o.grad)
     assert torch.equal(w_e.grad, w_o.grad)
+
+
+@pytest.mark.skipif(
+    not (IS_NPU_AVAILABLE and torch.npu.is_available()), reason="Frozen-weight fused RMSNorm requires a visible NPU"
+)
+@pytest.mark.parametrize("variant", ["standard", "offset"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("strided_grad", [False, True], ids=["contiguous-grad", "strided-grad"])
+def test_npu_frozen_weight_backward(variant: str, dtype: torch.dtype, strided_grad: bool, monkeypatch):
+    """Frozen affine weights must not block input gradients through fused NPU RMSNorm."""
+    import torch_npu
+
+    generator = torch.Generator().manual_seed(73)
+    shape = (2, 8, 128)
+    x = torch.randn(shape, generator=generator).to(device="npu", dtype=dtype).requires_grad_(True)
+    weight = (0.1 * torch.randn(shape[-1], generator=generator)).to(device="npu", dtype=dtype)
+    if variant == "standard":
+        weight = weight + 1.0
+    weight_before = weight.clone()
+    x_ref = x.detach().clone().requires_grad_(True)
+    eps = 1e-6
+
+    # An independent autograd formula, not the adapter's handwritten backward.
+    normalized = x_ref.float() * torch.rsqrt(x_ref.float().square().mean(-1, keepdim=True) + eps)
+    if variant == "standard":
+        expected = weight * normalized.to(dtype)
+    else:
+        expected = ((1.0 + weight.float()) * normalized).to(dtype)
+
+    calls = []
+    real_forward = torch_npu.npu_rms_norm
+    real_backward = torch_npu.npu_rms_norm_backward
+
+    def traced_forward(*args, **kwargs):
+        calls.append("forward")
+        return real_forward(*args, **kwargs)
+
+    def traced_backward(*args, **kwargs):
+        calls.append("backward")
+        return real_backward(*args, **kwargs)
+
+    # Spies delegate to the actual vendor kernels; no mock numerical output.
+    monkeypatch.setattr(torch_npu, "npu_rms_norm", traced_forward)
+    monkeypatch.setattr(torch_npu, "npu_rms_norm_backward", traced_backward)
+    actual = resolve_op("rms_norm", variant, "torch_npu").wrapper(x, weight, eps=eps)
+    assert actual.device == x.device
+    assert actual.dtype == dtype
+    assert actual.shape == x.shape
+    assert torch.isfinite(actual).all()
+    atol, rtol = (RMS_NPU_FP32_ATOL, RMS_NPU_FP32_RTOL) if dtype == torch.float32 else (RMS_NPU_ATOL, RMS_NPU_RTOL)
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+    grad = torch.randn((*shape[:-1], shape[-1] * 2), generator=generator).to(device="npu", dtype=dtype)[..., ::2]
+    if not strided_grad:
+        grad = grad.contiguous()
+    assert grad.is_contiguous() != strided_grad
+    actual.backward(grad)
+    expected.backward(grad)
+    assert calls == ["forward", "backward"]
+    assert x.grad is not None and x_ref.grad is not None
+    assert torch.isfinite(x.grad).all()
+    assert torch.count_nonzero(x.grad) > 0
+    grad_atol, grad_rtol = (atol, rtol) if dtype == torch.float32 else (RMS_NPU_GRAD_ATOL, RMS_NPU_GRAD_RTOL)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=grad_atol, rtol=grad_rtol)
+    assert not weight.requires_grad
+    assert weight.grad is None
+    torch.testing.assert_close(weight, weight_before, atol=0, rtol=0)
+
+
+def test_standard_fused_rms_norm_accepts_cpu_tensors(monkeypatch):
+    """Host-default fused rows must keep CPU activations on the eager pair."""
+
+    def reject_fused(*args, **kwargs):
+        raise AssertionError("fused RMSNorm ran on a CPU tensor")
+
+    try:
+        import liger_kernel.ops.rms_norm as liger_rms_norm
+    except ImportError:
+        liger_rms_norm = None
+    else:
+        monkeypatch.setattr(liger_rms_norm, "rms_norm_forward", reject_fused)
+        monkeypatch.setattr(liger_rms_norm, "rms_norm_backward", reject_fused)
+
+    try:
+        import torch_npu
+    except ImportError:
+        torch_npu = None
+    else:
+        monkeypatch.setattr(torch_npu, "npu_rms_norm", reject_fused)
+        monkeypatch.setattr(torch_npu, "npu_rms_norm_backward", reject_fused)
+
+    x = torch.randn(2, 8)
+    weight = torch.randn(8)
+    eps = 1e-6
+    grad = torch.randn_like(x)
+    reference, reference_saved = standard_eager.forward(x, weight, eps=eps)
+    reference_grads = standard_eager.backward(grad, reference_saved)
+
+    for fused in (standard_liger, standard_npu):
+        output, saved = fused.forward(x, weight, eps=eps)
+        grads = fused.backward(grad, saved)
+        torch.testing.assert_close(output, reference)
+        torch.testing.assert_close(grads[0], reference_grads[0])
+        torch.testing.assert_close(grads[1], reference_grads[1])
+
+    empty = torch.empty(0, 8)
+    for fused in (standard_liger, standard_npu):
+        output, saved = fused.forward(empty, weight, eps=eps)
+        grads = fused.backward(torch.empty_like(output), saved)
+        assert output.shape == empty.shape
+        assert grads[0].shape == empty.shape
+        assert grads[1].shape == weight.shape
+
+
+@pytest.mark.parametrize(
+    ("fused", "eager"),
+    (
+        (offset_npu, offset_eager),
+        (deepseek_v4_npu, deepseek_v4_eager),
+    ),
+)
+def test_host_default_torch_npu_rms_norm_accepts_cpu_tensors(monkeypatch, fused, eager):
+    """Offset and DeepSeek-V4 NPU defaults must keep CPU activations on eager."""
+
+    def reject_fused(*args, **kwargs):
+        raise AssertionError("fused RMSNorm ran on a CPU tensor")
+
+    try:
+        import torch_npu
+    except ImportError:
+        pass
+    else:
+        monkeypatch.setattr(torch_npu, "npu_rms_norm", reject_fused)
+        monkeypatch.setattr(torch_npu, "npu_rms_norm_backward", reject_fused)
+
+    x = torch.randn(2, 8)
+    weight = torch.randn(8)
+    eps = 1e-6
+    grad = torch.randn_like(x)
+    reference, reference_saved = eager.forward(x, weight, eps=eps)
+    reference_grads = eager.backward(grad, reference_saved)
+    output, saved = fused.forward(x, weight, eps=eps)
+    grads = fused.backward(grad, saved)
+    torch.testing.assert_close(output, reference)
+    torch.testing.assert_close(grads[0], reference_grads[0])
+    torch.testing.assert_close(grads[1], reference_grads[1])
+
+    empty = torch.empty(0, 8)
+    output, saved = fused.forward(empty, weight, eps=eps)
+    grads = fused.backward(torch.empty_like(output), saved)
+    assert output.shape == empty.shape
+    assert grads[0].shape == empty.shape
+    assert grads[1].shape == weight.shape

@@ -326,3 +326,35 @@ def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monk
             assert cosine_similarity(actual_grad, expected_grad) > 0.95
 
     assert set(requested_kv_lengths) == {kv_block}
+
+
+def test_tilelang_sparse_attention_backward_handles_unaligned_query_lengths():
+    """``preprocess`` tiles the query axis in 32s and indexes the tail unguarded.
+
+    Packed dynamic batching and context parallelism both produce per-sample query
+    spans that are not multiples of 32, so the row pads the query axis and slices
+    the extra ``delta`` rows off. A missing pad is an out-of-bounds read whose
+    symptom is a NaN ``grad_norm`` one step later, not a crash here -- which is
+    why the assertion is on finiteness as well as on the reference match.
+    """
+    require_nvidia_cuda("tilelang", min_cc=90)
+    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla import sparse_attn_tilelang
+
+    torch.manual_seed(11)
+    batch, heads, dim, kv_len, topk = 1, 8, 128, 64, 64
+    for seqlen in (17, 33, 47):
+        q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+        indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+        scale = dim**-0.5
+
+        out = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+        expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+        assert out.shape == (batch, seqlen, heads, dim)
+        grad = torch.randn_like(out)
+        expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+        out.backward(grad)
+        for actual_grad, reference_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+            assert actual_grad is not None and torch.isfinite(actual_grad).all(), seqlen
+            assert cosine_similarity(actual_grad, reference_grad) > 0.95, seqlen

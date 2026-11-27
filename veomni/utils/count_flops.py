@@ -109,6 +109,7 @@ class VeomniFlopsCounter:
             "gpt_oss": self._estimate_gpt_oss_flops,
             "gemma3": self._estimate_gemma3_flops,
             "gemma3_text": self._estimate_gemma3_flops,
+            "MiniMaxH3DiTModel": self._estimate_minimax_h3_flops,
         }
 
         self.config = config
@@ -116,6 +117,34 @@ class VeomniFlopsCounter:
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         return 0
+
+    def _estimate_minimax_h3_flops(self, tokens_sum, batch_seqlens, delta_time, model_metadata=None, **kwargs):
+        """Estimate useful full-parameter H3 training TFLOPS for the conditional branch.
+
+        Counts the major DiT and text-refiner projections and attention matmuls.
+        This is model FLOPs, not device FLOPs: checkpoint recomputation, CFG's
+        extra forward, normalization, embeddings and small projections are omitted.
+        """
+        if not batch_seqlens:
+            return 0.0
+        h3_text_seqlens = (model_metadata or {}).get("h3_text_seqlens")
+        if h3_text_seqlens is None or len(h3_text_seqlens) != len(batch_seqlens):
+            raise ValueError("MiniMax-H3 FLOPs requires one text length per packed sample")
+        if delta_time <= 0:
+            raise ValueError("MiniMax-H3 FLOPs requires a positive step time")
+        if any(t < 0 or t > s for t, s in zip(h3_text_seqlens, batch_seqlens)):
+            raise ValueError("MiniMax-H3 text lengths must be within packed sequence lengths")
+
+        cfg = self.config
+        hidden = int(cfg.hidden_size)
+        attn_dim = int(cfg.num_attention_heads) * int(cfg.attention_head_dim)
+        ffn = int(cfg.ffn_hidden_size)
+        linear_params = 4 * hidden * attn_dim + 3 * hidden * ffn
+        main = 6 * int(cfg.num_layers) * linear_params * tokens_sum
+        main += 12 * int(cfg.num_layers) * attn_dim * sum(s * s for s in batch_seqlens)
+        refiner = 6 * int(cfg.token_refiner_num_layers) * linear_params * sum(h3_text_seqlens)
+        refiner += 12 * int(cfg.token_refiner_num_layers) * attn_dim * sum(t * t for t in h3_text_seqlens)
+        return (main + refiner) / delta_time / 1e12
 
     @staticmethod
     def _compute_lm_head_params(hidden_size, vocab_size):
@@ -1481,6 +1510,7 @@ class VeomniFlopsCounter:
         lora_config: VeOmniLoraConfig | None = None,
         images_seqlens=None,
         freeze_vit: bool | None = None,
+        model_metadata=None,
     ):
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
@@ -1498,6 +1528,8 @@ class VeomniFlopsCounter:
                 models.
             freeze_vit (bool, optional): Whether the vision tower is frozen during full
                 fine-tuning. Ignored when ``lora_config`` is provided.
+            model_metadata (dict, optional): Model-specific metadata interpreted by the selected estimator.
+                Metadata-aware estimators must also handle an omitted argument when no metadata was collected.
 
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
@@ -1520,6 +1552,8 @@ class VeomniFlopsCounter:
             kwargs["images_seqlens"] = images_seqlens
         if freeze_vit is not None:
             kwargs["freeze_vit"] = freeze_vit
+        if model_metadata is not None:
+            kwargs["model_metadata"] = model_metadata
 
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)

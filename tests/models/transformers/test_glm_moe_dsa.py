@@ -39,12 +39,8 @@ from veomni.utils.moe_monitor import MoERouterMonitor, attach_moe_router_monitor
 
 
 def _glm_cls(architecture: str):
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.glm_moe_dsa import modeling_glm_moe_dsa as gen
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_npu as gen
-    else:
-        from veomni.models.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as gen
     return getattr(gen, architecture)
 
 
@@ -58,16 +54,19 @@ def _build_ours(
 
 
 def _assert_dsa_wiring(attn) -> None:
-    """GPU binds DSA attention and indexer; NPU indexer keeps HF scoring."""
+    """DSA attention and the GLM indexer both go through VeomniOp.
+
+    NPU has no cuDNN GLM indexer, so this eager config resolves to the
+    ``eager`` row. That row is the Hugging Face ReLU scoring path.
+    """
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     assert attn.veomni_dsa_attention.variant == "glm"
     assert attn.indexer is not None
     assert attn.indexer.veomni_rope.variant == "interleave"
-    if IS_NPU_AVAILABLE:
-        assert not hasattr(attn.indexer, "veomni_dsa_indexer")
-        return
     assert attn.indexer.veomni_dsa_indexer.variant == "glm"
+    if IS_NPU_AVAILABLE:
+        assert attn.indexer.veomni_dsa_indexer.impl == "eager"
 
 
 def test_glm_moe_dsa_eager_matches_hf():
@@ -202,7 +201,7 @@ def test_glm_moe_dsa_fused_drops_standard_causal_mask_and_rejects_padding():
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     if IS_NPU_AVAILABLE:
-        pytest.skip("NPU GLM indexer stays on the Hugging Face path")
+        pytest.skip("NPU GLM indexer runs the eager row")
     config = _tiny_config()
     model = _build_ours(config)
     model.eval()
@@ -227,7 +226,7 @@ def test_glm_moe_dsa_fused_forward_uses_marked_causal_mask(monkeypatch):
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     if IS_NPU_AVAILABLE:
-        pytest.skip("NPU GLM indexer stays on the Hugging Face path")
+        pytest.skip("NPU GLM indexer runs the eager row")
 
     def unexpected_scan(*args, **kwargs):
         pytest.fail("GLM fused forward must drop a marked standard causal mask without scanning")
@@ -257,7 +256,7 @@ def test_glm_moe_dsa_fused_cuda_forward_does_not_scan_standard_causal(monkeypatc
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     if IS_NPU_AVAILABLE:
-        pytest.skip("NPU GLM indexer stays on the Hugging Face path")
+        pytest.skip("NPU GLM indexer runs the eager row")
 
     def unexpected_scan(*args, **kwargs):
         pytest.fail("GLM fused CUDA forward must drop a marked standard causal mask without scanning")
@@ -327,7 +326,7 @@ def test_glm_moe_dsa_fused_rejects_output_attentions():
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     if IS_NPU_AVAILABLE:
-        pytest.skip("NPU GLM indexer stays on the Hugging Face path")
+        pytest.skip("NPU GLM indexer runs the eager row")
     config = _tiny_config()
     model = _build_ours(config)
     model.model.layers[0].self_attn.veomni_dsa_attention = _FusedAttentionSpy()
@@ -339,7 +338,7 @@ def test_glm_moe_dsa_fused_rejects_packed_position_ids():
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     if IS_NPU_AVAILABLE:
-        pytest.skip("NPU GLM indexer stays on the Hugging Face path")
+        pytest.skip("NPU GLM indexer runs the eager row")
     config = _tiny_config()
     model = _build_ours(config).eval()
     attn_spy = _FusedAttentionSpy()
@@ -358,7 +357,7 @@ def test_glm_moe_dsa_fused_rejects_gapped_position_ids():
     from veomni.utils.device import IS_NPU_AVAILABLE
 
     if IS_NPU_AVAILABLE:
-        pytest.skip("NPU GLM indexer stays on the Hugging Face path")
+        pytest.skip("NPU GLM indexer runs the eager row")
     config = _tiny_config()
     model = _build_ours(config).eval()
     attn_spy = _FusedAttentionSpy()

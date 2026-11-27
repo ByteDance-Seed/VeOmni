@@ -23,19 +23,41 @@ A module's choices live in its block of the `modules` YAML, under
 | FSDP2 (default) | `fsdp_config.fsdp_mode: fsdp2` | Backbones and every module large enough that sharding pays for its communication |
 | DDP | `fsdp_config.fsdp_mode: ddp`, usually with `init_device: cuda` and `broadcast_model_weights_from_rank0: false` (module level, outside `accelerator:`) | Small encoders, where a full replica per rank is cheaper than FSDP2 all-gathers |
 | Eager (inference only) | `fsdp_config.fsdp_mode: eager` | A single-process replica with no mesh; rejected for training |
-| Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md) |
-| Expert parallel | `ep_size: N`, `ep_outside: false` (shorthand for an `ep` extra parallel group) | A MoE backbone |
+| Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md). A dimension with no scalar of its own is set through these three lists, which are paired by position — write all three |
+| Expert parallel | `accelerator.ep_size: N` | A MoE backbone. For `ep`, **prefer `ep_size` over the lists**. `AcceleratorConfig.resolved_extra_parallel` leaves the raw fields untouched and folds `("ep", ep_size, ep_outside)` in on demand only when `"ep"` is absent from `extra_parallel_names`. When the global config sets `ep_size`, a module inherits it and opts out with `ep_size: 1`. If the global config instead places `"ep"` explicitly in `extra_parallel_names` / `extra_parallel_sizes` / `extra_parallel_placement_innermost`, that explicit list entry takes precedence over `ep_size`, so a module must also override or remove the matching `"ep"` entry across all three position-paired lists. Writing only `extra_parallel_sizes: [N]` desynchronises the three lists |
 | Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (one axis `> 1` per module, with `U * C = W / dp_size` and `pp_size = tp_size = 1` across all modules) | Ulysses SP on encoders/ViT, CP on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
 
+A module that holds nothing a dimension shards — a vision tower under a
+backbone's `ep`, say — has to switch that dimension off in its own block. A
+module with no parallel plan cannot be built under an enabled mesh, so the build
+raises.
+
+For `ep`, set `ep_size: 1` when the global config sets `ep_size`; if the global
+config also (or instead) placed `"ep"` explicitly in `extra_parallel_names`,
+remove or override `"ep"` across `extra_parallel_names`, `extra_parallel_sizes`,
+and `extra_parallel_placement_innermost` as well, keeping all three lists the
+same length. For any other dimension, remove its entries from all three lists.
+`AcceleratorConfig.resolved_extra_parallel` folds `ep_size` in on demand only
+when `"ep"` is absent from `extra_parallel_names`, so:
+
+- if the global config used `ep_size: N`, clearing the lists alone still leaves
+  `ep_size` inherited and `"ep"` is folded back in on demand;
+- if the global config listed `"ep"` explicitly in `extra_parallel_names` /
+  `extra_parallel_sizes`, setting `ep_size: 1` alone still resolves the inherited
+  list width.
+
+The build's error message names the dimensions it saw enabled.
+
+
 Children can inherit `expert_weight_fp8_all_gather: true` from the global accelerator.
 It enables FP8 transport only for experts whose actual `veomni_moe.impl` is
-`deepgemm_fp8`. A child without matching experts silently skips FP8 registration
+`deepgemm`. A child without matching experts silently skips FP8 registration
 and its compatibility checks, including when the child uses DDP, FP16 or CPU
 offload. Selected experts still undergo all shape, device and FSDP checks.
 The same selection rule applies to standalone models and the composed
 `fsdp_scope: model` wrap; no separate scope flag is needed.
-See [DeepGEMM FP8 transport](../../design/deepgemm_fp8_moe.md#optional-fp8-parameter-all-gather).
+See [DeepGEMM FP8 transport](../../design/deepgemm_moe.md#optional-fp8-parameter-all-gather).
 
 Two per-module properties are not accelerator settings but change how the
 module is wrapped and saved:

@@ -36,7 +36,8 @@ dependencies = [
 [project.optional-dependencies]
 # Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
 # (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM100+ and
-# requires gpu: `uv sync --extra gpu --extra magi`.
+# requires gpu: `uv sync --extra gpu --extra magi`. torchao (float8 training and
+# the torchao FP4 QAT rows) is optional too: `uv sync --extra gpu --extra float8`.
 dev = [
   "pre-commit>=4.0.0,<5.0",
   "ruff>=0.7.0,<1.0",
@@ -96,6 +97,15 @@ gpu = [
   "hf_transfer",
 ]
 
+# torchao: low-precision `torchao` op rows for `linear` and `gated_mlp`
+# (dynamic FP8 GEMMs on NVIDIA SM89+, and NVFP4/MXFP4 QAT). Kept out of `gpu`
+# so GPU jobs that never select `torchao` do not install it, and because it
+# breaks peft 0.18.1's torchao integration; combine with gpu:
+# `uv sync --extra gpu --extra float8 --dev`.
+float8 = [
+  "torchao==0.18.0",
+]
+
 # MagiAttention FFA (NVIDIA SM100+). Requires gpu via veomni[gpu]; conflicts with npu extras.
 magi = [
   "veomni[gpu]",
@@ -106,6 +116,11 @@ magi = [
   "flash-attn-cute==0.0.2; sys_platform == 'linux'",
   "magi-to-hstu-cuda==0.1; sys_platform == 'linux'",
   "magi-attention==1.1.1; sys_platform == 'linux'",
+]
+
+# Optional HyperParallel backend; combine with npu or npu_aarch64.
+hyper = [
+  "hyper-parallel==1.2.0.dev0",
 ]
 
 # Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
@@ -152,7 +167,6 @@ npu_aarch64 = [
 dev = [
   {include-group = "lint"},
   {include-group = "test"},
-  {include-group = "patchgen"},
 ]
 lint = [
   "pre-commit",
@@ -162,13 +176,6 @@ test = [
   "rich",
   "pytest",
   "expecttest",
-]
-# Sibling project under ./patchgen-pkg/ (build-time tool — regenerates
-# veomni/models/transformers/*/generated/; not imported at runtime).
-# Outer dir is `patchgen-pkg` because a flat `patchgen/` would shadow the
-# editable install via namespace-package discovery.
-patchgen = [
-  "patchgen>=0.1.0",
 ]
 # In default-groups so `uv sync` always installs transformers==5.16.1.
 # Kept out of [project.dependencies] so pip users are not forced into a
@@ -180,8 +187,7 @@ transformers-stable = [
 [tool.uv]
 # Range so local devs are not forced onto one weekly uv build. Reproducibility
 # is preserved because docker/CI install a concrete pin and use --locked /
-# --frozen. Concrete pins (docker/, .github/workflows/check_patchgen.yml)
-# must stay inside this range.
+# --frozen. Concrete pins in docker/ must stay inside this range.
 required-version = ">=0.9.8,<0.13"
 
 default-groups = ["transformers-stable"]
@@ -223,7 +229,7 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-patchgen = { path = "patchgen-pkg", editable = true }
+hyper-parallel = { git = "https://github.com/mindspore-ai/hyper-parallel.git", rev = "f570046629fa7f43428861cba0e54996e1ce6a3d" }
 magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 # MagiAttention upstream designates this contributor-maintained support branch
 # for its arbitrary-mask FA4 packages. Dao-AILab does
@@ -347,12 +353,14 @@ magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "10
 create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100" }
 magi-to-hstu-cuda = { MAX_JOBS = "8" }
 
+[tool.setuptools]
+license-files = ["LICENSE", "docs/licenses/hunyuanvideo15/LICENSE.txt", "docs/licenses/hunyuanvideo15/NOTICE.txt"]
+
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-# patchgen-pkg* — sibling project, not bundled into the veomni wheel.
 # The trailing `*` matters: `packages.find` treats a bare name as that package
 # only, and pyproject-based discovery enables namespace packages, so bare
 # `tasks` / `scripts` still shipped `tasks.infer`, `scripts.ci` and friends as
@@ -365,15 +373,10 @@ exclude = [
   "veomni_patch*",
   "tasks*",
   "scripts*",
-  "patchgen-pkg*",
 ]
 
 [tool.setuptools.package-data]
 veomni = ["**/*.txt"]
-
-[tool.patchgen]
-search_root = "veomni/models/transformers"
-package_prefix = "veomni.models.transformers"
 
 [tool.ruff]
 target-version = "py311"
@@ -389,11 +392,9 @@ select = ["B", "C", "E", "F", "I", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
-# Patch gen configs reference names from add_post_import_block (for example,
-# rotate_half) that ruff can't resolve because they only exist as
-# string literals until patchgen materializes them into the generated file.
-"veomni/models/**/generated/*.py" = ["E402", "B007"]
-"veomni/models/**/*_patch_gen_config.py" = ["F821"]
+# Upstream HuggingFace modeling loops occasionally bind an unused loop index;
+# preserve upstream loop variables for source comparison.
+"veomni/models/transformers/*/modeling_*.py" = ["B007"]
 "veomni/ops/kernels/gated_delta_rule/vendor/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
 "tests/models/test_qwen_image_precision.py" = ["F401", "F811"]
 

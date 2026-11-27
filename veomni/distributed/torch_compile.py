@@ -14,7 +14,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Collection, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -25,11 +25,6 @@ from ..utils import device, logging
 logger = logging.get_logger(__name__)
 
 
-_SUPPORTED_MULTIMODAL_DECODER_BLOCKS = {
-    "qwen3_vl": "Qwen3VLTextDecoderLayer",
-}
-
-
 @dataclass
 class CompileConfig:
     """Runtime options for compiling FSDP2 decoder blocks."""
@@ -38,93 +33,70 @@ class CompileConfig:
     backend: Optional[str] = "inductor"
     mode: Optional[str] = None
     fullgraph: bool = True
-    dynamic: bool = False
+    #: Passed straight to ``torch.compile``. ``None`` is torch's own default:
+    #: the first call compiles a static graph and a shape change promotes it to
+    #: a symbolic one, which then covers the rest of the run.
+    #:
+    #: ``False`` is not the safe choice here. With ``fullgraph=True`` a re-cache
+    #: is a hard failure, not a silent recompile: one new shape per step
+    #: exhausts ``torch._dynamo.config.cache_size_limit`` (8) and raises
+    #: ``FailOnRecompileLimitHit`` — 8 patch counts are fine, the 9th is fatal.
+    #:
+    #: ``True`` also survives a shape that moves, but pays for it on the first
+    #: call even when the shape never changes, and it makes Dynamo symbolically
+    #: trace every custom autograd ``Function``. A ``Function`` that chains two
+    #: Triton kernels then fails in ``overwrite_tensor_vt_proxy``: the first
+    #: kernel's launch scalars come back as constants while the outer graph still
+    #: holds symbols for them. The fused-Triton MoE experts are built that way.
+    #: ``None`` keeps the first compile static and identical to ``False``; only a
+    #: real second shape reaches the symbolic path.
+    dynamic: Optional[bool] = None
 
     def uses_cuda_graphs(self) -> bool:
-        """Return whether this config asks torch.compile to use graph replay."""
+        """Return whether this config asks torch.compile to use graph replay.
 
-        return self.backend == "cudagraphs" or self.mode == "reduce-overhead"
+        Both ``mode`` spellings are needed: ``reduce-overhead`` and
+        ``max-autotune`` each turn on Triton graph capture in torch's own mode
+        table (``torch/_inductor/__init__.py``), while
+        ``max-autotune-no-cudagraphs`` deliberately does not. Missing
+        ``max-autotune`` would let a run past the SeedOmni replay guard and record
+        ``_veomni_compile_uses_cuda_graphs=False``, so the per-step
+        ``cudagraph_mark_step_begin`` would never be called for a graph that does
+        replay.
+        """
 
-
-def _decoder_block_class_names(model: nn.Module) -> set[str]:
-    no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
-    if no_split_modules is None:
-        return set()
-    return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
-
-
-def _is_multimodal_model(model: nn.Module) -> bool:
-    config = getattr(model, "config", None)
-    if config is not None and any(
-        getattr(config, config_name, None) is not None for config_name in ("vision_config", "audio_config")
-    ):
-        return True
-
-    input_modalities = getattr(model, "input_modalities", None) or getattr(type(model), "input_modalities", ())
-    if isinstance(input_modalities, str):
-        input_modalities = (input_modalities,)
-    return any(modality != "text" for modality in input_modalities)
+        return self.backend == "cudagraphs" or self.mode == "reduce-overhead" or self.mode == "max-autotune"
 
 
-def validate_compile_model(
-    model: nn.Module,
-    compile_config: CompileConfig,
-    sequence_parallel_enabled: bool = False,
-    async_enabled: bool = False,
-) -> None:
-    """Validate model-specific contracts for per-block compilation.
+def _block_fqns(model: nn.Module) -> list[str]:
+    """Module paths of the blocks named in ``_no_split_modules``.
 
-    Text models keep the generic decoder-layer path. Multimodal models are
-    fail-closed because their towers and cross-modal injection points have
-    different shape and lifecycle contracts.
+    That list is the wrap-unit list FSDP already uses, so compiling it verbatim
+    keeps the compiled set and the sharded set identical — the whole model, not a
+    subset picked by class name.
+
+    An entry is a bare class name (``LlamaDecoderLayer``) matching anywhere, or —
+    on a SeedOmni composed model, whose children share one FSDP tree — scoped to
+    a child (``janus_llama.LlamaDecoderLayer``, see ``_scoped_no_split_modules``)
+    matching only under it.
     """
-
-    if not _is_multimodal_model(model):
-        return
-
-    config = getattr(model, "config", None)
-    model_type = getattr(config, "model_type", None)
-    expected_decoder_block = _SUPPORTED_MULTIMODAL_DECODER_BLOCKS.get(model_type)
-    if expected_decoder_block is None:
-        raise RuntimeError(
-            "model.accelerator.torch_compile.enable currently supports multimodal training only for dense Qwen3-VL "
-            f"(model_type='qwen3_vl'); got model_type={model_type!r}."
+    entries = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
+    if not entries:
+        return []
+    wanted = []
+    for entry in entries:
+        if isinstance(entry, str):
+            scope, _, class_name = entry.rpartition(".")
+            wanted.append((class_name, scope))
+    return [
+        fqn
+        for fqn, module in model.named_modules()
+        if fqn
+        and any(
+            class_name == type(module).__name__ and (not scope or fqn == scope or fqn.startswith(scope + "."))
+            for class_name, scope in wanted
         )
-    if compile_config.dynamic:
-        raise RuntimeError(
-            "model.accelerator.torch_compile.enable for Qwen3-VL requires model.accelerator.torch_compile.dynamic=False."
-        )
-    if compile_config.uses_cuda_graphs():
-        raise RuntimeError(
-            "model.accelerator.torch_compile.enable for Qwen3-VL does not support CUDA Graph replay yet because packed "
-            "FlashAttention metadata can vary between micro-batches; use backend='inductor' and mode=None."
-        )
-    if sequence_parallel_enabled or async_enabled:
-        raise RuntimeError(
-            "model.accelerator.torch_compile.enable for Qwen3-VL does not support Ulysses sequence parallelism, "
-            "Ring Attention context parallelism, or async Ulysses yet; set model.accelerator.ulysses_size=1, "
-            "model.accelerator.cp_size=1, and model.accelerator.enable_async=False."
-        )
-
-    decoder_block_class_names = _decoder_block_class_names(model)
-    if expected_decoder_block not in decoder_block_class_names:
-        raise RuntimeError(
-            f"model.accelerator.torch_compile.enable for Qwen3-VL requires {expected_decoder_block!r} in model._no_split_modules."
-        )
-
-
-def _is_decoder_block(module: nn.Module, decoder_block_class_names: Optional[Collection[str]] = None) -> bool:
-    """Check decoder blocks using the model's ``_no_split_modules`` list.
-
-    HuggingFace model classes typically list the decoder layer class in
-    ``_no_split_modules`` for FSDP/Accelerate. Multimodal models may include
-    vision/audio blocks in the same list, so the compile path keeps only
-    entries that are decoder layers.
-    """
-
-    if decoder_block_class_names is None:
-        decoder_block_class_names = _decoder_block_class_names(module)
-    return type(module).__name__ in decoder_block_class_names
+    ]
 
 
 def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_reshard_after_forward: bool) -> None:
@@ -146,6 +118,8 @@ def validate_compile_runtime(
     fsdp_mode: str,
     any_extra_parallel_enabled: bool,
     enable_reshard_after_forward: bool,
+    sequence_parallel_enabled: bool = False,
+    async_parallel_enabled: bool = False,
 ) -> None:
     """Validate runtime contracts before compile-specific setup begins."""
 
@@ -164,20 +138,143 @@ def validate_compile_runtime(
             "model.accelerator.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
             "communication may be captured inside compiled blocks."
         )
+    # Ulysses/CP slice activations along the sequence dimension, which the graph
+    # edges of a compiled block reorder; async Ulysses pipelines the same
+    # exchanges across steps. Both are refused for the same reason under SeedOmni
+    # (``_validate_omni_accelerator``), so the single-model path refuses them too
+    # rather than silently compiling a block that cannot run.
+    if sequence_parallel_enabled:
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable does not support sequence parallelism: "
+            "set accelerator.ulysses_size=1 and accelerator.cp_size=1."
+        )
+    if async_parallel_enabled:
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable does not support async Ulysses: "
+            "set accelerator.enable_async=False."
+        )
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
 
-def compile_decoder_blocks(
-    model: nn.Module,
-    compile_config: CompileConfig,
-    sequence_parallel_enabled: bool = False,
-    async_enabled: bool = False,
-) -> int:
-    """Compile forward of every decoder block inside ``model`` in place.
+#: Op rows whose kernels emit dtypes Inductor cannot lower, keyed by
+#: ``(config field, row name)`` and giving the format that triggers it.
+#:
+#: ``mxfp4`` materializes ``float8_e8m0fnu`` scale tensors, and Inductor's codegen
+#: has no lowering for that dtype. A runtime check cannot catch it, so the selection
+#: is refused here, from the config. It is keyed on the *format* rather than the row
+#: because the row is ``torchao`` for both FP4 layouts: a config may compile with
+#: ``dtype: nvfp4`` (float8_e4m3fn scales plus an FP32 per-tensor scale, both of
+#: which Inductor knows) and must not with ``dtype: mxfp4``.
+_UNCOMPILABLE_FORMATS: dict[str, tuple[str, str, str]] = {
+    "linear_implementation": ("linear", "torchao", "mxfp4"),
+    "gated_mlp_implementation": ("gated_mlp", "torchao", "mxfp4"),
+}
+
+
+def _bound_uncompilable_ops(model: nn.Module) -> tuple[bool, list[str]]:
+    """Inspect concrete ``VeomniOp`` handles bound on ``model`` for uncompilable formats."""
+    from ..ops.registry import VeomniOp
+
+    op_to_rule = {op: (field, impl, dtype) for field, (op, impl, dtype) in _UNCOMPILABLE_FORMATS.items()}
+    has_bound_ops = False
+    offending: list[str] = []
+    for module in model.modules():
+        for attr in vars(module).values():
+            if isinstance(attr, VeomniOp):
+                has_bound_ops = True
+                if attr.op in op_to_rule:
+                    field, impl, dtype = op_to_rule[attr.op]
+                    if attr.impl == impl and attr.kwargs.get("dtype") == dtype:
+                        entry = f"{field}={impl}(dtype={dtype!r})"
+                        if entry not in offending:
+                            offending.append(entry)
+    return has_bound_ops, offending
+
+
+def _selection_reaches(value, target_impl: str, target_dtype: str) -> bool:
+    """Return whether any ordered subset of overrides on ``value`` reaches ``(target_impl, target_dtype)``."""
+    base_name = getattr(value, "name", value)
+    base_kwargs = getattr(value, "kwargs", {}) or {}
+    states: set[tuple[str | None, str | None]] = {(base_name, base_kwargs.get("dtype"))}
+    for rule in getattr(value, "overrides", ()) or ():
+        rule_kwargs = rule.kwargs or {}
+        next_states = set(states)
+        for name, dtype in states:
+            if rule.name is not None and name is not None and rule.name != name:
+                next_states.add((rule.name, rule_kwargs.get("dtype")))
+            else:
+                next_states.add((rule.name if rule.name is not None else name, rule_kwargs.get("dtype", dtype)))
+        states = next_states
+    return (target_impl, target_dtype) in states
+
+
+def _uncompilable_selections(ops) -> list[str]:
+    """Return the offending ``field=row(dtype=...)`` strings on one ops config, if any."""
+    if ops is None:
+        return []
+    offending: list[str] = []
+    for field, (_op, impl, dtype) in _UNCOMPILABLE_FORMATS.items():
+        if _selection_reaches(getattr(ops, field, None), impl, dtype):
+            offending.append(f"{field}={impl}(dtype={dtype!r})")
+    return offending
+
+
+def _reject_incompatible_ops(model: nn.Module) -> None:
+    """Reject op selections ``torch.compile`` cannot lower, at any config depth.
+
+    On a concrete model that binds ``VeomniOp`` handles, inspect only those
+    resolved handles so unmatched overrides or op families the model never
+    binds (such as ``linear_implementation`` on Gemma3) do not falsely block
+    compilation. Fall back to walking ``config`` / ``sub_configs`` when no
+    handles are bound on ``model`` — that path is what a SeedOmni module takes.
+
+    Called once per compiled module, so a sibling that stayed eager never reaches
+    this — its selection is irrelevant because Inductor never sees it.
+    """
+    has_bound_ops, offending = _bound_uncompilable_ops(model)
+    if not has_bound_ops:
+        config = getattr(model, "config", None)
+        offending = _uncompilable_at(config, prefix="")
+    if offending:
+        raise RuntimeError(
+            "model.accelerator.torch_compile cannot be combined with "
+            f"{', '.join(offending)}: those selections emit tensors of a dtype Inductor cannot lower "
+            "(float8_e8m0fnu for the mxfp4 layout). Disable compilation or select a different dtype."
+        )
+
+
+def _uncompilable_at(config, *, prefix: str) -> list[str]:
+    """Collect offending selections on ``config`` and every sub-config below it.
+
+    A SeedOmni composed ``OmniConfig`` files its children in ``_module_configs``
+    rather than ``sub_configs`` (the latter describes one HF model's nesting), so
+    both are walked. Under the per-module design this only ever sees one module's
+    config, but the walk stays general so a single HF multimodal model is still
+    covered.
+    """
+    if config is None:
+        return []
+    found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None))]
+    for name in getattr(config, "sub_configs", {}) or {}:
+        child = getattr(config, name, None)
+        if child is not None:
+            found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+    for name, child in (getattr(config, "_module_configs", None) or {}).items():
+        found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+    return found
+
+
+def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> int:
+    """Compile forward of every block inside ``model`` in place.
 
     Compiling the forward method (rather than wrapping the whole module)
     preserves module identity for FSDP2 — pre/post-forward all-gather and
     reshard hooks stay outside the compiled region.
+
+    The blocks are the ones ``_no_split_modules`` names, so the compiled set and
+    the FSDP wrap set are the same (see :func:`_block_fqns`). Nothing here asks
+    what kind of model it is; the runtime contracts are checked once by the
+    caller through :func:`validate_compile_runtime`.
     """
 
     if not hasattr(torch, "compile"):
@@ -185,7 +282,7 @@ def compile_decoder_blocks(
             "model.accelerator.torch_compile.enable requires torch.compile, but this PyTorch build has no torch.compile."
         )
 
-    validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
+    _reject_incompatible_ops(model)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,
@@ -201,12 +298,10 @@ def compile_decoder_blocks(
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    decoder_block_class_names = _decoder_block_class_names(model)
+    blocks = set(_block_fqns(model))
     compiled = 0
     for fqn, module in model.named_modules():
-        if not _is_decoder_block(module, decoder_block_class_names):
-            continue
-        if getattr(module, "_veomni_forward_compiled", False):
+        if fqn not in blocks or getattr(module, "_veomni_forward_compiled", False):
             continue
 
         original_forward = module.forward
@@ -219,7 +314,7 @@ def compile_decoder_blocks(
             module.forward = torch.compile(original_forward, **compile_kwargs)
         module._veomni_forward_compiled = True
         module._veomni_compile_config = dict(compile_kwargs)
-        logger.info_rank0(f"Compiled decoder block forward for {fqn} with torch.compile({compile_kwargs}).")
+        logger.info_rank0(f"Compiled block forward for {fqn} with torch.compile({compile_kwargs}).")
         compiled += 1
 
     logger.info_rank0(f"Compiled {compiled} decoder blocks with torch.compile.")

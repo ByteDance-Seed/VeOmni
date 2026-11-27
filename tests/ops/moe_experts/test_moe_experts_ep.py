@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from tests.ops.moe_experts.reference import standard_ep_reference
 from tests.ops.tol import (
     MOE_EP_PRE_SM90_ATOL,
@@ -36,9 +37,13 @@ from tests.ops.tol import (
     MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
 )
 from tests.ops.utils import assert_close_with_error, assert_reference_signal
+from tests.tools.launch_utils import spawn_with_rendezvous
 from veomni.distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, is_sm90_or_above
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, is_sm90_or_above
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
+
+
+_EP_DISPATCH_PLAN = LaunchSpec(nproc=2, device="accelerator")
 
 
 def _skip_if_unsupported():
@@ -616,4 +621,182 @@ def test_fused_moe_routing_weights_match_ep_projection_order(swiglu_limit: float
         hs_ep.grad,
         rtol=MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
         atol=MOE_SPLIT_MERGED_GRAD_HIDDEN_ATOL,
+    )
+
+
+def _distributed_standard_ep_worker(rank, merged, activation, impl, endpoint):
+    """Compare real token exchange and every gradient with a non-EP replica."""
+    import torch.distributed as dist
+
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
+    from veomni.ops import resolve_op
+
+    world = _EP_DISPATCH_PLAN.nproc
+    get_torch_device().set_device(rank)
+    dist.init_process_group("nccl", store=endpoint.connect(), rank=rank, world_size=world)
+    try:
+        device = torch.device(get_device_type(), rank)
+        generator = torch.Generator().manual_seed(20261105)
+        tokens, experts, hidden, intermediate, top_k = 128, 4, 512, 256, 2
+
+        def random(shape):
+            return (0.1 * torch.randn(shape, generator=generator)).to(device=device, dtype=torch.bfloat16)
+
+        inputs = random((world, tokens, hidden))[rank]
+        gate = random((experts, intermediate, hidden))
+        up = random((experts, intermediate, hidden))
+        down = random((experts, hidden, intermediate))
+        upstream = random((world, tokens, hidden))[rank]
+        ids = torch.arange(tokens, device=device)
+        routes = torch.stack(((ids + rank) % experts, (ids + rank + 1) % experts), dim=1)
+        routing = torch.tensor([0.75, 0.25], device=device, dtype=torch.float32).expand(tokens, top_k).contiguous()
+        full_weights = [torch.cat((gate, up), dim=1), down] if merged else [gate, up, down]
+        reference_weights = [w.detach().clone().requires_grad_() for w in full_weights]
+        local_experts = experts // world
+        local_weights = [
+            w[rank * local_experts : (rank + 1) * local_experts].detach().clone().requires_grad_()
+            for w in full_weights
+        ]
+        reference_input = inputs.detach().clone().requires_grad_()
+        actual_input = inputs.detach().clone().requires_grad_()
+        reference_routing = routing.detach().clone().requires_grad_()
+        actual_routing = routing.detach().clone().requires_grad_()
+        empty = torch.empty(0, device=device, dtype=torch.bfloat16)
+        # ``impl`` is the row under test. ``eager`` matters most here: it is what a
+        # fused row hands a non-Swish activation to, and it is where the decision to
+        # take the dispatching path lives.
+        fused = resolve_op("moe_experts", "standard", impl).wrapper
+
+        def forward(x, weights, scores):
+            # ``activation`` is what makes this test exercise the EP dispatch at all:
+            # `fused_triton` evaluates the activation itself, and the sharded weights
+            # must reach the EP Functions rather than be indexed by global id.
+            if merged:
+                return fused(
+                    x,
+                    scores,
+                    routes,
+                    empty,
+                    empty,
+                    weights[1],
+                    weights[0],
+                    num_experts=experts,
+                    activation=activation,
+                )
+            return fused(
+                x,
+                scores,
+                routes,
+                weights[0],
+                weights[1],
+                weights[2],
+                empty,
+                num_experts=experts,
+                activation=activation,
+            )
+
+        nonep_state = _init_parallel_state(dp_size=world, device_type=get_device_type(), name="schedule_nonep")
+        ep_state = _init_parallel_state(
+            dp_size=world, device_type=get_device_type(), extra_parallel_sizes=(world,), name="schedule_ep"
+        )
+        with use_parallel_state(nonep_state):
+            expected = forward(reference_input, reference_weights, reference_routing)
+            reference_grads = torch.autograd.grad(
+                expected, [reference_input, reference_routing, *reference_weights], upstream
+            )
+        with use_parallel_state(ep_state):
+            actual = forward(actual_input, local_weights, actual_routing)
+            actual_grads = torch.autograd.grad(actual, [actual_input, actual_routing, *local_weights], upstream)
+
+        # Finish all collectives before any assertion can send a peer to cleanup.
+        weight_pairs = []
+        names = ["fc1 gradient", "fc2 gradient"] if merged else ["fc1_1 gradient", "fc1_2 gradient", "fc2 gradient"]
+        for name, observed, full_grad in zip(names, actual_grads[2:], reference_grads[2:], strict=True):
+            full = full_grad.float()
+            dist.all_reduce(full, op=dist.ReduceOp.SUM)
+            target = full[rank * local_experts : (rank + 1) * local_experts].to(observed.dtype)
+            weight_pairs.append((name, observed, target))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=_ep_atol())
+        _assert_ep_reference_grads(
+            [
+                ("hidden gradient", actual_grads[0], reference_grads[0]),
+                ("routing gradient", actual_grads[1], reference_grads[1]),
+                *weight_pairs,
+            ],
+            *_ep_gradient_tolerances(None),
+        )
+    finally:
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=_EP_DISPATCH_PLAN)
+# The rows this CUDA suite can reach. `fused_npu` and `fused_mlu` need their own
+# accelerators, and `deepgemm` needs SM90 plus its own distributed test
+# (`test_deepgemm_distributed.py`), so none of them appear here.
+#
+# `fused_quack` is listed for its SiLU cases only: `quack.wrapper` hands any other
+# activation to the `eager` row, so a `gelu` case labelled `fused_quack` would
+# actually run `eager`'s EP path. The ids say which is which.
+@pytest.mark.parametrize(
+    "impl",
+    ["eager", "fused_triton", "fused_quack"],
+    ids=["eager", "fused_triton", "fused_quack"],
+)
+@pytest.mark.parametrize("activation", ["silu", "gelu"], ids=["silu", "gelu"])
+@pytest.mark.parametrize("merged", [False, True], ids=["split-fc1", "merged-fc1"])
+def test_distributed_standard_ep_dispatch_matches_nonep(request, merged, activation, impl):
+    if impl == "fused_quack":
+        # ``fused_quack`` delegates a non-SiLU activation to the reference row, so only
+        # its SiLU cases exercise quack's own EP path.
+        if activation != "silu":
+            request.node.add_marker(pytest.mark.skip(reason="non-SiLU leaves fused_quack for eager"))
+    """Exercise the compact expert schedule behind real all-to-all dispatch.
+
+    Parametrized over the activation because that is where the dispatch was lost:
+    `gelu` is inside `SUPPORTED_ACTIVATIONS`, so a guard that keyed only on "is this
+    name served?" sent it down the inline expert loop -- which builds its mask from
+    the *global* expert count and then indexes a per-rank shard. A SiLU-only test
+    cannot see that, and ``rtol=0`` against the non-EP replica is what makes the
+    difference visible rather than a plausibility check.
+    """
+    _skip_if_unsupported()
+    if impl == "fused_quack" and not is_quack_gemm_available():
+        pytest.skip("the fused_quack row needs the quack package")
+    if runner_device_count() < _EP_DISPATCH_PLAN.nproc:
+        pytest.skip("Distributed EP dispatch requires its declared accelerator plan")
+    spawn_with_rendezvous(
+        _distributed_standard_ep_worker, args=(merged, activation, impl), nprocs=_EP_DISPATCH_PLAN.nproc
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_spawned_ep_worker_is_called_with_all_of_its_arguments():
+    """The spawn call must supply every worker parameter but `rank` and `endpoint`.
+
+    `spawn_with_rendezvous` binds `rank` first and appends `endpoint`, so the explicit
+    `args` tuple has to cover everything between. Giving the worker a new parameter
+    without widening that tuple produces a `TypeError` inside a spawned process on a
+    GPU box -- two cards burnt to learn what a signature comparison shows on CPU. It
+    happened once already, when the `impl` axis was added.
+    """
+    import ast
+    import inspect
+
+    parameters = list(inspect.signature(_distributed_standard_ep_worker).parameters)
+    assert parameters[0] == "rank"
+    assert parameters[-1] == "endpoint"
+
+    tree = ast.parse(inspect.getsource(test_distributed_standard_ep_dispatch_matches_nonep))
+    call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and "spawn_with_rendezvous" in ast.unparse(node.func)
+    )
+    explicit = next(keyword.value for keyword in call.keywords if keyword.arg == "args")
+    supplied = 1 + len(explicit.elts) + 1
+
+    assert supplied == len(parameters), (
+        f"spawn passes {supplied} arguments to a worker that takes {len(parameters)}: {parameters}. "
+        f"`args` covers everything between `rank` and `endpoint`."
     )

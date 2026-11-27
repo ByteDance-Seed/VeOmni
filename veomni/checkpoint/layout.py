@@ -42,7 +42,6 @@ from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 MODEL_DIRNAME = "model"
 WEIGHTS_DIRNAME = "ckpt"
 OPTIMIZER_DIRNAME = "optimizer"
-LR_SCHEDULER_FILENAME = "lr_scheduler.pt"
 LOADER_DIRNAME = "loader"
 EXTRA_STATE_DIRNAME = "extra_state"
 RANK_FILE_FORMAT = "rank_{}.pt"
@@ -50,6 +49,12 @@ RANK_FILE_FORMAT = "rank_{}.pt"
 # Export tree. Inference artifacts; resume never reads these.
 HF_EXPORT_DIRNAME = "hf_ckpt"
 LORA_EXPORT_DIRNAME = "lora_ckpt"
+# An HF export whose oversized row-sharded tables are still split by rank: the
+# per-rank shards stay under ``sharded/`` and this marker lists the files they
+# merge into. Loaders refuse the directory until ``scripts/merge_hf_export.py``
+# has run.
+HF_SHARDED_DIRNAME = "sharded"
+HF_PENDING_MERGE_FILENAME = "pending_merge.json"
 
 # Run-root sidecars. Written once at train start, beside ``checkpoints/``.
 ASSETS_DIRNAME = "model_assets"
@@ -88,11 +93,6 @@ def optimizer_dir(step_root: str, module: str = "") -> str:
     model and useless outside this run.
     """
     return os.path.join(model_dir(step_root, module), OPTIMIZER_DIRNAME)
-
-
-def lr_scheduler_path(step_root: str, module: str = "") -> str:
-    """Replicated scheduler pickle, beside the two DCP directories."""
-    return os.path.join(model_dir(step_root, module), LR_SCHEDULER_FILENAME)
 
 
 def loader_path(step_root: str, rank: int) -> str:
@@ -134,6 +134,7 @@ def assets_dir(assets_root: str, module: str = "") -> str:
 
 
 def manifest_path(step_root: str) -> str:
+    """Path of the step's completion marker, at the step root."""
     return os.path.join(step_root, MANIFEST_FILENAME)
 
 
@@ -268,7 +269,6 @@ __all__ = [
     "HF_EXPORT_DIRNAME",
     "LORA_EXPORT_DIRNAME",
     "LOADER_DIRNAME",
-    "LR_SCHEDULER_FILENAME",
     "MANIFEST_FILENAME",
     "MANIFEST_FORMAT_VERSION",
     "MODEL_DIRNAME",
@@ -283,7 +283,6 @@ __all__ = [
     "hf_export_dir",
     "loader_path",
     "lora_export_dir",
-    "lr_scheduler_path",
     "manifest_path",
     "model_dir",
     "optimizer_dir",

@@ -16,9 +16,10 @@
 
 from __future__ import annotations
 
-import torch
-import torch.nn.functional as F
 from torch import Tensor
+
+from ....activation import resolve
+from ..shared.act_fn_experts import merged_experts_act_fn_forward
 
 
 def wrapper(
@@ -33,6 +34,9 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    block_size: int = 128,
+    dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
 
@@ -42,32 +46,25 @@ def wrapper(
     intermediate before ``fc2`` and agrees with this row only to rounding.
     Regular autograd, no custom backward. ``assume_distinct_experts`` only
     tightens the Triton grouped-GEMM launch bound, so it is unused here.
+
+    Every activation, and both weight layouts, run the one reference loop in
+    :mod:`veomni.ops.kernels.moe_experts.shared.act_fn_experts`. A name outside
+    ``veomni.ops.activation`` is resolved through ``ACT2FN`` -- the same table the
+    model built its ``act_fn`` from -- so a config that trained before the activation
+    became a call argument still trains. That loop owns the expert-parallel dispatch
+    too, because the weights it indexes are sharded per rank under EP; a second
+    non-EP copy lived here and indexed a shard with global ids.
     """
-    del assume_distinct_experts
-    has_split = fc1_1_weight.numel() > 0
-    has_merged = fc1_1_2_weight.numel() > 0
-    if has_split == has_merged:
-        raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both or neither.")
-    if has_split and fc1_2_weight.numel() == 0:
-        raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
-
-    output = torch.zeros_like(hidden_states)
-    expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-    for expert_idx in expert_hit:
-        idx = int(expert_idx[0].item())
-        top_k_pos, token_idx = torch.where(expert_mask[idx])
-        x = hidden_states[token_idx]
-        if has_merged:
-            gate, up = F.linear(x, fc1_1_2_weight[idx]).chunk(2, dim=-1)
-        else:
-            gate = F.linear(x, fc1_1_weight[idx])
-            up = F.linear(x, fc1_2_weight[idx])
-        if swiglu_limit is not None:
-            gate = gate.clamp(max=swiglu_limit)
-            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.linear(F.silu(gate) * up, fc2_weight[idx])
-        y = y * routing_weights[token_idx, top_k_pos, None]
-        output = output.index_add(0, token_idx, y.to(output.dtype))
-    return output
+    del assume_distinct_experts, block_size, dtype
+    return merged_experts_act_fn_forward(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        fc1_1_2_weight,
+        fc2_weight,
+        resolve(activation),
+        num_experts,
+        swiglu_limit,
+        fc1_1_proj=fc1_1_weight,
+        fc1_2_proj=fc1_2_weight,
+    )

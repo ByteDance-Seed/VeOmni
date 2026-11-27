@@ -23,7 +23,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from tests.models.tiny_configs import tiny_gemma3_text_config
 from veomni.models.configuration_base import as_veomni_config
-from veomni.models.transformers.gemma3.generated import patched_modeling_gemma3_npu as gemma3_modeling
+from veomni.models.transformers.gemma3 import modeling_gemma3 as gemma3_modeling
 from veomni.ops import VeomniOp
 
 
@@ -49,6 +49,13 @@ def _build_tiny_gemma3_vlm():
     )
     as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     return gemma3_modeling.Gemma3ForConditionalGeneration(config)
+
+
+def test_gemma3_vlm_registry_resolves_without_an_npu():
+    from veomni.models.registry import MODELING_REGISTRY
+
+    resolved = MODELING_REGISTRY["gemma3"]("Gemma3ForConditionalGeneration")
+    assert resolved is gemma3_modeling.Gemma3ForConditionalGeneration
 
 
 def test_gemma3_vlm_binds_instance_local_ops_and_runs_text_loss():

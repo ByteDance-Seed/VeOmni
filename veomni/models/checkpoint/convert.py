@@ -86,6 +86,15 @@ class CheckpointTensorConverter(Protocol):
         """
         ...
 
+    def checkpoint_row_counts(self) -> Dict[str, Tuple[int, int]]:
+        """Optionally map weight FQNs to (checkpoint rows, padded runtime rows).
+
+        Omit this method or return an empty dict when no row cropping is needed.
+        The checkpoint planners consume this metadata without importing model code.
+        Padding must be semantically inert; optimizer tensors keep runtime shapes.
+        """
+        ...
+
     def is_dim0_zero_pad(self, name: str) -> bool:
         """Optional streaming capability: whether this converter's *only* transform for
         ``name`` is appending trailing zero rows on dim-0 (no fusion/reshape/dtype change).
@@ -109,6 +118,31 @@ class CheckpointTensorConverter(Protocol):
         MoE kernels assert it) rather than padding experts; declaring this for experts
         would silently corrupt results.
         """
+        ...
+
+    def dim0_rowwise_companion(self, name: str) -> Optional[str]:
+        """Optional streaming capability: the checkpoint key ``name`` is converted
+        together with, row by row -- or ``None``.
+
+        Returning a key declares that row ``i`` of the converted ``name`` depends
+        only on row ``i`` of ``name`` and of that companion (e.g. fp8 table rows
+        and their per-row block scales, dequantized to bf16). Such a transform
+        commutes with a ``Shard(0)`` split, so a per-rank streaming loader reads
+        the same real-row slice of both keys, hands them to :meth:`convert_rows`,
+        and zero-fills any rows past the checkpoint's. That loader then skips
+        the companion's own key; a whole-tensor loader hands both keys to
+        :meth:`convert`, so it must pair them there too.
+
+        A key outside every ExtraParallel plan is read whole, with its whole
+        companion. The loader asks for every key, claimed by :meth:`can_handle`
+        or not, and only uses the companion when the checkpoint holds it;
+        without it the key falls back to :meth:`is_dim0_zero_pad`. Implementing
+        this method is optional and a missing method means ``None``.
+        """
+        ...
+
+    def convert_rows(self, name: str, rows: "torch.Tensor", companion_rows: "torch.Tensor") -> "torch.Tensor":
+        """Convert matching row slices of ``name`` and its :meth:`dim0_rowwise_companion`."""
         ...
 
     def should_skip_without_loading(self, name: str) -> bool:
@@ -150,6 +184,15 @@ class CheckpointTensorConverter(Protocol):
         """
         ...
 
+    def crop_hf_export_tensor(self, name: str, tensor: "torch.Tensor") -> "torch.Tensor":
+        """Optional export hook: crop runtime dim-0 padding from a full unsharded tensor.
+
+        ``name`` is the unprefixed weight FQN on the underlying model and ``tensor``
+        is the full unsharded matrix. Implementing this method is optional; a missing
+        method leaves exported tensors unchanged.
+        """
+        ...
+
 
 def checkpoint_converter_is_dim0_zero_pad(
     converter: Optional["CheckpointTensorConverter"],
@@ -165,6 +208,22 @@ def checkpoint_converter_is_dim0_zero_pad(
         return False
     fn = getattr(converter, "is_dim0_zero_pad", None)
     return bool(fn(name)) if callable(fn) else False
+
+
+def checkpoint_converter_dim0_rowwise_companion(
+    converter: Optional["CheckpointTensorConverter"],
+    name: str,
+) -> Optional[str]:
+    """Safely query the optional :meth:`CheckpointTensorConverter.dim0_rowwise_companion`.
+
+    Not gated on ``can_handle``: a converter may claim a weight only by its
+    content (``can_handle_tensor``), and the name alone is all a streaming
+    loader has before reading.
+    """
+    if converter is None:
+        return None
+    fn = getattr(converter, "dim0_rowwise_companion", None)
+    return fn(name) if callable(fn) else None
 
 
 def checkpoint_converter_should_skip_without_loading(
@@ -223,6 +282,8 @@ def get_checkpoint_tensor_converter(
     model: Union["nn.Module", "PreTrainedModel"],
 ) -> Optional["CheckpointTensorConverter"]:
     """Return the checkpoint tensor converter registered on *model*, or ``None``."""
+    while isinstance(getattr(model, "module", None), nn.Module):
+        model = model.module
     factory = getattr(model, "_create_checkpoint_tensor_converter", None)
     if factory is None:
         return None
@@ -372,20 +433,43 @@ def split_moe_params(name, tensor, ep_rank=0):
 _process_moe_params = split_moe_params
 
 
-def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor], None, None]:
+def export_weights(
+    model: torch.nn.Module,
+    *,
+    skip_frozen_ple: bool = False,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     """
     Export master weights from fully_sharded model, fused MoE weights are split into per-expert weights.
 
     Args:
         model: The fully_sharded model to export the master weights from.
+        skip_frozen_ple: Omit frozen Qwen4-Exp PLE n-gram tables before unsharding
+            ``DTensor`` shards. Disabled by default so checkpoint exports remain complete.
 
     Returns:
         A generator of tuples of the form (name, tensor).
     """
+    from veomni.models.frozen_ple import is_ple_table
+
     ps = parallel_state.get_parallel_state()
+    while isinstance(getattr(model, "module", None), torch.nn.Module):
+        next_model = model.module
+        if next_model is model:
+            break
+        model = next_model
     params = model.state_dict()
+    frozen_ple_names = (
+        {name for name, param in model.named_parameters() if is_ple_table(name) and not param.requires_grad}
+        if skip_frozen_ple
+        else set()
+    )
+    converter = get_checkpoint_tensor_converter(model)
+    crop_fn = getattr(converter, "crop_hf_export_tensor", None) if converter is not None else None
+
     device = None
     for name, param in params.items():
+        if name in frozen_ple_names:
+            continue
         # With ``CPUOffloadPolicy`` the sharded DTensor local shard lives on CPU, so an
         # unstaged ``full_tensor()`` all-gathers over gloo and hands CPU tensors to the
         # consumers (EP broadcast, quantization kernels), which require device tensors.
@@ -412,4 +496,6 @@ def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]
             if is_expert_layer:
                 yield from split_moe_params(name, unsharded_tensor, ep_rank=0)
             else:
+                if callable(crop_fn):
+                    unsharded_tensor = crop_fn(name, unsharded_tensor)
                 yield name, unsharded_tensor

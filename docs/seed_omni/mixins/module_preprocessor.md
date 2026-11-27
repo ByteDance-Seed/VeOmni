@@ -12,7 +12,7 @@ at that subclass.
 - Asset binding helper: [`bind_module_assets`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L128)
 - Composed orchestrator: [`OmniProcessor`](../../../veomni/models/seed_omni/processing_omni.py#L78)
 - Dataset transform caller: [`process_seedomni_example`](../../../veomni/data/seed_omni/seedomni_transform.py#L183) / [`process_seedomni_cached_example`](../../../veomni/data/seed_omni/seedomni_transform.py#L254)
-- Collator: [`SeedOmniCollator`](../../../veomni/data/seed_omni/collator.py#L22)
+- Collator: [`SeedOmniCollator`](../../../veomni/data/seed_omni/collator.py#L61)
 
 ## Why preprocessing is per-module, per-sample, and CPU-only
 
@@ -118,18 +118,18 @@ class VisionPreprocessor(ModulePreprocessorBase):
 
 | Function | Called by | Effect |
 |----------|-----------|--------|
-| [`ModulePreprocessorBase.__call__(batch, inference=False, **kwargs)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L85) | [`OmniProcessor.preprocess_batch`](../../../veomni/models/seed_omni/processing_omni.py#L228) | Delegates `batch["conversation_list"]` to `preprocess_conversations` in `config.module_names` order. |
+| [`ModulePreprocessorBase.__call__(batch, inference=False, **kwargs)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L85) | [`OmniProcessor.preprocess_batch`](../../../veomni/models/seed_omni/processing_omni.py#L239) | Delegates `batch["conversation_list"]` to `preprocess_conversations` in `config.module_names` order. |
 | [`bind_module_assets(model, *, checkpoint_path=None, preprocessor=None, config_overrides=None)`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L128) | [`PretrainedOmniModule.from_pretrained`](../../../veomni/models/seed_omni/modules/module_modeling_base.py#L32) and [`ModuleRuntime._build_model_assets`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L354) | Copies CPU asset attributes (`_processor`, `_image_processor`, `_video_processor`, `_tokenizer`, `_chat_template`) from the preprocessor onto `model` if not already set, so `generate()` and HF checkpoint export can access them. |
 
 ## Call flow
 
 - **Training sample & micro-batch**:
   - [`OmniTrainer._build_data_transform`](../../../veomni/trainer/omni/omni_trainer.py#L288) builds [`OmniProcessor.from_config`](../../../veomni/models/seed_omni/processing_omni.py#L109), calls [`OmniProcessor.bind_dummy_inputs`](../../../veomni/models/seed_omni/processing_omni.py#L88), and passes `processor` into [`process_seedomni_example`](../../../veomni/data/seed_omni/seedomni_transform.py#L183) / [`process_seedomni_cached_example`](../../../veomni/data/seed_omni/seedomni_transform.py#L254).
-  - For each dataset sample, `seedomni_transform` calls [`OmniProcessor.preprocess(conversation_list)`](../../../veomni/models/seed_omni/processing_omni.py#L216) → [`OmniProcessor.preprocess_batch(..., inference=False)`](../../../veomni/models/seed_omni/processing_omni.py#L228), running each module's [`ModulePreprocessorBase.__call__`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L85) → [`preprocess_conversations`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L89) to mutate items in place, populate `_omni_token_len` / `labels`, and append per-sample `is_dummy=True` placeholders.
-  - When `train.dyn_bsz: true`, [`get_length_fn`](../../../veomni/data/dataset.py#L444) (`count_mode="total"` and `physical_token_cap`, including `is_dummy=True` items) and [`get_length_by_labels_fn`](../../../veomni/data/dataset.py#L476) (`count_mode="effective"`, excluding `is_dummy=True` items) read those metadata fields to batch samples by token budget, and [`SeedOmniCollator.__call__`](../../../veomni/data/seed_omni/collator.py#L63) groups the selected sample dicts into a micro-batch.
+  - For each dataset sample, `seedomni_transform` calls [`OmniProcessor.preprocess(conversation_list)`](../../../veomni/models/seed_omni/processing_omni.py#L216) → [`OmniProcessor.preprocess_batch(..., inference=False)`](../../../veomni/models/seed_omni/processing_omni.py#L239), running each module's [`ModulePreprocessorBase.__call__`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L85) → [`preprocess_conversations`](../../../veomni/models/seed_omni/modules/module_processing_base.py#L89) to mutate items in place, populate `_omni_token_len` / `labels`, and append per-sample `is_dummy=True` placeholders.
+  - When `train.dyn_bsz: true`, [`get_length_fn`](../../../veomni/data/dataset.py#L444) (`count_mode="total"` and `physical_token_cap`, including `is_dummy=True` items) and [`get_length_by_labels_fn`](../../../veomni/data/dataset.py#L480) (`count_mode="effective"`, excluding `is_dummy=True` items) read those metadata fields to batch samples by token budget, and [`SeedOmniCollator.__call__`](../../../veomni/data/seed_omni/collator.py#L102) groups the selected sample dicts into a micro-batch.
 - **Inference request**:
   - [`OmniInferencer._build_model`](../../../veomni/trainer/omni/omni_inferencer.py#L120) builds [`OmniProcessor.from_config`](../../../veomni/models/seed_omni/processing_omni.py#L109).
-  - [`OmniInferencer._run`](../../../veomni/trainer/omni/omni_inferencer.py#L237) calls [`OmniProcessor.__call__(..., inference=True)`](../../../veomni/models/seed_omni/processing_omni.py#L167) → [`OmniProcessor.preprocess`](../../../veomni/models/seed_omni/processing_omni.py#L216) → [`OmniProcessor.preprocess_batch(..., inference=True)`](../../../veomni/models/seed_omni/processing_omni.py#L228).
+  - [`OmniInferencer._run`](../../../veomni/trainer/omni/omni_inferencer.py#L237) calls [`OmniProcessor.__call__(..., inference=True)`](../../../veomni/models/seed_omni/processing_omni.py#L167) → [`OmniProcessor.preprocess`](../../../veomni/models/seed_omni/processing_omni.py#L216) → [`OmniProcessor.preprocess_batch(..., inference=True)`](../../../veomni/models/seed_omni/processing_omni.py#L239).
 
 ## Rules an implementation must follow
 
@@ -141,10 +141,10 @@ class VisionPreprocessor(ModulePreprocessorBase):
 ## Tests
 
 - [`tests/seed_omni/data/test_preprocessor.py`](../../../tests/seed_omni/data/test_preprocessor.py):
-  - [strict key alignment across collated samples](../../../tests/seed_omni/data/test_preprocessor.py#L91),
-  - [mixed-resolution images preserved unstacked and normalized per item](../../../tests/seed_omni/data/test_preprocessor.py#L101),
-  - [per-sample dummy anchor injection when a modality is absent](../../../tests/seed_omni/data/test_preprocessor.py#L145), and
-  - [`seedomni_transform` runs `OmniProcessor` and populates `dyn_bsz` total/effective lengths](../../../tests/seed_omni/data/test_preprocessor.py#L164).
+  - [strict key alignment across collated samples](../../../tests/seed_omni/data/test_preprocessor.py#L92),
+  - [mixed-resolution images preserved unstacked and normalized per item](../../../tests/seed_omni/data/test_preprocessor.py#L102),
+  - [per-sample dummy anchor injection when a modality is absent](../../../tests/seed_omni/data/test_preprocessor.py#L146), and
+  - [`seedomni_transform` runs `OmniProcessor` and populates `dyn_bsz` total/effective lengths](../../../tests/seed_omni/data/test_preprocessor.py#L165).
 - [`tests/seed_omni/model/test_processor.py`](../../../tests/seed_omni/model/test_processor.py):
   - [preprocessors run in module order](../../../tests/seed_omni/model/test_processor.py#L36),
   - [`model_config` and `processor_config` overrides reach `from_pretrained`](../../../tests/seed_omni/model/test_processor.py#L162), and

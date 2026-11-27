@@ -102,7 +102,13 @@ class OmniInferencer:
         )
         if self._distributed:
             self.device = OmniTrainer._setup(args, save_launch_args=False)
-        helper.set_seed(args.infer.seed)
+        helper.set_seed(args.infer.seed, args.infer.enable_full_determinism)
+        if args.infer.enable_full_determinism:
+            logger.info_rank0(
+                "OmniInferencer: full determinism is ON "
+                "(NCCL_DETERMINISTIC / cuDNN disabled). "
+                "Pass --infer.enable_full_determinism false for serving speed."
+            )
         self._build_model()
 
         # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved
@@ -145,7 +151,7 @@ class OmniInferencer:
             self.model = OmniModel.from_pretrained(
                 self.checkpoint_root,
                 config=config,
-                torch_dtype=torch.bfloat16,
+                torch_dtype="auto",
                 device_map="auto",
             ).eval()
             logger.info_rank0(
@@ -242,6 +248,7 @@ class OmniInferencer:
             videos=req.videos or None,
             mm_configs=req.mm_configs or None,
             inference=True,
+            **req.generation_kwargs,
         )
         if self._distributed:
             # Every module sits on this rank's device, as in training. An eager

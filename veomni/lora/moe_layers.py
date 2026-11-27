@@ -117,8 +117,9 @@ EP-aware rank-0 broadcast / per-rank load paths slice the disk-side
 Both wrappers always call ``VeomniOp("moe_experts_lora", variant, impl)``.
 ``variant`` is the wrapper class (``shared`` / ``independent``). ``impl``
 follows the wrapped experts' ``veomni_moe`` handle when that LoRA row is
-available on this device, and falls back to ``eager`` otherwise. The FP8
-``deepgemm_fp8`` backend rejects expert LoRA rather than changing precision.
+available on this device, and falls back to ``eager`` otherwise. Two backends
+reject expert LoRA rather than changing precision: ``deepgemm``, and the
+``qat`` row, which has no adapter forward that would fake-quantize the weights.
 
 PEFT-format save/load compatibility (PEFT-aligned FQN layout)
 -------------------------------------------------------------
@@ -163,14 +164,19 @@ logger = logging.get_logger(__name__)
 
 
 def _moe_lora_op(base_layer: nn.Module, variant: str):
-    """Reject unsupported FP8 expert LoRA; otherwise bind the matching row or fall back to ``eager``."""
+    """Reject a rounding expert backend; otherwise bind its row."""
     from veomni.ops import OP_REGISTRY, VeomniOp
+    from veomni.ops.kernels.moe_experts import QUANTIZING_IMPLS
 
     base_op = getattr(base_layer, "veomni_moe", None)
     impl = "eager" if base_op is None else base_op.impl
-    if impl == "deepgemm_fp8":
+    # No ``moe_experts_lora`` row fake-quantizes the base weights, so a selection
+    # that does -- ``qat`` or ``deepgemm`` -- must be refused: substituting
+    # ``eager`` would train them at full precision while the config still claimed
+    # quantization.
+    if impl in QUANTIZING_IMPLS:
         raise ValueError(
-            "moe_implementation='deepgemm_fp8' does not support MoE-LoRA on expert weights. "
+            f"moe_implementation={impl!r} does not support MoE-LoRA on expert weights. "
             "Select a supported MoE-LoRA backend (for example 'fused_triton' on GPU), "
             "or exclude expert weights from the LoRA targets."
         )
@@ -678,10 +684,16 @@ class LoraSharedExperts(nn.Module):
                 # underlying storage.
                 if local_storage.is_contiguous():
                     dist.all_reduce(local_storage, op=dist.ReduceOp.SUM, group=ep_group)
+                    buffer_to_scale = local_storage
                 else:
                     buf = local_storage.contiguous()
                     dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=ep_group)
                     local_storage.copy_(buf)
+                    buffer_to_scale = local_storage
+                # Without an FSDP wrap (`extra_parallel_only`), divide the EP-summed
+                # accumulated grad by world_size here so multi-microbatch scaling stays exact.
+                if getattr(ps, "extra_parallel_only", False):
+                    buffer_to_scale.div_(ps.world_size)
 
             return _hook
 
@@ -705,13 +717,6 @@ class LoraSharedExperts(nn.Module):
         # Must run after FSDP wrapping has converted params to DTensors, hence
         # the lazy install at first forward rather than in ``__init__``.
         self._ensure_ep_grad_sync_hooks()
-
-        if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
-            raise RuntimeError(
-                "LoraSharedExperts: eager forward does not support expert parallelism (EP). "
-                "Set moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
-                "to use the EP-aware fused LoRA path, or disable EP."
-            )
 
         return self.veomni_moe_lora(
             hidden_states,
@@ -1005,13 +1010,6 @@ class LoraIndependentExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Run routed experts with per-expert LoRA adapters through ``veomni_moe_lora``."""
-        if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
-            raise RuntimeError(
-                "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
-                "Set moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
-                "to use the EP-aware fused LoRA path, or disable EP."
-            )
-
         return self.veomni_moe_lora(
             hidden_states,
             top_k_weights,

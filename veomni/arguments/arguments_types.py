@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
+from ..ops.registry import OpsSelection
 from ..utils import logging
 from ..utils.env import get_env
 
@@ -85,7 +86,7 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal["adamw", "anyprecision_adamw", "muon", "hyper_muon"] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -257,6 +258,21 @@ class OptimizerConfig:
             )
         },
     )
+    muon_expert_ns_max_experts: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "Enable chunked Newton-Schulz for a local-expert stack on device (the "
+                "muon_expert_zero_comm path). -1 (default) disables chunking: the whole local "
+                "stack is orthogonalized in one call, which is fastest and needs the most NS "
+                "workspace. A positive value bounds the workspace at max_experts * min(M, K)**2 "
+                "instead of local_experts * min(M, K)**2, splitting the stack into balanced "
+                "slices of at most that many experts (a remainder never becomes a single-expert "
+                "call). Costs a few percent of step time; use it only when the unchunked "
+                "workspace would OOM."
+            )
+        },
+    )
     muon_ns_implementation: Literal["std", "gram", "gram_quack"] = field(
         default="gram_quack",
         metadata={
@@ -281,6 +297,11 @@ class OptimizerConfig:
     )
 
     def __post_init__(self):
+        if self.type not in ("adamw", "anyprecision_adamw", "muon", "hyper_muon"):
+            raise ValueError(
+                f"Unknown model.optimizer.type: {self.type!r}. "
+                "Supported values: 'adamw', 'anyprecision_adamw', 'muon', 'hyper_muon'."
+            )
         # Annotations are not enforced for YAML values (see constraints), so the
         # literal is validated explicitly; otherwise a typo would silently fall
         # back to the stock path in the builder.
@@ -477,11 +498,9 @@ class GradientCheckpointingConfig:
         default=False,
         metadata={
             "help": (
-                "Use reentrant gradient checkpointing. Kept off by default, and not usable "
-                "on a model whose block loop passes its block arguments by keyword "
-                "(MiniMax-H3): reentrant checkpointing saves positional tensors only, so "
-                "the first recomputed block raises. torch also refuses "
-                "enable_reentrant=True together with SAC."
+                "Use reentrant gradient checkpointing. Kept off by default. MiniMax-H3 rejects "
+                "this when enabling checkpointing because differentiable block inputs are passed "
+                "by keyword. Reentrant checkpointing also does not support SAC."
             )
         },
     )
@@ -591,9 +610,19 @@ class TorchCompileConfig:
         default=True,
         metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
     )
-    dynamic: bool = field(
-        default=False,
-        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
+    dynamic: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether to pass dynamic=True to torch.compile. Unset keeps torch's default: the first call "
+                "compiles a static graph and a shape change promotes it to a symbolic one covering the rest of "
+                "the run. Leave it unset. False is not the safe choice: with fullgraph=True a re-cache is a "
+                "hard failure, so one new shape per step raises FailOnRecompileLimitHit once "
+                "torch._dynamo.config.cache_size_limit (8) is exhausted. True survives a moving shape but pays "
+                "for it on the first call, and it breaks a custom autograd Function that chains two Triton "
+                "kernels (the fused-Triton MoE experts)."
+            )
+        },
     )
 
 
@@ -666,15 +695,36 @@ def validate_low_precision_reduce_scatter_comm(
 
 def validate_expert_fsdp_shard_dim(dim, *, fsdp_mode="fsdp2"):
     """Validate an explicit expert FSDP placement independently of its optimizer."""
-    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode != "fsdp2"):
+    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode not in ("fsdp2", "hyper_fsdp2")):
         raise ValueError("expert_fsdp_shard_dim must be null, 0 or 1 and requires FSDP2.")
+
+
+@dataclass
+class HyperParallelFSDPConfig:
+    """Optional Hyper-specific controls under the shared FSDP configuration."""
+
+    comm_fusion: bool = False
+    comm_fusion_vit: Optional[bool] = None
+    forward_prefetch_depth: int = 1
+    backward_prefetch_depth: int = 1
+    reduce_comm_interval: int = 1
+
+    def __post_init__(self):
+        if type(self.comm_fusion) is not bool:
+            raise ValueError("hyper_parallel.comm_fusion must be bool.")
+        if self.comm_fusion_vit is not None and type(self.comm_fusion_vit) is not bool:
+            raise ValueError("hyper_parallel.comm_fusion_vit must be bool or null.")
+        for name in ("forward_prefetch_depth", "backward_prefetch_depth", "reduce_comm_interval"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"hyper_parallel.{name} must be a positive integer.")
 
 
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp2", "eager"] = field(
+    fsdp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2", "eager"] = field(
         default="fsdp2",
         metadata={
             "help": (
@@ -744,11 +794,11 @@ class FSDPConfig:
             "help": (
                 "Use mixed_precision.param_dtype for node-local FSDP2 ReduceScatter communication, while "
                 "keeping FP32 reduction buffers and accumulation. Disabled by default. Equal parameter and "
-                "reduction dtypes retain native communication. The custom path requires enabled mixed precision, "
-                "bfloat16 or float16 parameters, and float32 reduction. "
-                "Cross-node or unknown-placement shard groups fall back to native communication; "
-                "HSDP replica-linked groups make a consistent choice. FP32 modules excluded from mixed "
-                "precision keep native communication."
+                "reduction dtypes retain native communication. The custom path requires enabled mixed precision "
+                "and float32 reduction. CUDA/NCCL supports bfloat16 or float16 parameters and HSDP "
+                "replica-linked groups. Ascend/HCCL supports bfloat16 parameters with no HSDP replicas. "
+                "Cross-node or unknown-placement shard groups fall back to native communication. "
+                "FP32 modules excluded from mixed precision keep native communication."
             )
         },
     )
@@ -759,13 +809,29 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    extra_parallel_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Apply the model's ExtraParallel plan (ep / emb) but skip the FSDP2 wrap. "
+                "Only applies when fsdp_mode='fsdp2'; ignored under 'ddp' or 'eager'. "
+                "The plan shards the dimension it names (e.g. experts on dim0) and the wrap "
+                "shards the rest (dim1 for experts); without the wrap that second axis must "
+                "be size 1, so this only fits a dimension already as wide as the shard axis. "
+                "For inference on a checkpoint kept quantized (fp8/fp4 storage), whose layer "
+                "mixes several floating-point dtypes that an FSDP parameter group refuses; "
+                "a training run dequantizes at load and does not need it for that reason."
+            )
+        },
+    )
+    hyper_parallel: HyperParallelFSDPConfig = field(default_factory=HyperParallelFSDPConfig)
 
     def __post_init__(self):
-        if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
+        if self.fsdp_mode not in ("ddp", "fsdp2", "hyper_fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
                 "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
-                "'ddp', or 'eager'."
+                "'hyper_fsdp2', 'ddp', or 'eager'."
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
@@ -797,8 +863,8 @@ class OffloadConfig:
             "help": (
                 "Enable async activation offload to CPU via stream-based D2H/H2D transfers. "
                 "More efficient than synchronous offload. Mutually exclusive with "
-                "`enable_activation`. Uses `model._no_split_modules` when "
-                "`activation_offload_modules` is empty."
+                "`enable_activation`. When `activation_offload_modules` is empty, uses "
+                "`model._activation_offload_target_classes` if defined, otherwise `model._no_split_modules`."
             )
         },
     )
@@ -905,6 +971,14 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
+    skip_sp_gather_between_modules: bool = field(
+        default=False,
+        metadata={
+            "help": "SeedOmni: every module's post_forward hands its sequence-parallel shard "
+            "directly to the next module instead of all-gathering full-sequence tensors onto "
+            "`conversation_list`. Global to the run: per-module overrides are ignored."
+        },
+    )
     init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
         default="meta",
         metadata={
@@ -916,20 +990,28 @@ class AcceleratorConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
+    @property
+    def resolved_extra_parallel(self) -> tuple[list[str], list[int], list[bool]]:
+        """Effective ``(names, sizes, placement_innermost)`` with ``ep`` folded in on demand.
+
+        Keeps the raw dataclass fields untouched so ``asdict()`` and per-module overlay
+        merging never inherit a pre-folded ``"ep"`` entry that shadows ``ep_size``.
+        """
+        names = list(self.extra_parallel_names)
+        sizes = list(self.extra_parallel_sizes)
+        innermost = list(self.extra_parallel_placement_innermost)
+        if "ep" not in names:
+            names.append("ep")
+            sizes.append(self.ep_size)
+            innermost.append(self.ep_outside)
+        return names, sizes, innermost
+
     def __post_init__(self):
         from ..distributed.hccl_options import validate_ep_hccl_options
 
         validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
-        # although expert parallel and extra parallel are both provided in the arguments,
-        # the implementation is configuring extra parallelism to include expert parallelism.
-        # Guarded so re-instantiating from a saved config (asdict round-trip) does not
-        # append a second "ep" dimension.
-        if "ep" not in self.extra_parallel_names:
-            self.extra_parallel_sizes.append(self.ep_size)
-            self.extra_parallel_names.append("ep")
-            self.extra_parallel_placement_innermost.append(self.ep_outside)
-
-        ep_size = dict(zip(self.extra_parallel_names, self.extra_parallel_sizes)).get("ep", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = self.resolved_extra_parallel
+        ep_size = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ep", 1)
         if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
             raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
 
@@ -990,7 +1072,7 @@ class AcceleratorConfig:
             self.dp_shard_size = self.dp_size
 
     def _validate_init_device(self):
-        if self.fsdp_config.fsdp_mode == "fsdp2":
+        if self.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2"):
             assert self.init_device == "meta", "Please use model.accelerator.init_device: meta for FSDP2 training"
         else:
             # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
@@ -1247,7 +1329,6 @@ class TrainingArguments:
             )
         },
     )
-
     # sub-argument groups
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
@@ -1332,7 +1413,7 @@ class TrainingArguments:
                 logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
-        # ├── checkpoints/          # DCP: model + optimizer + lr_scheduler.pt + trainer_state
+        # ├── checkpoints/          # DCP: model + optimizer + per-rank extra_state
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
@@ -1373,10 +1454,15 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
-    "swiglu_mlp_implementation": frozenset(),
+    "gated_mlp_implementation": frozenset(),
+    "linear_implementation": frozenset(),
+    "kv_round_implementation": frozenset({"none"}),
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"torch_npu"}),
+    "situ_and_mul_implementation": frozenset({"triton"}),
+    "chunk_kda_implementation": frozenset({"ascendc"}),
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
@@ -1384,6 +1470,7 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"torch_npu"}),
 }
 
 _AITER_ATTENTION_IMPLEMENTATIONS = frozenset(
@@ -1398,7 +1485,9 @@ _MLU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"liger_kernel"}),
     "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
     "rotary_pos_emb_vision_implementation": frozenset({"liger_kernel"}),
-    "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "gated_mlp_implementation": frozenset({"liger_kernel"}),
+    "linear_implementation": frozenset(),
+    "kv_round_implementation": frozenset({"none"}),
     "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
@@ -1454,7 +1543,7 @@ class OpsImplementationConfig:
 
     - **Config-parse time** (``__post_init__``) for the model-agnostic fields:
       ``rms_norm``, ``rotary_pos_emb``,
-      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
+      ``rotary_pos_emb_vision``, ``gated_mlp``, ``linear``, ``load_balancing_loss``, plus
       ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
       model-agnostic allow-list.
     - **Model-build time** (instance-local ``VeomniOp`` resolution) for
@@ -1505,12 +1594,12 @@ class OpsImplementationConfig:
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
     )
-    moe_implementation: Optional[str] = field(
+    moe_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
-            "'fused_quack' (GPU SM90+) | 'deepgemm_fp8' (SM90/SM100 FP8 training) | 'fused_npu' (NPU) | "
-            "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
+            "'fused_quack' (GPU SM90+) | 'deepgemm' (SM90/SM100, dtype='fp8') | 'fused_npu' (NPU) | "
+            "'fused_mlu' (MLU Apex grouped-GEMM) | 'qat' (dtype='fp8' or 'fp4') | 'eager'. "
             "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
             "and 'fused_triton' otherwise."
         },
@@ -1534,11 +1623,25 @@ class OpsImplementationConfig:
             "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
-    swiglu_mlp_implementation: Optional[str] = field(
+    gated_mlp_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'eager'. No NPU backend. "
-            "Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
+            "help": "Gated MLP (act(gate(x)) * up(x)). 'liger_kernel' (SiLU only; GPU, MLU) | "
+            "'qat' (SM90+, dtype='fp8') | 'torchao' (dtype='fp8', 'nvfp4', or 'mxfp4', needs the "
+            "'torchao' package) | 'deepgemm' (native FP8 GEMM forward/dgrad/wgrad, dtype='fp8', "
+            "SiLU only, SM90/SM100) | 'eager'. "
+            "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
+        },
+    )
+    linear_implementation: Optional[str] | OpsSelection = field(
+        default=None,
+        metadata={
+            "help": "Dense projection. 'qat' (fake quantization of both GEMM operands, SM90+, dtype='fp8') | "
+            "'torchao' (dynamic FP8 GEMMs or FP4 fake quantization, 'standard' variant only, needs the "
+            "'torchao' package, dtype='fp8', 'nvfp4', or 'mxfp4') | 'deepgemm' (native FP8 GEMM "
+            "forward/dgrad/wgrad, dtype='fp8', SM90/SM100) | 'eager' (calls the projection module). "
+            "Unset: 'eager'. Selected independently of gated_mlp_implementation: a model that owns its "
+            "own projections reads this field, a model that runs the fused gated-MLP row reads that one."
         },
     )
     rotary_pos_emb_implementation: Optional[str] = field(
@@ -1587,6 +1690,28 @@ class OpsImplementationConfig:
             "matching backend raises when the model resolves its kernel."
         },
     )
+    situ_and_mul_implementation: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Kimi-K3 SituGLU activation (beta*tanh(gate/beta)*sigmoid(gate) * up). "
+            "'eager' is the ops-side fp32 PyTorch reference. "
+            "'triton' is the fused Triton-Ascend kernel (requires triton-ascend, NPU). "
+            "Unset: 'triton' on NPU, 'eager' elsewhere."
+        },
+    )
+    chunk_kda_implementation: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Kimi-K3 KDA chunked linear attention. "
+            "'eager' is the ops-side pure-PyTorch reference (chunk_kda_naive, slow). "
+            "'fla' is fla.ops.kda.chunk_kda (requires flash-linear-attention with KDA "
+            "beta-sigmoid gating support, GPU). "
+            "'ascendc' is the fused AscendC kernel from the flash-linear-attention-npu "
+            "package (NPU; routes around two verified fused-kernel bugs, see "
+            "veomni/ops/kernels/kda/kimi_k3/ascendc.py). "
+            "Unset: 'ascendc' on NPU, 'eager' elsewhere."
+        },
+    )
     chunk_gated_delta_rule_implementation: str = field(
         default="fla",
         metadata={
@@ -1598,8 +1723,14 @@ class OpsImplementationConfig:
             "cu_seqlens; varlen training therefore raises at runtime. "
             "'triton' uses the vendored Triton-Ascend kernel (requires triton-ascend, NPU). "
             "'fla_npu' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
-            "delegates heavy GDN compute to torch.ops.npu.*). "
+            "delegates heavy GDN compute to the stable fla_npu.ops.ascendc entry). "
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
+        },
+    )
+    minimax_sparse_attention_implementation: Optional[Literal["eager", "torch_npu"]] = field(
+        default=None,
+        metadata={
+            "help": "MiniMax sparse language attention. Defaults to NPU fusion on Ascend and PyTorch elsewhere."
         },
     )
     qsa_attention_implementation: Literal["eager", "tilelang", "torch_npu"] = field(
@@ -1612,6 +1743,15 @@ class OpsImplementationConfig:
             "torch_npu.npu_fusion_attention (requires bf16, Ascend NPU). "
             "Both fused backends cover training forward/backward only, no KV cache, and raise on an "
             "attention mask. Nonzero attention dropout falls back to eager with a warning."
+        },
+    )
+    qsa_indexer_implementation: Literal["eager"] = field(
+        default="eager",
+        metadata={
+            "help": "Qwen4-Exp QSA block top-k. 'eager' masks invisible blocks with finite -1.0 "
+            "and runs PyTorch topk. Visible scores are ReLU outputs (>= 0), so -1.0 stays below "
+            "them without an -inf sentinel that faults Ascend TopKV2. On NPU the validity gather "
+            "uses int8. Projections, RoPE, and the compressed-row gather stay in the model."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
@@ -1639,19 +1779,16 @@ class OpsImplementationConfig:
             "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
-    qat_implementation: Literal["none", "fp8_blockwise"] = field(
+    kv_round_implementation: Optional[str] | OpsSelection = field(
         default="none",
         metadata={
-            "help": "Quantization-aware training recipe for DeepSeek V4. 'fp8_blockwise' makes training "
-            "see the rounding FP8 deployment will: the operands of every linear inference runs as a "
-            "true FP8 GEMM (128x128 weight tiles, 1x128 activation blocks, ue8m0 scales), the NoPE "
-            "channels of every attention KV entry inference caches in FP8 (1x64 blocks), both "
-            "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
-            "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
-            "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
-            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
-            "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
+            "help": "KV-cache and indexer-activation storage rounding. 'none' leaves stored tensors "
+            "unchanged and is the default, because this family has no host default and its reference "
+            "row ('eager') does round -- unlike every other field, 'eager' here is not 'off'. "
+            "'triton' (GPU) and 'eager' both round stored KV and indexer operands to their inference "
+            "storage dtype on every forward, which is what quantization-aware training needs to see "
+            "deployment's rounding. A model selects the variant that owns its geometry; this field "
+            "only chooses the implementation."
         },
     )
 
@@ -1727,11 +1864,26 @@ class OpsImplementationConfig:
         return implementation
 
     def __post_init__(self):
+        self._normalize_selections()
         self._apply_deprecated_aliases()
         self.validate_attention_backend(self.attn_implementation)
         self.validate_hub_attention_backend(self.attn_implementation)
         self.attn_implementation = self.normalize_attention_backend(self.attn_implementation)
         self._validate_implementations()
+
+    _PER_SITE_FIELDS = (
+        "moe_implementation",
+        "gated_mlp_implementation",
+        "linear_implementation",
+        "kv_round_implementation",
+    )
+
+    def _normalize_selections(self) -> None:
+        """Convert mapping-form per-site op fields into ``OpsSelection``."""
+        for field_name in self._PER_SITE_FIELDS:
+            value = getattr(self, field_name)
+            if isinstance(value, dict):
+                setattr(self, field_name, OpsSelection.from_config_value(value))
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize non-None op implementation selections to a dict."""
@@ -1739,18 +1891,40 @@ class OpsImplementationConfig:
 
     def _apply_deprecated_aliases(self) -> None:
         """Resolve renamed implementation values and reject values that were never implementations."""
-        for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
+
+        def _rewrite_field(field_name: str, transform) -> None:
             value = getattr(self, field_name)
-            if value in messages:
-                raise ValueError(f"{field_name}={value!r}: {messages[value]}")
+            if isinstance(value, str):
+                setattr(self, field_name, transform(value))
+            elif isinstance(value, OpsSelection):
+                if isinstance(value.name, str):
+                    value.name = transform(value.name)
+                for rule in value.overrides:
+                    if isinstance(rule.name, str):
+                        rule.name = transform(rule.name)
+
+        for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
+
+            def _reject(name: str, *, _field=field_name, _msgs=messages) -> str:
+                if name in _msgs:
+                    raise ValueError(f"{_field}={name!r}: {_msgs[name]}")
+                return name
+
+            _rewrite_field(field_name, _reject)
 
         for field_name, aliases in _DEPRECATED_IMPLEMENTATION_ALIASES.items():
-            value = getattr(self, field_name)
-            if value in aliases:
-                self._warn_deprecated(field_name, value, aliases[value])
-                setattr(self, field_name, aliases[value])
 
-        if self.moe_implementation == "fused":
+            def _alias(name: str, *, _field=field_name, _aliases=aliases) -> str:
+                if name in _aliases:
+                    self._warn_deprecated(_field, name, _aliases[name])
+                    return _aliases[name]
+                return name
+
+            _rewrite_field(field_name, _alias)
+
+        def _resolve_fused_moe(name: str) -> str:
+            if name != "fused":
+                return name
             from ..utils.device import IS_NPU_AVAILABLE
             from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
 
@@ -1761,7 +1935,9 @@ class OpsImplementationConfig:
             else:
                 resolved = "fused_quack"
             self._warn_deprecated("moe_implementation", "fused", resolved)
-            self.moe_implementation = resolved
+            return resolved
+
+        _rewrite_field("moe_implementation", _resolve_fused_moe)
 
     @staticmethod
     def _warn_deprecated(field_name: str, old: str, new: str) -> None:
@@ -1778,12 +1954,13 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
-        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
-            raise ValueError(
-                "moe_implementation='deepgemm_fp8' cannot be combined with "
-                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
-                "DeepGEMM already quantizes the expert GEMM operands."
-            )
+        # No cross-family conflict needs rejecting here. ``deepgemm`` and
+        # ``qat`` are two values of the same ``moe_implementation`` field, so they
+        # cannot both be selected; ``linear_implementation`` and
+        # ``gated_mlp_implementation`` are separate GEMMs with separate operands,
+        # so quantizing them alongside a DeepGEMM expert GEMM rounds nothing twice.
+        # The shared expert in particular is a dense gated MLP, not one of the
+        # routed experts.
 
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
@@ -1795,66 +1972,60 @@ class OpsImplementationConfig:
         on_npu = IS_NPU_AVAILABLE
         on_mlu = is_torch_mlu_available()
 
-        for field_name, npu_ok in _NPU_ALLOWED.items():
+        def impls_for(field_name: str):
+            """Every impl this field can resolve to, across its overrides.
+
+            A per-site selection carries one row per override, and each is a
+            separate kernel, so all of them have to clear the host check -- not
+            just the default. The site itself is unknown here, so a selection with
+            a low-precision block contributes its low-precision row and its
+            reference row.
+            """
             value = getattr(self, field_name)
-            if value is None or value == "eager":
-                continue
-            if on_npu and value not in npu_ok:
-                allowed = sorted(npu_ok | {"eager"})
-                raise ValueError(
-                    f"{field_name}={value!r} is not supported on Ascend NPU. "
-                    f"Set to one of {allowed}, or leave it unset for the NPU default; "
-                    f"'eager' is the universal fallback for ops with no NPU kernel for the current model."
-                )
-            if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
-                raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
+            if isinstance(value, OpsSelection):
+                seen = []
+                for candidate in value.all_impls():
+                    if candidate not in seen:
+                        seen.append(candidate)
+                return seen
+            return [value]
+
+        for field_name, npu_ok in _NPU_ALLOWED.items():
+            for value in impls_for(field_name):
+                if value is None or value == "eager":
+                    continue
+                if on_npu and value not in npu_ok:
+                    allowed = sorted(npu_ok | {"eager"})
+                    raise ValueError(
+                        f"{field_name}={value!r} is not supported on Ascend NPU. "
+                        f"Set to one of {allowed}, or leave it unset for the NPU default; "
+                        f"'eager' is the universal fallback for ops with no NPU kernel for the current model."
+                    )
+                if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
+                    raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
 
         for field_name, mlu_ok in _MLU_ALLOWED.items():
-            value = getattr(self, field_name)
-            if value is None or value == "eager":
-                continue
-            if on_mlu:
-                if value == "fused_mlu" and not is_apex_mlu_available():
-                    raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
-                if value == "liger_kernel" and not is_liger_kernel_mlu_available():
-                    raise ValueError(
-                        f"{field_name}='liger_kernel' requires the Cambricon MLU liger_kernel build on MLU "
-                        "(upstream GPU liger-kernel does not run on MLU). Install the MLU liger_kernel wheel, "
-                        "set 'eager', or leave the field unset."
-                    )
-                if value not in mlu_ok:
-                    allowed = sorted(mlu_ok | {"eager"})
-                    raise ValueError(
-                        f"{field_name}={value!r} is not supported on Cambricon MLU. "
-                        f"Set to one of {allowed}; 'eager' is the universal fallback "
-                        f"for ops with no MLU kernel for the current model."
-                    )
-
-        # ``qat_implementation`` selects a quantization recipe rather than an
-        # op implementation, so registry resolution does not validate it. Its fake
-        # quantizers are the SM90-only TileLang kernels: without this check a
-        # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
-        # inside the first fake-quant call.
-        if self.qat_implementation != "none":
-            import torch
-
-            from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
-
-            unsupported = torch.version.hip is not None or not IS_CUDA_AVAILABLE
-            if not unsupported:
-                # Reading the capability initializes CUDA, and parsing happens
-                # before the trainer calls ``set_device`` -- query this rank's
-                # own GPU so the early context does not land on device 0 for
-                # every rank. The count is NVML-based and needs no context.
-                local_rank = int(os.getenv("LOCAL_RANK", "0"))
-                device = local_rank if local_rank < torch.cuda.device_count() else 0
-                unsupported = get_gpu_compute_capability(device) < 90
-            if unsupported:
-                raise ValueError(
-                    f"qat_implementation={self.qat_implementation!r} requires an SM90 or later NVIDIA CUDA "
-                    f"GPU, because its fake quantizers are the DeepSeek V4 TileLang kernels. "
-                    f"Set it to 'none' to train in the model dtype."
-                )
+            for value in impls_for(field_name):
+                if value is None or value == "eager":
+                    continue
+                if on_mlu:
+                    if value == "fused_mlu" and not is_apex_mlu_available():
+                        raise ValueError(
+                            "moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU."
+                        )
+                    if value == "liger_kernel" and not is_liger_kernel_mlu_available():
+                        raise ValueError(
+                            f"{field_name}='liger_kernel' requires the Cambricon MLU liger_kernel build on MLU "
+                            "(upstream GPU liger-kernel does not run on MLU). Install the MLU liger_kernel wheel, "
+                            "set 'eager', or leave the field unset."
+                        )
+                    if value not in mlu_ok:
+                        allowed = sorted(mlu_ok | {"eager"})
+                        raise ValueError(
+                            f"{field_name}={value!r} is not supported on Cambricon MLU. "
+                            f"Set to one of {allowed}; 'eager' is the universal fallback "
+                            f"for ops with no MLU kernel for the current model."
+                        )
 
 
 @dataclass
@@ -1995,7 +2166,7 @@ class ModelArguments(BaseModelArguments):
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
         },
     )
-    ep_sharded_stream_load: bool = field(
+    extra_parallel_stream_load: bool = field(
         default=False,
         metadata={
             "help": "Opt-in fast/low-memory loader for large ExtraParallel-sharded checkpoint tensors (for example MoE experts or PLE embedding tables): each rank reads only its dim-0 slice straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
@@ -2005,6 +2176,11 @@ class ModelArguments(BaseModelArguments):
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
     def __post_init__(self):
+        if self.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2" and self.optimizer.type == "anyprecision_adamw":
+            raise ValueError(
+                "Hyper FSDP does not support optimizer.type='anyprecision_adamw'. "
+                "Use 'adamw', 'muon', or 'hyper_muon'."
+            )
         super().__post_init__()
         # Both move training state to host; running them together would double
         # the host footprint and fight over the accelerator. Reject at parse time.
@@ -2013,17 +2189,17 @@ class ModelArguments(BaseModelArguments):
                 "model.optimizer.state_offload='cpu' cannot be combined with "
                 "model.accelerator.fsdp_config.offload; both move training state to host."
             )
-        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # extra_parallel_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.
-        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
-            "model.ep_sharded_stream_load requires "
+        assert not (self.extra_parallel_stream_load and self.broadcast_model_weights_from_rank0), (
+            "model.extra_parallel_stream_load requires "
             "model.broadcast_model_weights_from_rank0=False "
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
 
-        extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
-        ple_size = extra_parallel_sizes.get("ple", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = self.accelerator.resolved_extra_parallel
+        ple_size = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ple", 1)
         if ple_size > 1:
             effective_fsdp_shard_size = (
                 self.accelerator.dp_shard_size * self.accelerator.ulysses_size * self.accelerator.cp_size
@@ -2032,9 +2208,9 @@ class ModelArguments(BaseModelArguments):
                 raise ValueError(
                     f"PLE size ({ple_size}) must divide the effective FSDP shard size ({effective_fsdp_shard_size})."
                 )
-            if not self.ep_sharded_stream_load:
+            if not self.extra_parallel_stream_load:
                 raise ValueError(
-                    "PLE two-dimensional parallelism requires model.ep_sharded_stream_load=true so each rank "
+                    "PLE two-dimensional parallelism requires model.extra_parallel_stream_load=true so each rank "
                     "reads only its local row-by-column checkpoint rectangle."
                 )
 

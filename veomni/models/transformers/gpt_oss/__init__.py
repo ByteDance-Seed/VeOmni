@@ -28,7 +28,7 @@ def register_gpt_oss_modeling(architecture: str):
             "GPT-OSS support requires a Transformers build that provides `transformers.models.gpt_oss`."
         ) from e
 
-    from .generated.patched_modeling_gpt_oss_gpu import (
+    from .modeling_gpt_oss import (
         GptOssForCausalLM,
         GptOssForSequenceClassification,
         GptOssForTokenClassification,

@@ -45,6 +45,12 @@ from tests.models.tiny_configs import (
     tiny_gpt_oss_config as _tiny_gpt_oss_config,
 )
 from tests.models.tiny_configs import (
+    tiny_kimi_k3_config as _tiny_kimi_k3_config,
+)
+from tests.models.tiny_configs import (
+    tiny_kimi_linear_config as _tiny_kimi_linear_config,
+)
+from tests.models.tiny_configs import (
     tiny_llama_config as _tiny_llama_config,
 )
 from tests.models.tiny_configs import (
@@ -52,6 +58,9 @@ from tests.models.tiny_configs import (
 )
 from tests.models.tiny_configs import (
     tiny_minimax_h3_config as _tiny_minimax_h3_config,
+)
+from tests.models.tiny_configs import (
+    tiny_minimax_m3_vl_config as _tiny_minimax_m3_vl_config,
 )
 from tests.models.tiny_configs import (
     tiny_movqgan_config as _tiny_movqgan_config,
@@ -130,42 +139,56 @@ from veomni.models import (
     get_model_class,
 )
 from veomni.ops import VeomniOp
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 _CPU_LAUNCH = LaunchSpec(device="cpu")
 _ACCELERATOR_LAUNCH = LaunchSpec(device="accelerator")
 
-# Families whose MODELING_REGISTRY entry selects between *_npu and *_gpu generated modules
-# based on IS_NPU_AVAILABLE.
-_NPU_GENERATED_FAMILIES = frozenset(
+# Families whose MODELING_REGISTRY entry resolves from a standalone
+# ``veomni.models.transformers.<pkg>.modeling_<m>`` module.
+_STANDALONE_HF_FAMILIES = frozenset(
     {
         "deepseek_v3",
         "deepseek_v4",
+        "gemma3_text",
         "glm_moe_dsa",
+        "gpt_oss",
+        "kimi_k3",
+        "kimi_linear",
+        "llama",
+        "qwen2",
+        "qwen2_5_omni",
+        "qwen2_5_omni_text",
+        "qwen2_5_omni_thinker",
+        "qwen2_5_vl",
+        "qwen2_vl",
         "qwen3",
         "qwen3_5",
-        "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        "qwen3_5_text",
         "qwen3_moe",
         "qwen3_omni_moe",
-        "qwen3_omni_moe_thinker",
         "qwen3_omni_moe_text",
+        "qwen3_omni_moe_thinker",
         "qwen3_vl",
         "qwen3_vl_moe",
+        "qwen4_exp",
         "seed_oss",
     }
 )
 
 
 def _assert_expected_generated_module_source(model_type: str, model_cls: type) -> None:
-    if model_type not in _NPU_GENERATED_FAMILIES:
+    if model_type not in _STANDALONE_HF_FAMILIES:
         return
-    expected_suffix = "_npu" if IS_NPU_AVAILABLE else "_gpu"
-    assert model_cls.__module__.endswith(expected_suffix), (
-        f"Expected {model_type} ({model_cls.__name__}) to resolve from a *{expected_suffix} module, "
-        f"got {model_cls.__module__!r}"
+    # Talker architectures on Omni models intentionally delegate to pristine HF.
+    if "Talker" in model_cls.__name__:
+        return
+    mod = model_cls.__module__
+    assert mod.startswith("veomni.models.transformers.") and ".modeling_" in mod and ".generated" not in mod, (
+        f"Expected {model_type} ({model_cls.__name__}) to resolve from a standalone "
+        f"veomni.models.transformers.<pkg>.modeling_<m> module, got {mod!r}"
     )
 
 
@@ -195,30 +218,44 @@ class _ModelCase:
     stamps_hf_attn: bool = True
 
 
-# NPU glm_moe_dsa indexer keeps Hugging Face scoring and does not bind
-# ``veomni_dsa_indexer``. GPU wiring is covered by the same path below.
-_NPU_ABSENT_EAGER_OPS = frozenset(
-    {
-        "model.layers.0.self_attn.indexer.veomni_dsa_indexer",
-    }
-)
+def _tiny_hunyuanvideo15_config(architecture):
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.configuration_hunyuanvideo15_transformer import (
+        HunyuanVideo15Config,
+    )
 
-
-def _eager_ops(model_case: _ModelCase) -> tuple[tuple[str, str], ...]:
-    if not IS_NPU_AVAILABLE:
-        return model_case.eager_ops
-    return tuple(item for item in model_case.eager_ops if item[0] not in _NPU_ABSENT_EAGER_OPS)
+    config = HunyuanVideo15Config(
+        hidden_size=24,
+        heads_num=2,
+        rope_dim_list=[4, 4, 4],
+        in_channels=2,
+        out_channels=2,
+        mm_double_blocks_depth=1,
+        text_states_dim=16,
+        vision_states_dim=8,
+    )
+    config.architectures = [architecture]
+    return config
 
 
 _MODEL_CASES = (
+    _ModelCase(
+        model_type="HunyuanVideo15Model",
+        config_factory=_tiny_hunyuanvideo15_config,
+        architectures=("HunyuanVideo15Model",),
+        has_registered_config=True,
+        registered_config_aliases=("HunyuanVideo15ConditionModel",),
+        registered_model_aliases=("HunyuanVideo15ConditionModel",),
+        stamps_hf_attn=False,
+        eager_ops=(),
+    ),
     _ModelCase(
         model_type="deepseek_v3",
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.3.mlp.experts.veomni_moe", "moe_experts"),
-            ("model.layers.3.mlp.shared_experts.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.3.mlp.shared_experts.veomni_gated_mlp", "gated_mlp"),
         ),
         config_factory=_tiny_deepseek_v3_config,
         architectures=(
@@ -240,7 +277,7 @@ _MODEL_CASES = (
             ("model.layers.0.self_attn.veomni_dsa_attention", "dsa_attention"),
             ("model.layers.3.self_attn.compressor.indexer.veomni_dsa_indexer", "dsa_indexer"),
             ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
-            ("model.layers.0.mlp.shared_experts.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.shared_experts.veomni_gated_mlp", "gated_mlp"),
             ("model.hc_head.veomni_mhc_head", "mhc"),
         ),
         config_factory=_tiny_deepseek_v4_config,
@@ -300,11 +337,47 @@ _MODEL_CASES = (
         architectures=("GlmMoeDsaForCausalLM", "GlmMoeDsaModel"),
     ),
     _ModelCase(
+        model_type="kimi_k3",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("language_model.model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("language_model.model.layers.3.self_attn.veomni_attn", "attention"),
+            ("vision_tower.encoder.blocks.0.veomni_attn", "attention"),
+            ("language_model.model.layers.1.self_attn.veomni_chunk_kda", "chunk_kda"),
+            ("language_model.model.layers.1.block_sparse_moe.experts.veomni_moe", "moe_experts"),
+            (
+                "language_model.model.layers.1.block_sparse_moe.experts.act_fn.veomni_situ_and_mul",
+                "situ_and_mul",
+            ),
+        ),
+        # The kimi_k3 moe_experts variant (SituGLU) has no fused_triton row.
+        isolation_op_path="veomni_ce",
+        config_factory=_tiny_kimi_k3_config,
+        architectures=("KimiK3ForConditionalGeneration",),
+        has_registered_config=True,
+    ),
+    _ModelCase(
+        model_type="kimi_linear",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.3.self_attn.veomni_attn", "attention"),
+            ("model.layers.1.self_attn.veomni_chunk_kda", "chunk_kda"),
+            ("model.layers.1.block_sparse_moe.experts.veomni_moe", "moe_experts"),
+            ("model.layers.1.block_sparse_moe.experts.act_fn.veomni_situ_and_mul", "situ_and_mul"),
+        ),
+        # The kimi_k3 moe_experts variant (SituGLU) has no fused_triton row.
+        isolation_op_path="veomni_ce",
+        config_factory=_tiny_kimi_linear_config,
+        architectures=("KimiLinearForCausalLM",),
+        has_registered_config=True,
+    ),
+    _ModelCase(
         model_type="llama",
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.0.self_attn.veomni_rope", "rope"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
@@ -316,6 +389,21 @@ _MODEL_CASES = (
             "LlamaForSequenceClassification",
             "LlamaModel",
         ),
+    ),
+    _ModelCase(
+        model_type="minimax_m3_vl",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.language_model.layers.0.self_attn.veomni_msa_indexer", "minimax_sparse_indexer"),
+            ("model.language_model.layers.0.self_attn.veomni_msa_attention", "minimax_sparse_attention"),
+            ("model.language_model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+            ("model.vision_tower.layers.0.self_attn.veomni_attn", "attention"),
+        ),
+        config_factory=_tiny_minimax_m3_vl_config,
+        architectures=("MiniMaxM3SparseForConditionalGeneration",),
+        has_registered_config=True,
+        processor_class_name="MiniMaxM3VLProcessor",
     ),
     _ModelCase(
         model_type="movqgan",
@@ -330,7 +418,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.0.self_attn.veomni_rope", "rope"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
@@ -349,7 +437,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.0.self_attn.veomni_rope", "rope"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
@@ -406,7 +494,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.0.self_attn.veomni_rope", "rope"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
@@ -696,7 +784,11 @@ def test_build_foundation_model_requires_ops_config():
         build_foundation_model(config)
 
 
-@pytest.mark.launch_plan(provider=_ACCELERATOR_LAUNCH)
+@pytest.mark.launch_plan(
+    provider=lambda context: (
+        _CPU_LAUNCH if context.params["model_case"].model_type == "HunyuanVideo15Model" else _ACCELERATOR_LAUNCH
+    )
+)
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_build_foundation_model_constructs_registered_model(model_case: _ModelCase):
     cfg = eager_ops_config()
@@ -709,13 +801,11 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
     assert model.config.ops_implementation["rms_norm_implementation"] == "eager"
     assert model.__class__.__name__ == model_case.architectures[0]
     _assert_expected_generated_module_source(model_case.model_type, type(model))
-    for path, expected_op in _eager_ops(model_case):
+    for path, expected_op in model_case.eager_ops:
         op = attrgetter(path)(model)
         assert isinstance(op, VeomniOp), path
         assert op.op == expected_op, path
         assert op.impl == "eager", path
-    if IS_NPU_AVAILABLE and model_case.model_type == "glm_moe_dsa":
-        assert not hasattr(model.model.layers[0].self_attn.indexer, "veomni_dsa_indexer")
 
 
 _ALTERNATE_OP_IMPLS = {
@@ -742,11 +832,7 @@ def _op_bindings(model, selected_path):
     return bindings
 
 
-@pytest.mark.launch_plan(
-    provider=lambda context: (
-        _ACCELERATOR_LAUNCH if context.params["model_case"].model_type in _NPU_GENERATED_FAMILIES else _CPU_LAUNCH
-    )
-)
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 @pytest.mark.parametrize(
     "model_case",
     [case for case in _MODEL_CASES if case.eager_ops],
@@ -797,7 +883,11 @@ def test_model_registry_entries(model_case: _ModelCase):
         assert model_case.processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys()
 
 
-@pytest.mark.launch_plan(provider=_ACCELERATOR_LAUNCH)
+@pytest.mark.launch_plan(
+    provider=lambda context: (
+        _CPU_LAUNCH if context.params["model_case"].model_type == "HunyuanVideo15Model" else _ACCELERATOR_LAUNCH
+    )
+)
 @pytest.mark.parametrize("model_case", _MODEL_CASES, ids=lambda model_case: model_case.model_type)
 def test_get_model_class_returns_registered_architectures(model_case: _ModelCase):
     for architecture in model_case.architectures:
@@ -856,10 +946,11 @@ def test_context_parallel_is_refused_on_npu(monkeypatch: pytest.MonkeyPatch):
     from types import SimpleNamespace
 
     import veomni.models.auto as auto
+    from veomni.distributed.context_parallel import support as cp_support
 
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True))
-    monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", True)
     with pytest.raises(NotImplementedError, match="GPU-only"):
         check_context_parallel_supported(_tiny_qwen3_config())
 
@@ -872,6 +963,25 @@ def test_context_parallel_gate_is_inert_when_no_parallel_state_was_installed(mon
     monkeypatch.setattr(parallel_state_module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(parallel_state_module.dist, "get_world_size", lambda: 2)
     check_context_parallel_supported(_tiny_qwen3_config())
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+def test_hunyuanvideo15_registry(tmp_path, monkeypatch):
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.configuration_hunyuanvideo15_transformer import (
+        HunyuanVideo15Config,
+    )
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_transformer.modeling_hunyuanvideo15_transformer import (
+        HunyuanVideo15Model,
+    )
+
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    HunyuanVideo15Config().save_pretrained(tmp_path)
+    config = build_config(str(tmp_path))
+    assert isinstance(config, HunyuanVideo15Config)
+    assert get_model_class(config) is HunyuanVideo15Model
+    condition_config = MODEL_CONFIG_REGISTRY[config.condition_model_type]()
+    condition_model = MODELING_REGISTRY[config.condition_model_type]()
+    assert condition_model.config_class is condition_config
 
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
@@ -924,7 +1034,7 @@ def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_
 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.configuration_base import VeOmniPretrainedConfig
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
 
     config = LlamaConfig(
         vocab_size=32,
@@ -948,7 +1058,8 @@ def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_
 
 @pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 @pytest.mark.parametrize(
-    "family", ["ltx", "minimax", "qwen_image", "wan", "text_encoder", "omni", "fake_a", "fake_b", "movqgan"]
+    "family",
+    ["ltx", "minimax", "qwen_image", "wan", "hunyuanvideo15", "text_encoder", "omni", "fake_a", "fake_b", "movqgan"],
 )
 @pytest.mark.parametrize("attention", [None, "eager", "sdpa", "flash_attention_2"])
 def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkeypatch, family, attention):
@@ -971,6 +1082,16 @@ def test_delegating_wrappers_preserve_attention_without_hf_kernel_loading(monkey
 
         def construct():
             return cls(config)
+    elif family == "hunyuanvideo15":
+        from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.modeling_hunyuanvideo15_condition import (
+            HunyuanVideo15ConditionModel,
+        )
+
+        monkeypatch.setattr(HunyuanVideo15ConditionModel, "_load_components", lambda self, device: None)
+        config = HunyuanVideo15ConditionModel.config_class(generator_device="cpu", ops_implementation=ops)
+
+        def construct():
+            return HunyuanVideo15ConditionModel(config)
     elif family == "movqgan":
         from veomni.models.transformers.movqgan.modeling_movqgan import MoVQGAN
 

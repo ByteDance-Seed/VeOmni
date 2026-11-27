@@ -166,6 +166,7 @@ model:
         enable: true
         param_dtype: bfloat16
         reduce_dtype: float32
+        cast_forward_inputs: false
 
 data:
   train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
@@ -189,6 +190,30 @@ train:
 ---
 
 ## Packed Offline Training
+
+For full-parameter offline H3 training, the existing `mfu` metric estimates
+useful model FLOPs from the valid packed positions and each sample's text length.
+Legacy tail padding is excluded. For direct calls to `VeomniFlopsCounter.estimate_flops`,
+nonempty H3 batches require `model_metadata={"h3_text_seqlens": lengths}`: one
+nonnegative text-refiner length per sample, in the same order as `batch_seqlens`
+and no greater than its main length.
+
+The estimate includes the main DiT and text-refiner projection and attention
+operations. It excludes activation-checkpoint recomputation, CFG's extra forward,
+and smaller operations, and is not a device-profiler measurement. H3 LoRA uses
+the existing unsupported-model zero-FLOPs fallback. Inputs without usable packed
+lengths contribute no FLOPs; other available inputs and ranks are still counted.
+Thus missing metadata can make the reported MFU an underestimate. Online encoding
+may construct `packed` only after the meter runs, resulting in zero MFU when no
+rank has usable lengths.
+
+For the model-specific FLOPs metadata callback contract, see:
+
+```{toctree}
+:maxdepth: 1
+
+../design/flops_metadata_callback.md
+```
 
 With `train.micro_batch_size > 1`, H3 packs samples inside its ordinary forward.
 Both **FL2VA** and **visual Ref2VA** (image/video references, without reference
@@ -288,6 +313,49 @@ variability; a separate accumulation-precision fix must not silently change the
 single-sample path. Sample-local refiner execution is restricted to cross-sample
 packing; ordinary single-sample attention dispatch is preserved.
 
+### Mixed precision
+
+H3 keeps the official checkpoint's video/audio patch projections, both time
+embedding projections and video/audio output heads in FP32; block, refiner and
+conditioning weights keep the configured BF16/FP16 precision. Projection inputs
+are cast to the projection's own dtype, the time MLP stays FP32, and AdaLN
+applies SiLU before casting to its ordinary projection dtype. Parameter names
+and shapes are unchanged, but the previous BF16 forward numerics intentionally
+change.
+
+Under FSDP2 the six projections are sharded without parameter casting. To reach
+them, `MiniMaxH3DiT` is listed in `_no_split_modules`, which has side effects:
+
+- `MiniMaxH3DiT` is its own FSDP unit: with the default reshard and prefetch
+  settings, its remaining parameters (condition projection, token refiner and
+  final-layer AdaLN) are resharded after forward and gathered again in backward,
+  and manual forward/backward prefetch is enabled. The six FP32 projections stay
+  unsharded between forward and backward.
+- A configured `mixed_precision.output_dtype` also applies to `dit` outputs.
+- Async activation offload auto-discovery selects only `MiniMaxH3DiTBlock`
+  instances. It does not offload the parent `MiniMaxH3DiT` FSDP unit. Each
+  block owns its checkpoint boundary, so offload leaves backward recomputation
+  active.
+
+Set `mixed_precision.cast_forward_inputs=false`. The single `forward` entry point
+selects audio/video or image execution from `config.audio_enabled`; both paths
+reject floating-point timesteps or positions already cast below FP32. Call the
+model as `model(...)` so FSDP2 runs the wrapper and DiT unshard hooks. Image
+inference uses this entry point and returns patchified image rows.
+Serial and packed audio/video calls both accept FP64 metadata. Packing validates
+each sample before concatenation, so mixing FP32 with BF16/FP16 metadata still
+raises instead of hiding the rounded input through dtype promotion.
+Set `gradient_checkpointing.enable_reentrant` to `false` so recomputation
+preserves gradients for the time embedding passed to each block. FSDP2
+parallelization rejects LoRA on the six FP32 projections; other paths do not
+check. `save_hf_safetensor` exports still convert FP32 tensors, including these
+projections, to BF16.
+
+Native HF `model.save_pretrained(...)` preserves the mixed parameter dtypes and
+records the backbone dtype in `config.json`. Reloading with
+`MiniMaxH3DiTModel.from_pretrained(..., dtype="auto")` retains the BF16 backbone
+and the FP32 projections, including image PDD heads.
+
 ### Attention and validation
 
 The DiT and VAE attention backend comes from
@@ -358,7 +426,7 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
         attn_implementation="flash_attention_2",
         rotary_pos_emb_implementation="eager",
         rms_norm_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         cross_entropy_loss_implementation="eager",
         moe_implementation="eager",
         load_balancing_loss_implementation="eager",

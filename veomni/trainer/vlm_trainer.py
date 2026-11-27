@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
@@ -24,7 +25,6 @@ from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.torch_compile import (
     CompileConfig,
     mark_compile_step_begin,
-    validate_compile_model,
     validate_compile_runtime,
 )
 from ..models import build_foundation_model
@@ -74,6 +74,31 @@ class VLMTrainingArguments(TrainingArguments):
         default=1e-6,
         metadata={"help": "Maximum learning rate for vit parameters."},
     )
+
+    freeze_ple_embeddings: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Freeze Qwen4-Exp PLE n-gram embedding tables. The forward lookup still "
+                "reads them, but they are excluded from the optimizer and Adam states."
+            )
+        },
+    )
+    frozen_ple_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Training-time dtype for frozen PLE tables: float32 or bfloat16. Requires freeze_ple_embeddings=true."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        """Validate VLM freeze settings and initialize inherited training options."""
+        from ..models.frozen_ple import validate_frozen_ple_config
+
+        validate_frozen_ple_config(self.freeze_ple_embeddings, self.frozen_ple_dtype)
+        super().__post_init__()
 
 
 @dataclass
@@ -133,12 +158,6 @@ class VLMModelRuntime(VeOmniModelRuntime):
         compile_config = CompileConfig(
             **{field.name: getattr(accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
         )
-        validate_compile_model(
-            self.model,
-            compile_config,
-            sequence_parallel_enabled=accelerator.ulysses_size > 1 or accelerator.cp_size > 1,
-            async_enabled=accelerator.enable_async,
-        )
         parallel_state = get_parallel_state()
         validate_compile_runtime(
             compile_config,
@@ -147,6 +166,8 @@ class VLMModelRuntime(VeOmniModelRuntime):
             fsdp_mode=parallel_state.dp_mode,
             any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
             enable_reshard_after_forward=accelerator.fsdp_config.reshard_after_forward,
+            sequence_parallel_enabled=parallel_state.sp_enabled,
+            async_parallel_enabled=bool(accelerator.enable_async),
         )
 
     def _freeze_model_module(self):
@@ -187,10 +208,30 @@ class VLMModelRuntime(VeOmniModelRuntime):
                 )
                 audio_proj.requires_grad_(True)
 
+        if getattr(train_args, "freeze_ple_embeddings", False):
+            from ..models.frozen_ple import freeze_ple_embeddings, validate_frozen_ple_config
+
+            validate_frozen_ple_config(
+                train_args.freeze_ple_embeddings,
+                train_args.frozen_ple_dtype,
+                enable_fsdp_offload=self.args.accelerator.fsdp_config.offload,
+            )
+
+            count = freeze_ple_embeddings(self.model)
+            logger.info_rank0("Frozen PLE: %d tables", count)
+
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
     def _build_optimizer(self, param_groups=None):
+        if getattr(self.train_args, "freeze_ple_embeddings", False):
+            from ..models.frozen_ple import prepare_ple_storage
+            from ..utils.device import get_device_type
+
+            # Parallelization can upcast frozen parameters. Apply the requested
+            # table dtype after wrapping/loading and before optimizer construction.
+            prepare_ple_storage(self.model, self.train_args.frozen_ple_dtype, expected_device=get_device_type())
+
         if param_groups is not None:
             return super()._build_optimizer(param_groups=param_groups)
 
@@ -221,6 +262,20 @@ class VLMModelRuntime(VeOmniModelRuntime):
 
 class VLMTrainer:
     def __init__(self, args: VeOmniVLMArguments):
+        if (
+            args.model.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2"
+            or args.model.optimizer.type == "hyper_muon"
+            or sys.modules.get("hyper_parallel.integration.veomni") is not None
+        ):
+            try:
+                from hyper_parallel.integration.veomni import apply_hyper_parallel_patch
+            except ModuleNotFoundError as exc:
+                if exc.name != "hyper_parallel":
+                    raise
+                raise ImportError(
+                    "HyperParallel is required for the selected backend. Add `--extra hyper` to your uv sync command."
+                ) from exc
+            apply_hyper_parallel_patch(args.model)
         # BaseTrainer.__init__ is NOT called here; we call its private
         # helpers one-by-one so the sequence is explicit.
         self.base = BaseTrainer.__new__(BaseTrainer)

@@ -1069,7 +1069,7 @@ def _run_fsdp2_hccl_optimizer_step():
 
 
 def _run_fsdp2_hccl_expert_optimizer_step():
-    from ..utils.test_extra_parallel_clip_grad_norm import ToyMoeAndEmbedModel
+    from ..utils.test_extra_parallel import ToyMoeAndEmbedModel
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()

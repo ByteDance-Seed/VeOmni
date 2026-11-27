@@ -73,7 +73,7 @@ different data-parallel samples to those ranks.
   `ple_fsdp × ple` mesh.
 - HSDP replicas of the two-dimensional PLE table in the first implementation.
 - FSDP CPU offload for FSDP-ignored PLE parameters.
-- Hugging Face export of the complete 95 GiB PLE table.
+- Validation of full-size 95 GiB Hugging Face export on production hardware.
 
 Unsupported combinations must fail during argument or parallel-plan
 validation. They must not silently fall back to the current parameter
@@ -439,7 +439,57 @@ must measure bytes read and startup time as well as host materialization size.
 ## DCP model and optimizer state
 
 A persistent PLE parameter is already a DTensor on the complete mesh with
-placements `[Shard(1), Shard(0)]`. It should be passed to DCP in that form.
+placements `[Shard(1), Shard(0)]`. DCP and Hugging Face checkpoints save each
+PLE table at its own logical row count; runtime parameters and optimizer state
+retain their padded shapes. Row counts are tracked by the full weight name
+because different PLE layers can have different vocabulary sizes.
+
+DCP loading restores the runtime shape with a zero-filled tail for logical-row
+checkpoints and remains compatible with older padded checkpoints. Invalid row
+counts and mixed logical/padded formats are rejected. Models with
+`ple_layer_ids=[]` skip PLE row conversion.
+
+DCP and distributed HF export clip PLE chunks at their original global offsets.
+The save planner emits logical-row metadata and local prefix views, without
+resharding DTensors or exchanging PLE rows. DCP loads directly into padded
+runtime shards and zeroes only the unsaved tail. Legacy rank-zero HF export
+crops full CPU tensors after reading the checkpoint.
+
+### Checkpoint row contract
+
+The model-owned converter may implement `checkpoint_row_counts()` to return
+`{weight_fqn: (logical_rows, runtime_rows)}`. Names match
+`model.named_parameters()` on the underlying model, without DDP or DCP wrapper
+prefixes. The framework unwraps DDP before querying the converter. Each pair must satisfy
+`0 < logical_rows <= runtime_rows`; padding must be semantically inert.
+Every weight requiring cropping must have metadata, with missing metadata
+reported by the converter. A missing method or empty mapping opts out.
+The getter must not materialize parameter data or perform collectives.
+
+`DistributedCheckpointer.execute_save()` and `.load()` consume this mapping
+through `checkpoint/row_crop.py` and add the outer `model.` prefix. Distributed
+HF saving uses unprefixed names with `RowCropSavePlanner`; legacy rank-zero
+export receives explicit row counts derived from the supplied model and crops
+full CPU tensors. Without a model, legacy conversion skips cropping; older padded
+checkpoints need model metadata to export logical rows. Optimizer state
+retains its runtime shapes. The checkpoint layer imports no model packages.
+
+For in-memory weight iteration via [`export_weights`](../../veomni/models/checkpoint/convert.py#L436),
+the model converter may also implement [`crop_hf_export_tensor(name, tensor)`](../../veomni/models/checkpoint/convert.py#L187)
+(for Qwen4-Exp, [`Qwen4ExpCheckpointTensorConverter.crop_hf_export_tensor`](../../veomni/models/transformers/qwen4_exp/checkpoint_tensor_converter.py#L107)):
+given an unprefixed weight FQN and its full unsharded matrix, it returns the
+logical-row slice `[0, logical_rows)` for retained non-expert tensors at the
+[`export_weights` call site](../../veomni/models/checkpoint/convert.py#L500). A
+missing method opts out and leaves exported tensors unchanged. Complete export
+is the default, including frozen tables. Callers that synchronize only trainable
+weights may pass `skip_frozen_ple=True`; the exporter then derives the frozen
+table names from `requires_grad` and omits them before unsharding `DTensor`
+shards, while retaining trainable PLE tables.
+
+See the [converter protocol](../../veomni/models/checkpoint/convert.py#L89)
+and [row-count lookup](../../veomni/checkpoint/row_crop.py#L15).
+
+### ExtraParallel adapter
 
 The existing ExtraParallel DCP adapter drops the ExtraParallel dimension before
 handing an FSDP-local tensor to DCP and restores it afterward. Extend
@@ -520,13 +570,10 @@ PLE 2D layout: rows=8 (ple), columns=8 (ple_fsdp), local=[V/8, E/8]
 | `veomni/optim/optimizer.py` | Classify persistent PLE DTensors into the `ple` optimizer bucket. |
 | `veomni/distributed/fsdp2/clip_grad_norm.py` | Verify two-axis norm reduction for persistent PLE shards. |
 | `veomni/models/transformers/qwen4_exp/parallel_plan.py` | Declare the persistent PLE shard and the disjoint EP expert shard. |
-| `qwen4_exp_*_patch_gen_config.py` | Implement GPU/NPU two-dimensional request/result routing. |
+| `veomni/models/transformers/qwen4_exp/modeling_qwen4_exp.py` | Implement GPU/NPU two-dimensional request/result routing. |
 | `tests/models/test_qwen4_exp_packing.py` | Packed-boundary output and gradient parity. |
 | `tests/parallel/ulysses/test_qwen4_exp_ulysses.py` | Ulysses lookup, halo, QSA, GDN, and VLM parity. |
 | `tests/e2e/test_e2e_parallel.py` | Two-device Qwen4-Exp VLM training smoke coverage. |
-
-Generated files under `veomni/models/transformers/qwen4_exp/generated/` must
-only be changed by running patchgen.
 
 ## Validation plan
 
@@ -591,8 +638,7 @@ The real-checkpoint deployment gate records:
 1. Add the persistent-shard plan metadata, mesh accessor, topology guards, and
    unit tests.
 2. Add two-dimensional streaming load and local DTensor materialization tests.
-3. Add the GPU and NPU PLE lookup implementation in patchgen sources and
-   regenerate generated modeling files.
+3. Add the GPU and NPU PLE lookup implementation in `veomni/models/transformers/qwen4_exp/modeling_qwen4_exp.py`.
 4. Add gradient scaling, optimizer classification, and gradient-norm parity
    tests.
 5. Add DCP model/optimizer save-resume and topology-reshard tests.

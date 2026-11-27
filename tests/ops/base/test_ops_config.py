@@ -55,31 +55,47 @@ def test_unweighted_rms_norm_rejects_unregistered_backend(monkeypatch, impl):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("parse_config", [False, True], ids=["dataclass", "parser"])
-def test_deepgemm_rejects_qat_before_hardware_validation(monkeypatch, parse_config):
+@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
+def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, parse_config, field):
+    """A DeepGEMM expert GEMM and a quantizing dense family round different operands.
+
+    ``deepgemm`` and ``qat`` are two values of the same ``moe_implementation``
+    field, so the routed experts can never be quantized twice. The shared expert
+    (``gated_mlp``) and the attention projections (``linear``) are separate dense
+    GEMMs, so quantizing them alongside is a valid recipe -- and a useful one, since
+    DeepGEMM covers only the experts.
+    """
     from veomni.arguments import OpsImplementationConfig
     from veomni.arguments.parser import _instantiate_recursive
 
-    # An invalid combination must report the config conflict even without CUDA.
-    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
-    values = {"moe_implementation": "deepgemm_fp8", "qat_implementation": "fp8_blockwise"}
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise") as error:
-        if parse_config:
-            _instantiate_recursive(OpsImplementationConfig, values)
-        else:
-            OpsImplementationConfig(**values)
-    assert "Set qat_implementation='none'" in str(error.value)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device: 90)
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    monkeypatch.setattr("torch.version.hip", None)
+
+    values = {"moe_implementation": "deepgemm", field: "qat"}
+    config = (
+        _instantiate_recursive(OpsImplementationConfig, values) if parse_config else OpsImplementationConfig(**values)
+    )
+
+    assert config.moe_implementation == "deepgemm"
+    assert getattr(config, field) == "qat"
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     "values",
     [
-        {"moe_implementation": "deepgemm_fp8"},
-        {"moe_implementation": "deepgemm_fp8", "qat_implementation": "none"},
-        {"moe_implementation": None, "qat_implementation": "fp8_blockwise"},
-        {"moe_implementation": "eager", "qat_implementation": "fp8_blockwise"},
-        {"moe_implementation": "fused_triton", "qat_implementation": "fp8_blockwise"},
-        {"moe_implementation": "fused_quack", "qat_implementation": "fp8_blockwise"},
+        {"moe_implementation": "deepgemm"},
+        {"moe_implementation": "deepgemm", "linear_implementation": "eager"},
+        {"moe_implementation": "deepgemm", "linear_implementation": "torchao"},
+        {"moe_implementation": None, "linear_implementation": "qat"},
+        {"moe_implementation": "eager", "linear_implementation": "qat"},
+        {"moe_implementation": "fused_triton", "linear_implementation": "qat"},
+        {"moe_implementation": "fused_quack", "linear_implementation": "qat"},
+        {"moe_implementation": "eager", "gated_mlp_implementation": "qat"},
     ],
 )
 def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
@@ -94,8 +110,9 @@ def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
     monkeypatch.setattr("torch.version.hip", None)
 
     config = OpsImplementationConfig(**values)
+
     assert config.moe_implementation == values["moe_implementation"]
-    assert config.qat_implementation == values.get("qat_implementation", "none")
+    assert config.linear_implementation == values.get("linear_implementation")
 
 
 def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
@@ -150,12 +167,12 @@ def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
 
     overridden = LlamaConfig.from_pretrained(
         tmp_path,
-        ops_implementation={"swiglu_mlp_implementation": "eager"},
+        ops_implementation={"gated_mlp_implementation": "eager"},
     )
     assert overridden.ops_implementation == {
         "rms_norm_implementation": "eager",
         "attn_implementation": "veomni_sdpa",
-        "swiglu_mlp_implementation": "eager",
+        "gated_mlp_implementation": "eager",
     }
 
 
@@ -523,7 +540,13 @@ def test_sparse_load_override_preserves_subconfig_choices(tmp_path, monkeypatch)
 
 
 def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
-    """Sparse overrides on existing or loaded configs validate the merged state at every node."""
+    """Sparse overrides on existing or loaded configs validate the merged state at every node.
+
+    The conflict used here is a GPU-only kernel selected on an Ascend host: it is
+    decided by the merged state (device plus value), so an override that leaves the
+    incompatible pair in place has to be rejected, and one that removes it has to be
+    accepted -- atomically, including inside a sub-config.
+    """
     from transformers.models.llama.configuration_llama import LlamaConfig
 
     LlamaConfig = get_veomni_config_class(LlamaConfig)
@@ -533,12 +556,10 @@ def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
 
     import veomni.models  # noqa: F401
 
-    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    # Simulate an Ascend host so `liger_kernel` is an incompatible explicit value.
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
-    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device: 90)
-    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
-    monkeypatch.setattr("torch.version.hip", None)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
 
     llama_dir = tmp_path / "llama"
     cfg = LlamaConfig(
@@ -546,41 +567,39 @@ def test_sparse_override_enforces_cross_field_validation(tmp_path, monkeypatch):
         intermediate_size=128,
         num_hidden_layers=2,
         num_attention_heads=4,
-        ops_implementation={"moe_implementation": "deepgemm_fp8"},
+        ops_implementation={"rms_norm_implementation": "torch_npu"},
     )
     cfg.save_pretrained(llama_dir)
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        cfg._set_ops_implementation({"qat_implementation": "fp8_blockwise"})
-    assert cfg.ops_implementation == {"moe_implementation": "deepgemm_fp8"}
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel' is not supported on Ascend NPU"):
+        cfg._set_ops_implementation({"rms_norm_implementation": "liger_kernel"})
+    assert cfg.ops_implementation == {"rms_norm_implementation": "torch_npu"}
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        LlamaConfig.from_pretrained(llama_dir, ops_implementation={"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel' is not supported on Ascend NPU"):
+        LlamaConfig.from_pretrained(llama_dir, ops_implementation={"rms_norm_implementation": "liger_kernel"})
 
-    # Overriding moe_implementation away from deepgemm_fp8 at the same time is valid.
+    # Replacing the incompatible value in the same override is valid.
     reloaded = LlamaConfig.from_pretrained(
         llama_dir,
-        ops_implementation={"moe_implementation": "fused_triton", "qat_implementation": "fp8_blockwise"},
+        ops_implementation={"rms_norm_implementation": "eager"},
     )
-    assert reloaded.ops_implementation == {
-        "moe_implementation": "fused_triton",
-        "qat_implementation": "fp8_blockwise",
-    }
+    assert reloaded.ops_implementation == {"rms_norm_implementation": "eager"}
 
-    # Sub-config cross-field conflicts must also be rejected atomically.
+    # Sub-config validation is atomic: the rejected override must leave both levels
+    # exactly as they were.
     vl_dir = tmp_path / "qwen3_vl"
     vl_cfg = Qwen3VLConfig(
-        text_config={"ops_implementation": {"moe_implementation": "deepgemm_fp8"}},
+        text_config={"ops_implementation": {"rms_norm_implementation": "torch_npu"}},
     )
     vl_cfg.save_pretrained(vl_dir)
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        vl_cfg._set_ops_implementation({"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel' is not supported on Ascend NPU"):
+        vl_cfg._set_ops_implementation({"rms_norm_implementation": "liger_kernel"})
     assert vl_cfg.ops_implementation == {}
-    assert vl_cfg.text_config.ops_implementation == {"moe_implementation": "deepgemm_fp8"}
+    assert vl_cfg.text_config.ops_implementation == {"rms_norm_implementation": "torch_npu"}
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*cannot be combined.*fp8_blockwise"):
-        Qwen3VLConfig.from_pretrained(vl_dir, ops_implementation={"qat_implementation": "fp8_blockwise"})
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel' is not supported on Ascend NPU"):
+        Qwen3VLConfig.from_pretrained(vl_dir, ops_implementation={"rms_norm_implementation": "liger_kernel"})
 
 
 def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path, monkeypatch):
@@ -948,7 +967,7 @@ def test_direct_model_validates_final_ops_before_hf_initialization(monkeypatch, 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import LTXVideoTransformerModel
     from veomni.models.transformers.flux.modeling_flux import FluxModel
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
 
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
@@ -994,3 +1013,130 @@ def test_config_normalizes_deprecated_attention_aliases(tmp_path, entrypoint):
             config.ops_implementation["attn_implementation"] = legacy
     assert config.ops_config.attn_implementation == "veomni_flash_attention_2"
     assert config._attn_implementation == "veomni_flash_attention_2"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_checkpoint_written_before_the_per_family_rows_still_loads(tmp_path):
+    """Every pre-refactor export carries ``qat_implementation``; it must not become unloadable.
+
+    The default value was ``"none"``, so most published configs hold it. Migrating
+    means dropping the removed key, which is what "train in the model dtype" already
+    meant.
+    """
+    from transformers import Qwen3Config
+
+    from veomni.models import build_config
+
+    Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=64,
+        ops_implementation={"qat_implementation": "none", "rms_norm_implementation": "eager"},
+    ).save_pretrained(tmp_path)
+
+    config = build_config(str(tmp_path))
+
+    assert "qat_implementation" not in config.ops_implementation
+    assert config.ops_implementation["rms_norm_implementation"] == "eager"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_legacy_quantizing_recipe_names_the_replacement_fields(tmp_path):
+    """The quantizing value cannot be translated without knowing the model, so it explains itself."""
+    from transformers import Qwen3Config
+
+    from veomni.models import build_config
+
+    Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=64,
+        ops_implementation={"qat_implementation": "fp8_blockwise"},
+    ).save_pretrained(tmp_path)
+
+    with pytest.raises(ValueError, match="became per-family") as error:
+        build_config(str(tmp_path))
+    assert "linear_implementation" in str(error.value)
+    assert "kv_round_implementation" in str(error.value)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_renamed_field_migrates_to_its_current_spelling(tmp_path):
+    """A checkpoint saved before the `swiglu_mlp` -> `gated_mlp` rename still loads.
+
+    The rename was forced by the family gaining an activation argument. Configs
+    written before it record `swiglu_mlp_implementation`, and a checkpoint stores
+    whatever was set, so without the migration the load dies with a bare
+    `unexpected keyword argument` and no way forward.
+    """
+    from transformers import Qwen3Config
+
+    from veomni.models import build_config
+
+    Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=64,
+        ops_implementation={"swiglu_mlp_implementation": "eager"},
+    ).save_pretrained(tmp_path)
+
+    config = build_config(str(tmp_path))
+
+    assert "swiglu_mlp_implementation" not in config.ops_implementation
+    assert config.ops_implementation["gated_mlp_implementation"] == "eager"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_current_selections_are_untouched_by_the_migration():
+    from veomni.models.legacy_qat_selections import migrate_retired_selections
+
+    selections = {"linear_implementation": "qat", "kv_round_implementation": "triton"}
+    assert migrate_retired_selections(selections) == selections
+    assert migrate_retired_selections({"gated_mlp_implementation": "qat"}) == {"gated_mlp_implementation": "qat"}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_ops_config_refreshes_on_nested_kwargs_and_override_mutations(monkeypatch):
+    """Mutating nested ``kwargs`` or ``overrides`` in ``ops_implementation`` invalidates ``ops_config``."""
+    from transformers import Qwen3Config
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+
+    config = as_veomni_config(
+        Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            intermediate_size=64,
+            ops_implementation={
+                "linear_implementation": {
+                    "name": "torchao",
+                    "kwargs": {"dtype": "nvfp4"},
+                    "overrides": [{"site": r"layers\.0\.q_proj", "name": "eager"}],
+                }
+            },
+        )
+    )
+    assert config.ops_config.linear_implementation.resolve("layers.1.q_proj") == ("torchao", {"dtype": "nvfp4"})
+    assert config.ops_config.linear_implementation.resolve("layers.0.q_proj") == ("eager", {})
+
+    config.ops_implementation["linear_implementation"]["kwargs"]["dtype"] = "mxfp4"
+    assert config.ops_config.linear_implementation.resolve("layers.1.q_proj") == ("torchao", {"dtype": "mxfp4"})
+
+    config.ops_implementation["linear_implementation"]["overrides"][0]["name"] = "torchao"
+    assert config.ops_config.linear_implementation.resolve("layers.0.q_proj") == ("torchao", {"dtype": "mxfp4"})
+    assert "mxfp4" in config.to_json_string()

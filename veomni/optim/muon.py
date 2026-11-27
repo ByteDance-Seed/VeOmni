@@ -24,7 +24,7 @@ projection in row blocks (one block per head group) instead of as one matrix.
 """
 
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -78,7 +78,10 @@ __all__ = [
 
 DEFAULT_NS_COEFFICIENTS: Tuple[float, float, float] = (DEFAULT_A, DEFAULT_B, DEFAULT_C)
 
-# Lookup-table-like 2D weights are kept on AdamW.
+# 2D weights that route, mix or gate rather than transform features are kept on
+# AdamW. Newton-Schulz orthogonalizes a matrix and then scales it by
+# ``0.2 * sqrt(max(A, B))``, which is the wrong geometry for a matrix that only
+# selects or mixes, and a large multiplier on a small row block.
 _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "embed_tokens",
     "embedding",
@@ -87,6 +90,17 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "confidence_head",
     "output_layer",
     "conv1d",
+    ".gate.",
+    ".router.",
+    "shared_expert_gate",
+    "_hc.fn",
+    "hc_head.",
+    "weights_proj",
+    # Compressor/indexer `gate_proj` are softmax gates over pooled KV entries, so
+    # they are scoped rather than matched by a bare `gate_proj`, which would also
+    # catch the shared-expert and MLP feature projections.
+    "compressor.gate_proj",
+    "indexer.gate_proj",
 )
 
 # Attribute names carrying a head count and a per-head row stride. MLA modules
@@ -686,6 +700,63 @@ _KIND_FSDP_GATHER_2D = "fsdp_gather_2d"
 _KIND_MOE_LOCAL_3D = "moe_local_3d"
 _KIND_MOE_GATHER_3D = "moe_gather_3d"
 
+#: Experts per Newton-Schulz call on a 3D local-expert stack; dim 0 is a pure
+#: batch dim, so a positive value bounds the workspace at ``value * min(M, K)**2``.
+#: ``-1`` (default) disables chunking: one call, fastest, largest workspace.
+_MOE_LOCAL_3D_NS_CHUNK_DISABLED = -1
+_DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS = _MOE_LOCAL_3D_NS_CHUNK_DISABLED
+
+
+def _expert_ns_chunk_sizes(num_experts: int, max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS) -> List[int]:
+    """Balanced Newton-Schulz chunk sizes for one 3D local-expert pass.
+
+    Uses as few calls as ``max_experts`` allows and keeps sizes within one of each
+    other, so the remainder never becomes a single-expert call. An empty stack (a
+    non-owner rank's FSDP shard) returns no sizes rather than dividing by zero.
+    ``max_experts <= 0`` disables chunking and yields one whole-stack call.
+    """
+    if num_experts <= 0:
+        return []
+    if max_experts <= 0 or num_experts <= max_experts:
+        return [num_experts]
+    calls = -(-num_experts // max_experts)
+    base, remainder = divmod(num_experts, calls)
+    return [base + 1] * remainder + [base] * (calls - remainder)
+
+
+def _chunked_newton_schulz(
+    local: Tensor,
+    ns: "Callable[[Tensor], Tensor]",
+    max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS,
+) -> Tensor:
+    """Run ``ns`` over a 3D expert stack in balanced chunks of at most ``max_experts``.
+
+    Disabled by default: one whole-stack call is fastest because it amortizes the
+    per-call fp32 normalize/cast and ``bmm`` launches over every expert. Enable it
+    only when that stack's NS workspace would otherwise OOM; it costs a few
+    percent of step time.
+
+    When enabled, the result is written into one preallocated stack chunk by
+    chunk; collecting outputs in a list and ``torch.cat``-ing them would hold a
+    second full stack at peak.
+
+    An empty stack (a non-owner rank's shard) returns without calling ``ns``.
+    """
+    sizes = _expert_ns_chunk_sizes(local.shape[0], max_experts)
+    if not sizes:
+        return ns(local)
+    if len(sizes) == 1:
+        return ns(local)
+    out = torch.empty_like(local)
+    start = 0
+    for size in sizes:
+        end = start + size
+        # In-place: the chunk's ortho lands directly in ``out``, so only one chunk
+        # of workspace is live on top of the result the caller needs anyway.
+        out[start:end] = ns(local[start:end])
+        start = end
+    return out
+
 
 def _shard_dims(p: DTensor) -> List[int]:
     """Return the list of tensor dims along which ``p`` is sharded."""
@@ -830,6 +901,7 @@ class DistributedMuon(Optimizer):
         ns_implementation: str = "gram_quack",
         gram_ns_reset_iterations: Sequence[int] = (2,),
         head_blocks: int = 1,
+        expert_ns_max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS,
     ) -> None:
         if not _MUON_AVAILABLE:
             raise RuntimeError(
@@ -849,6 +921,10 @@ class DistributedMuon(Optimizer):
             raise ValueError(f"ns_implementation must be one of {NS_IMPLEMENTATIONS}, got {ns_implementation!r}")
         if int(head_blocks) < 1:
             raise ValueError(f"head_blocks must be >= 1 but is: {head_blocks}")
+        if int(expert_ns_max_experts) < -1:
+            raise ValueError(
+                f"expert_ns_max_experts must be >= -1 (-1 disables chunking) but is: {expert_ns_max_experts}"
+            )
 
         defaults: Dict[str, Any] = {
             "lr": lr,
@@ -862,6 +938,10 @@ class DistributedMuon(Optimizer):
             "ns_implementation": ns_implementation,
             "gram_ns_reset_iterations": tuple(int(i) for i in gram_ns_reset_iterations),
         }
+        # A constructor-level switch, deliberately not in ``param_groups``: keeping
+        # it out of the optimizer state dict is what lets a resume neither
+        # KeyError on it nor restore the checkpoint's value over this run's.
+        self._expert_ns_max_experts = int(expert_ns_max_experts)
         # Only carried when splitting is on: as a default it would add a
         # ``param_groups.<fqn>.head_blocks`` entry to every flattened optimizer
         # state dict, which checkpoints written before this option lack.
@@ -947,6 +1027,7 @@ class DistributedMuon(Optimizer):
             ns_implementation = str(group.get("ns_implementation", "gram_quack"))
             gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
             head_blocks = int(group.get("head_blocks", 1))
+            expert_ns_max_experts = self._expert_ns_max_experts
             # Scope settings travel inside ns_kwargs so the all-to-all owner path
             # reads them from one dict.
             ns_kwargs = {
@@ -956,6 +1037,7 @@ class DistributedMuon(Optimizer):
                 "ns_implementation": ns_implementation,
                 "gram_ns_reset_iterations": gram_ns_reset_iterations,
                 "head_blocks": head_blocks,
+                "expert_ns_max_experts": expert_ns_max_experts,
             }
 
             # Keep at most one owner-assignment chunk live per mesh/dtype. This
@@ -1001,6 +1083,7 @@ class DistributedMuon(Optimizer):
                         )
                 else:
                     ortho = self._compute_ortho(update, kind, **ns_kwargs)
+                    del update
                     self._apply_ortho(
                         p,
                         ortho,
@@ -1010,6 +1093,7 @@ class DistributedMuon(Optimizer):
                         adjust_lr_fn=adjust_lr_fn,
                         head_blocks=head_blocks,
                     )
+                    del ortho
 
             for (mesh, _local_dtype), entries in a2a_buckets.items():
                 self._flush_fsdp_all2all_chunk(
@@ -1202,6 +1286,7 @@ class DistributedMuon(Optimizer):
         ns_implementation: str = "gram_quack",
         gram_ns_reset_iterations: Sequence[int] = (2,),
         head_blocks: int = 1,
+        expert_ns_max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS,
     ) -> Tensor:
         """Run Newton-Schulz on ``update`` according to its layout kind."""
 
@@ -1226,7 +1311,7 @@ class DistributedMuon(Optimizer):
         if kind == _KIND_MOE_LOCAL_3D:
             assert isinstance(update, DTensor)
             local = update._local_tensor
-            local_ortho = _ns(local)
+            local_ortho = _chunked_newton_schulz(local, _ns, expert_ns_max_experts)
             return DTensor.from_local(
                 local_ortho,
                 device_mesh=update.device_mesh,

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SwiGLU clamping and merged-FC1 forward activation shared across MoE experts."""
+"""SwiGLU clamping and merged-FC1 forward/backward shared across MoE experts."""
 
 from __future__ import annotations
 
@@ -43,17 +43,83 @@ def apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
     return fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2
 
 
-def merged_swiglu_forward(gate: Tensor, up: Tensor) -> Tensor:
+def swiglu_oai(gate: torch.Tensor, up: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Apply SwiGLU-OAI after any model-specific input clamping.
+
+    Evaluated as ``(up + 1) * (gate * sigmoid(gate * alpha))``, the op order of
+    the MiniMax / GPT-OSS eager experts. Every step rounds in bf16, so any other
+    association drifts from eager by an ULP on a large share of elements.
+    """
+    glu = gate * torch.sigmoid(gate * alpha)
+    return (up + 1.0) * glu
+
+
+def swiglu_oai_backward(
+    grad_output: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, alpha: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return analytical gradients for the unclamped SwiGLU-OAI inputs."""
+    sigmoid = torch.sigmoid(alpha * gate)
+    glu = gate * sigmoid
+    grad_gate = grad_output * (up + 1.0) * (sigmoid + alpha * gate * sigmoid * (1.0 - sigmoid))
+    grad_up = grad_output * glu
+    return grad_gate, grad_up
+
+
+def swiglu_activation(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    swiglu_alpha: float | None,
+    *,
+    return_gate_activation: bool = False,
+):
+    """Fused-MoE gated activation: standard SwiGLU, or SwiGLU-OAI when ``swiglu_alpha`` is set.
+
+    With ``return_gate_activation`` also returns ``silu(gate)`` (``None`` for
+    SwiGLU-OAI) so a caller recomputing the activation in backward can hand it to
+    :func:`swiglu_activation_backward` instead of evaluating SiLU twice.
+    """
+    if swiglu_alpha is None:
+        gate_activation = torch.ops.aten.silu(gate)
+        output = gate_activation * up
+    else:
+        gate_activation = None
+        output = swiglu_oai(gate, up, swiglu_alpha)
+    return (output, gate_activation) if return_gate_activation else output
+
+
+def swiglu_activation_backward(
+    grad_output: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    swiglu_alpha: float | None,
+    gate_activation: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gradients of :func:`swiglu_activation` w.r.t. its (post-clamp) ``gate`` and ``up``.
+
+    ``gate_activation`` is an already computed ``silu(gate)`` for the standard
+    path; it is recomputed when omitted.
+    """
+    if swiglu_alpha is None:
+        if gate_activation is None:
+            gate_activation = torch.ops.aten.silu(gate)
+        grad_gate = torch.ops.aten.silu_backward(grad_output * up, gate)
+        grad_up = gate_activation * grad_output
+        return grad_gate, grad_up
+    return swiglu_oai_backward(grad_output, gate, up, swiglu_alpha)
+
+
+def merged_swiglu_forward(gate: Tensor, up: Tensor, alpha: float | None = None) -> Tensor:
     """Fuse staged ``silu(gate) * up`` for merged-FC1 halves on NVIDIA CUDA.
 
     Called inside both non-EP and EP merged-FC1 custom autograd functions, which
     continue to own saved tensors and backward math. Falls back to the staged
-    ATen expression on non-NVIDIA backends (ROCm, MLU).
+    ATen expression on non-NVIDIA backends (ROCm, MLU). Supplying ``alpha``
+    selects the MiniMax SwiGLU-OAI expression on every backend.
     """
     assert gate.ndim == 2 and up.shape == gate.shape
     assert gate.device == up.device
-    if not is_nvidia_cuda_device(gate.device):
-        return torch.ops.aten.silu(gate) * up
+    if alpha is not None or not is_nvidia_cuda_device(gate.device):
+        return swiglu_activation(gate, up, alpha)
     assert gate.dtype == up.dtype and gate.dtype in (torch.bfloat16, torch.float16)
 
     output = gate.new_empty(gate.shape)
@@ -78,3 +144,60 @@ def merged_swiglu_forward(gate: Tensor, up: Tensor) -> Tensor:
             enable_fp_fusion=False,
         )
     return output
+
+
+def merged_swiglu_backward(
+    gate: Tensor,
+    up: Tensor,
+    grad: Tensor,
+    gate_mask: Tensor | None = None,
+    up_mask: Tensor | None = None,
+    alpha: float | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Recompute the activation and packed FC1 gradients with staged rounding.
+
+    Clamp masks are the contiguous masks returned by ``apply_swiglu_clamp``.
+    SwiGLU-OAI (``alpha`` supplied) and non-NVIDIA backends use staged ATen math.
+    """
+    assert gate.ndim == 2 and up.shape == grad.shape == gate.shape
+    assert gate.device == up.device == grad.device
+    assert (gate_mask is None) == (up_mask is None)
+    if alpha is not None or not is_nvidia_cuda_device(gate.device):
+        activation, silu = swiglu_activation(gate, up, alpha, return_gate_activation=True)
+        grad_gate, grad_up = swiglu_activation_backward(grad, gate, up, alpha, silu)
+        if gate_mask is not None:
+            grad_gate.masked_fill_(~gate_mask, 0)
+            grad_up.masked_fill_(~up_mask, 0)
+        return activation, torch.cat([grad_gate, grad_up], dim=-1)
+    assert gate.dtype == up.dtype == grad.dtype and gate.dtype in (torch.bfloat16, torch.float16)
+    if gate_mask is not None:
+        assert gate_mask.shape == up_mask.shape == gate.shape
+        assert gate_mask.is_contiguous() and up_mask.is_contiguous()
+    activation = gate.new_empty(gate.shape)
+    packed_grad = gate.new_empty((gate.shape[0], 2 * gate.shape[1]))
+    if activation.numel() == 0:
+        return activation, packed_grad
+    from ._triton_swiglu import _merged_swiglu_backward_kernel
+
+    with get_torch_device().device(gate.device):
+        _merged_swiglu_backward_kernel[((activation.numel() + 1023) // 1024,)](
+            gate,
+            up,
+            grad,
+            gate_mask,
+            up_mask,
+            activation,
+            packed_grad,
+            activation.numel(),
+            columns=gate.shape[1],
+            gate_stride_m=gate.stride(0),
+            gate_stride_n=gate.stride(1),
+            up_stride_m=up.stride(0),
+            up_stride_n=up.stride(1),
+            grad_stride_m=grad.stride(0),
+            grad_stride_n=grad.stride(1),
+            CLAMPED=gate_mask is not None,
+            BLOCK_SIZE=1024,
+            enable_fp_fusion=False,
+        )
+    return activation, packed_grad

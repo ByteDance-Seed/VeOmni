@@ -60,11 +60,11 @@ collected against the complete runner slice to catch such losses.
 
 `pytest.mark.skipif(device_count < N)` markers express eligibility,
 not exact resource reservations. For example,
-[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L1174)
+[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L1181)
 checks a two-device minimum but launches either two or four workers according
-to its parameter. The
+to its parameter (two on NPU, where the four-rank topology is not run). The
 [launcher defaults](../../tests/tools/launch_utils.py#L149) and
-[training command resolution](../../tests/tools/training_utils.py#L243) provide
+[training command resolution](../../tests/tools/training_utils.py#L249) provide
 shared plan inputs rather than a second quota definition.
 
 ## Writing new tests
@@ -105,9 +105,9 @@ its result.
 ## Test API
 
 Use the `provider` keyword on `pytest.mark.launch_plan`. A provider is either a
-[LaunchSpec](../../scripts/ci/accelerator/launch_plan.py#L30), a
-[CasePlan](../../scripts/ci/accelerator/launch_plan.py#L48), or a callable accepting a
-[PlanContext](../../scripts/ci/accelerator/launch_plan.py#L81) and returning one of those
+[LaunchSpec](../../scripts/ci/accelerator/launch_plan.py#L34), a
+[CasePlan](../../scripts/ci/accelerator/launch_plan.py#L52), or a callable accepting a
+[PlanContext](../../scripts/ci/accelerator/launch_plan.py#L85) and returning one of those
 values. The planner calls it through
 [resolve_plan](../../scripts/ci/accelerator/pytest_plugin.py#L23). Using a keyword prevents pytest from interpreting a
 callable provider as the test function being decorated.

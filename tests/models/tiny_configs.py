@@ -243,6 +243,59 @@ def tiny_llama_config(architecture: str = "LlamaForCausalLM", **overrides) -> Pr
     return LlamaConfig(**kwargs)
 
 
+def tiny_minimax_m3_vl_config(architecture: str = "MiniMaxM3SparseForConditionalGeneration") -> PretrainedConfig:
+    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import (
+        MiniMaxM3VLConfig,
+        MiniMaxM3VLTextConfig,
+        MiniMaxM3VLVisionConfig,
+    )
+
+    MiniMaxM3VLConfig = get_veomni_config_class(MiniMaxM3VLConfig)
+    MiniMaxM3VLTextConfig = get_veomni_config_class(MiniMaxM3VLTextConfig)
+    MiniMaxM3VLVisionConfig = get_veomni_config_class(MiniMaxM3VLVisionConfig)
+
+    text = MiniMaxM3VLTextConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=16,
+        dense_intermediate_size=64,
+        shared_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        index_n_heads=1,
+        index_head_dim=8,
+        head_dim=8,
+        rotary_dim=8,
+        num_local_experts=4,
+        num_experts_per_tok=1,
+        layer_types=["minimax_m3_sparse", "full_attention"],
+        mlp_layer_types=["sparse", "dense"],
+        max_position_embeddings=64,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    vision = MiniMaxM3VLVisionConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_channels=3,
+        patch_size=14,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+    )
+    return MiniMaxM3VLConfig(
+        text_config=text.to_dict(),
+        vision_config=vision.to_dict(),
+        image_token_index=IMAGE_TOKEN_ID,
+        video_token_index=VIDEO_TOKEN_ID,
+        projector_hidden_size=32,
+        architectures=[architecture],
+        attn_implementation="eager",
+    )
+
+
 def tiny_movqgan_config(architecture: str = "MoVQGAN") -> PretrainedConfig:
     from veomni.models.transformers.movqgan.configuration_movqgan import MoVQGANConfig
 
@@ -448,6 +501,32 @@ def tiny_minimax_h3_condition_config(architecture: str = "MiniMaxH3ConditionMode
     }
     kwargs.update(overrides)
     return MiniMaxH3ConditionModelConfig(**kwargs)
+
+
+def tiny_minimax_h3_image_config(architecture: str = "MiniMaxH3DiTModel", **overrides) -> PretrainedConfig:
+    return tiny_minimax_h3_config(
+        architecture=architecture,
+        audio_enabled=False,
+        num_pdd_heads=2,
+        **overrides,
+    )
+
+
+def tiny_minimax_h3_image_condition_config(
+    architecture: str = "MiniMaxH3ImageConditionModel", **overrides
+) -> PretrainedConfig:
+    from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
+        MiniMaxH3ImageConditionModelConfig,
+    )
+
+    kwargs = {
+        "base_model_path": "",
+        "skip_encoder_load": True,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+    }
+    kwargs.update(overrides)
+    return MiniMaxH3ImageConditionModelConfig(**kwargs)
 
 
 def tiny_qwen_image_config(architecture: str = "QwenImageTransformer2DModel", **overrides) -> PretrainedConfig:
@@ -1155,3 +1234,27 @@ def tiny_qwen3_vl_moe_config(
         architectures=[architecture],
         attn_implementation="eager",
     )
+
+
+def tiny_kimi_k3_config(architecture: str = "KimiK3ForConditionalGeneration") -> PretrainedConfig:
+    """Load the Kimi K3 VLM toy config (``tests/toy_config/kimi_k3_toy``).
+
+    The vendored K3 config carries the full MoonViT3d vision section and a
+    hybrid KDA/MLA text stack; loading the checked-in toy config keeps the
+    factory in sync with the layout the bitwise-parity suites build.
+    """
+    from pathlib import Path
+
+    from veomni.models.transformers.kimi_k3.configuration_kimi_k3 import KimiK3Config
+
+    toy_dir = Path(__file__).resolve().parents[1] / "toy_config" / "kimi_k3_toy"
+    config = KimiK3Config.from_pretrained(str(toy_dir))
+    config.architectures = [architecture]
+    return config
+
+
+def tiny_kimi_linear_config(architecture: str = "KimiLinearForCausalLM") -> PretrainedConfig:
+    """Kimi K3 text stack standalone (the ``kimi_linear`` model type)."""
+    config = tiny_kimi_k3_config().text_config
+    config.architectures = [architecture]
+    return config

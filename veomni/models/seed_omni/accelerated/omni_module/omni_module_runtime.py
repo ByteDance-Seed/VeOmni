@@ -67,6 +67,38 @@ def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
     return fsdp_config.fsdp_scope == "model" and fsdp_config.fsdp_mode != "eager"
 
 
+def module_compile_config(accelerator: "AcceleratorConfig", *, global_accelerator=None):
+    """This module's compile settings, or everything off unless the run asked for it.
+
+    ``enable`` needs the module's resolved ``torch_compile.enable`` and an
+    ``fsdp2`` wrap — and, when ``global_accelerator`` is given (i.e. under
+    ``fsdp_scope='model'``), an ``fsdp2`` launcher too, because that wrap is the
+    top-level one. Which blocks compile, and whether ``dynamic`` is used, come
+    from the config alone; there is no per-model capability flag.
+
+    ``fsdp_scope='model'`` is already refused for ``torch_compile`` at parse time
+    (:func:`veomni.arguments.omni_arguments_types._validate_composed_wrap`), so
+    the launcher leg below is a guard for runtimes built directly rather than
+    through the launcher.
+    """
+    from .....distributed.torch_compile import CompileConfig
+
+    run_config = accelerator.torch_compile
+    fsdp2 = accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    wrap_fsdp2 = global_accelerator is None or global_accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    enabled = bool(run_config.enable) and fsdp2 and wrap_fsdp2
+    return CompileConfig(
+        enable=enabled,
+        backend=run_config.backend,
+        mode=run_config.mode,
+        fullgraph=run_config.fullgraph,
+        # Only a module that compiles gets a shape policy; a disabled module's is
+        # irrelevant, and pinning it to False keeps an eager module's config from
+        # reading as if it had asked for symbolic shapes.
+        dynamic=run_config.dynamic if enabled else False,
+    )
+
+
 class ModuleRuntime(VeOmniModelRuntime):
     """One OmniModule's training unit (model + optimizer + lr_scheduler + FSDP2).
 
@@ -129,6 +161,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         for_inference: bool = False,
         hf_source: Optional["HFSource"] = None,
     ):
+        """Bind the arguments, config and accelerator settings for one module."""
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
@@ -237,7 +270,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``model_path`` it is the weight-free view's, where the config and assets
         are read from.
         """
-        return self.hf_source.path if self.hf_source is not None else self.args.model_path
+        return self.hf_source.weights_path if self.hf_source is not None else self.args.model_path
 
     @property
     def module_name(self) -> str:
@@ -280,6 +313,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         model_path = args.model_path
         model_type = self.module_config.model_type
         cls = OMNI_MODEL_REGISTRY[model_type]()
+        module_dtype = getattr(self.module_config, "dtype", None) or torch.bfloat16
+        if isinstance(module_dtype, str):
+            module_dtype = getattr(torch, module_dtype)
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:
@@ -297,7 +333,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self.hf_source,
                 self.module_name,
                 device_map=device_map,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=module_dtype,
             ).eval()
             self.model_config = self.model.config
             self._build_model_assets()
@@ -309,7 +345,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.model = cls.from_pretrained(
             model_path,
             config=self.module_config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=module_dtype,
             device_map=device_map,
         ).eval()
         self.model_config = self.model.config
@@ -348,7 +384,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             # Mirrors the loaders' ``empty_init``: off rank 0 a CPU init stays on meta.
             off_rank0 = dist.is_initialized() and dist.get_rank() != 0
             if init_device != "meta" and not (init_device == "cpu" and off_rank0):
-                load_model_weights(self.model, self.hf_source.path, init_device)
+                load_model_weights(self.model, self.hf_source.weights_path, init_device)
         self.model_config = self.model.config
 
     def _build_model_assets(self) -> None:
@@ -426,13 +462,13 @@ class ModuleRuntime(VeOmniModelRuntime):
         )
 
     def _build_parallelized_model(self) -> None:
-        """FSDP2/DDP-wrap this module and load its weights.
+        """Let the base build compile and wrap — except when the composed model owns the wrap.
 
-        When ``fsdp_scope='model'``, only async activation offload is applied
-        here, since it must precede the wrap: the module stays on meta (freeze
-        already applied) so :class:`OmniModelRuntime` can wrap the composed
-        parent once, then :meth:`build_after_omni_model_wrap` builds the
-        optimizer on the now-DTensor parameters.
+        Under ``fsdp_scope='model'`` the composed ``OmniModel`` wraps once, so this
+        module applies what must precede that wrap and returns instead of calling
+        the base build. Compilation is not part of that: the launcher rejects
+        ``torch_compile`` under this scope in ``_validate_composed_wrap``, so there
+        is nothing here to compile and no per-module compile log to emit.
         """
         if self.wrap_omni_model:
             self._apply_async_activation_offload()
@@ -442,6 +478,21 @@ class ModuleRuntime(VeOmniModelRuntime):
             )
             return
         super()._build_parallelized_model()
+
+    def _compile_config(self):
+        """This module's compile settings, or everything off if it did not opt in.
+
+        Under ``fsdp_scope='model'`` the composed ``OmniModel`` does the wrapping,
+        so the launcher's ``fsdp_mode`` has to be consulted as well: that wrap
+        refuses DDP, and a module overlay saying ``fsdp2`` cannot change it.
+        Under ``fsdp_scope='module'`` the module's own overlay *is* its wrap, so
+        the launcher is not consulted — otherwise a ``fsdp2`` child would be
+        disabled by a ``ddp`` launcher default it never uses.
+        """
+        return module_compile_config(
+            self.args.accelerator,
+            global_accelerator=self._global_accelerator if self.wrap_omni_model else None,
+        )
 
     def build_after_omni_model_wrap(self) -> None:
         """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.
@@ -517,6 +568,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     @property
     def has_trainable_parameters(self) -> bool:
+        """Whether any parameter of this module requires grad (cached after first use)."""
         if self._has_trainable_parameters is None:
             self._has_trainable_parameters = any(param.requires_grad for param in self.model.parameters())
         return self._has_trainable_parameters
@@ -556,11 +608,18 @@ class ModuleRuntime(VeOmniModelRuntime):
         A distributed optimizer (Muon) reads ``get_parallel_state()`` at build
         time, so it must resolve to this module's mesh, not the orchestrator's.
         A no-op for a fully-frozen module: there is nothing to step.
+
+        A module that defines ``configure_optimizer(optimizer)`` gets the built
+        optimizer before the lr-scheduler is built and a checkpoint is loaded into
+        it, so it can adjust its param groups or register step hooks.
         """
         if not self.has_trainable_parameters:
             return
         with self._scoped():
             super()._build_optimizer(param_groups)
+            configure_optimizer = getattr(self.omni_module, "configure_optimizer", None)
+            if callable(configure_optimizer):
+                configure_optimizer(self.optimizer)
 
     def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build this module's lr-scheduler over ``total_steps``.
@@ -632,6 +691,13 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         if not any(p.requires_grad for p in self.model.parameters()):
             logger.info_rank0(f"ModuleRuntime[{self.module_name}]: fully frozen — skipping DCP/HF checkpoint.")
+            if any(
+                getattr(self.omni_module, hook, None) is not None for hook in ("extra_state_dict", "rng_state_dict")
+            ):
+                logger.warning_rank0(
+                    f"ModuleRuntime[{self.module_name}]: the fully frozen module contributes extra checkpoint state, "
+                    "but has no checkpoint manager, so that state is not saved. Keep it on a trainable module."
+                )
             self._has_trainable_parameters = False
             self.checkpoint = None
             return
@@ -641,6 +707,43 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Resume this module's DCP checkpoint, if one is configured."""
         if self.checkpoint is not None:
             self.checkpoint.load()
+
+    def extra_state(self) -> dict[str, Any]:
+        """Return optional module-owned checkpoint state under a private namespace.
+
+        ``extra_state_dict`` / ``load_extra_state_dict`` are the generic hooks.
+        The RNG pair remains a compatibility path for existing modules.
+        """
+        save = getattr(self.omni_module, "extra_state_dict", None)
+        if save is not None:
+            if getattr(self.omni_module, "load_extra_state_dict", None) is None:
+                logger.warning_rank0(
+                    f"ModuleRuntime[{self.module_name}]: extra_state_dict is defined without "
+                    "load_extra_state_dict; saved state cannot be restored."
+                )
+            return {"module_extra_state": save()}
+        rng_state_dict = getattr(self.omni_module, "rng_state_dict", None)
+        return {} if rng_state_dict is None else {"module_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        state = extra_state.get("module_extra_state")
+        load = getattr(self.omni_module, "load_extra_state_dict", None)
+        if state is not None and load is not None:
+            with self._scoped():
+                load(state)
+            return
+        rng_state = extra_state.get("module_rng_state")
+        if rng_state is None:
+            return
+        load_rng = getattr(self.omni_module, "load_rng_state_dict", None)
+        if load_rng is None:
+            logger.warning_rank0(
+                f"ModuleRuntime[{self.module_name}]: checkpoint carries module RNG state, "
+                "but the module has no load_rng_state_dict hook; state was not restored."
+            )
+            return
+        with self._scoped():
+            load_rng(rng_state)
 
     def save_dcp(self, state: "TrainerState") -> None:
         """Write this module's distributed checkpoint (train resume)."""
