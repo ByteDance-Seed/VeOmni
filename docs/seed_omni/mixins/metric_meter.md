@@ -12,7 +12,7 @@ throughput.
 
 The single-model trainers count tokens from `input_ids` and pick one FLOPs
 formula from the model's `model_type`
-([`EnvironMeter`](../../../veomni/utils/helper.py#L220) +
+([`EnvironMeter`](../../../veomni/utils/helper.py#L198) +
 [`VeomniFlopsCounter`](../../../veomni/utils/count_flops.py#L73)). An
 `OmniModel` is a composition of independent modules (text encoder, vision
 encoder, AR backbone, VQ codec, ...). It has no single config to dispatch a
@@ -89,10 +89,10 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceModuleMixin, MetricMeter):
 | Function | Called by | Effect |
 |----------|-----------|--------|
 | [`MetricMeterMixin.metric_meter_add(method)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L120) | [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27), once per training node, right after `pre_forward` and before the endpoint runs, inside the module's `ParallelState` scope | [Appends](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L136) the lengths stashed for the running `method` to the module's per-step buffer, then [clears](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L137) the whole stash, so copies a shared hook left under other call-sites cannot leak into a later node. Over gradient accumulation it runs once per micro-batch, so the buffer holds the whole global step. |
-| [`MetricMeterMixin.metric_meter_collect() -> (flops, seqlens)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L139) | [`OmniModelRuntime.metric_meter_collect`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L596) | Returns `(estimate_flops(buffer), buffer)` and empties the buffer for the next step. |
-| [`OmniModelRuntime.metric_meter_collect() -> {name: (flops, seqlens)}`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L596) | [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L76) | Drains every module with `isinstance(omni_module, MetricMeterMixin)`. Keys are module names, so they are identical on every rank even when a rank's batch did not use a module (it reports `(0.0, [])`). |
-| [`OmniEnvironMeter.add(micro_batch)`](../../../veomni/utils/omni_helper.py#L123) | [`OmniStepMetricsCallback.on_step_begin`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L66), once per micro-batch | Counts samples — `len(conversation_list)`, or a packed batch's `packed_cu_seqlens` boundaries — and, for multi-source, gathers `ds_idx`. Never looks at tokens. |
-| [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L145) | [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L73) | [One DP all-reduce](../../../veomni/utils/omni_helper.py#L177) of FLOPs, sample count and per-module token sums, then the metrics listed below. |
+| [`MetricMeterMixin.metric_meter_collect() -> (flops, seqlens)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L139) | [`OmniModelRuntime.metric_meter_collect`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L628) | Returns `(estimate_flops(buffer), buffer)` and empties the buffer for the next step. |
+| [`OmniModelRuntime.metric_meter_collect() -> {name: (flops, seqlens)}`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L628) | [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L69) | Drains every module with `isinstance(omni_module, MetricMeterMixin)`. Keys are module names, so they are identical on every rank even when a rank's batch did not use a module (it reports `(0.0, [])`). |
+| [`OmniEnvironMeter.add(micro_batch)`](../../../veomni/utils/omni_helper.py#L123) | [`OmniStepMetricsCallback.on_step_begin`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L64), once per micro-batch | Counts samples — `len(conversation_list)`, or a packed batch's `packed_cu_seqlens` boundaries — and, for multi-source, gathers `ds_idx`. Never looks at tokens. |
+| [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L145) | [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L69) | [One DP all-reduce](../../../veomni/utils/omni_helper.py#L177) of FLOPs, sample count and per-module token sums, then the metrics listed below. |
 
 The `OmniEnvironMeter` itself is built in
 [`OmniStepMetricsCallback.__init__`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L51)
@@ -106,7 +106,7 @@ and stored as `trainer.environ_meter`.
     - [`OmniEnvironMeter.add(micro_batch)`](../../../veomni/utils/omni_helper.py#L123) for each micro-batch: sample count, `ds_idx`.
     - [`start_time = time.time()`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L67)
   - For each micro-batch: [`forward_backward_step`](../../../veomni/trainer/omni/omni_trainer.py#L500) →
-    [`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L516) →
+    [`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L518) →
     [`TrainNodeRunner`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L78) →
     [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27), for each node:
     - [`raw.pre_forward(method, **batch)`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L63)
@@ -117,16 +117,16 @@ and stored as `trainer.environ_meter`.
   - [`on_step_end`](../../../veomni/trainer/omni/omni_trainer.py#L570) →
     [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L69)
     - [`delta_time = time.time() - start_time`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L72)
-    - [`OmniModelRuntime.metric_meter_collect()`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L596) →
+    - [`OmniModelRuntime.metric_meter_collect()`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L628) →
       per metered module [`(estimate_flops(buffer), buffer)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L150); buffer reset.
     - [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L145)
     - [`trainer.step_env_metrics = ...`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L107),
-      logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L157).
+      logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L159).
 
 `delta_time` covers every micro-batch's forward and backward plus the optimizer
 step. Metering only happens through `TrainNodeRunner`: calling
 `OmniModel.forward` without a `node_runner` (the eager, framework-free path,
-[`OmniModel._run_train_node`](../../../veomni/models/seed_omni/modeling_omni.py#L495))
+[`OmniModel._run_train_node`](../../../veomni/models/seed_omni/modeling_omni.py#L497))
 runs `pre_forward` but never drains the stash, so nothing is counted there.
 
 ## Resulting metrics
@@ -144,7 +144,7 @@ same dict and `WandbTraceCallback` logs it.
 | [`trace/<module>/tokens_per_second(M)`](../../../veomni/utils/omni_helper.py#L201) | This module's global tokens this step / `delta_time`. |
 | [`trace/<module>/consume_tokens(M)`, `(B)`](../../../veomni/utils/omni_helper.py#L202) | This module's cumulative global tokens. |
 | [`trace/<module>/avg_seq_len`](../../../veomni/utils/omni_helper.py#L205) | This module's global tokens this step / `global_batch_size`. |
-| `max_memory_allocated(GB)`, `cpu_used_memory(GB)`, ... | Device and host memory, reduced to the worst rank by [`compute_device_memory_metrics`](../../../veomni/utils/helper.py#L178) (shared with `EnvironMeter`). |
+| `max_memory_allocated(GB)`, `cpu_used_memory(GB)`, ... | Device and host memory, reduced to the worst rank by [`compute_device_memory_metrics`](../../../veomni/utils/helper.py#L156) (shared with `EnvironMeter`). |
 | `multi_source/...` | Only with `data.enable_multisource`; see [Multi-source accounting](#multi-source-accounting). |
 
 `<module>` is the module's name in the `OmniModel` (the key of
@@ -220,7 +220,7 @@ warning. To make a backbone eligible, stash exactly one length per conversation.
 - [`tests/seed_omni/mixins/test_metric_meter_mixin.py`](../../../tests/seed_omni/mixins/test_metric_meter_mixin.py):
   the mixin's stash/accumulate/reset contract and the `OmniEnvironMeter` roll-up,
   including a two-rank gloo run.
-- [`test_metric_meter_collect_drains_only_the_metered_modules`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L399):
+- [`test_metric_meter_collect_drains_only_the_metered_modules`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L400):
   the runtime drain.
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   the callback wiring.
