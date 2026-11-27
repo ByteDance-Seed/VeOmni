@@ -621,6 +621,7 @@ class TestCheckpointLayoutRoundTrip:
 
         with (
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True) as agreed,
+            patch("veomni.checkpoint.dcp_checkpointer._reject_unproven_extra_parallel_optimizer"),
             patch.object(DistributedCheckpointer, "_create_storage_reader"),
             patch("veomni.checkpoint.dcp_checkpointer.dcp") as mock_dcp,
         ):
@@ -2526,6 +2527,7 @@ class TestStageDirValidation:
         with (
             patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
+            patch("veomni.checkpoint.dcp_checkpointer._reject_unproven_extra_parallel_optimizer"),
             patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
         ):
@@ -3033,11 +3035,13 @@ def _extra_parallel_only_dcp_worker(rank: int, world_size: int, ckpt_dir: str, e
         fsdp_submesh = mesh["emb_fsdp"]
         local = torch.arange(rows * cols, dtype=torch.float32).view(rows, cols) + 100 * rank
 
-        saved = restore_extra_parallel_dim(local.clone(), mesh, fsdp_submesh, ep_shard_dim=0)
+        saved = restore_extra_parallel_dim(local.clone(), mesh, fsdp_submesh, ep_shard_dim=0, extra_parallel_only=True)
         assert saved.shape == (world_size * rows, cols)
         dcp.save({"table": saved}, checkpoint_id=ckpt_dir)
 
-        target = restore_extra_parallel_dim(torch.zeros_like(local), mesh, fsdp_submesh, ep_shard_dim=0)
+        target = restore_extra_parallel_dim(
+            torch.zeros_like(local), mesh, fsdp_submesh, ep_shard_dim=0, extra_parallel_only=True
+        )
         state = {"table": target}
         dcp.load(state, checkpoint_id=ckpt_dir)
         torch.testing.assert_close(drop_extra_parallel_dim(state["table"], fsdp_submesh), local)
