@@ -23,7 +23,11 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 from transformers import PreTrainedConfig
-from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_causal_mask
+from transformers.masking_utils import (
+    ALL_MASK_ATTENTION_FUNCTIONS,
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.attention.attention_cases import (
@@ -39,6 +43,7 @@ from veomni.ops.kernels.attention.mask import magi as magi_mask
 from veomni.ops.kernels.attention.mask import sdpa as sdpa_mask
 from veomni.ops.mask import (
     MagiAttentionMask,
+    eager_attention_mask_builder,
     flash_attention_mask_builder,
     flex_attention_mask_builder,
     magi_attention_mask_builder,
@@ -185,7 +190,10 @@ def test_flex_ulysses_2d_mask_length_aligns(monkeypatch):
     assert tuple(flex.shape[-2:]) == (8, 8)
 
 
-@pytest.mark.parametrize(("impl", "module"), (("veomni_flex_attention", flex_mask), ("veomni_sdpa", sdpa_mask)))
+@pytest.mark.parametrize(
+    ("impl", "module"),
+    (("veomni_flex_attention", flex_mask), ("veomni_sdpa", sdpa_mask), ("veomni_eager", sdpa_mask)),
+)
 def test_hf_create_causal_mask_with_ulysses_uses_global_lengths(monkeypatch, impl, module):
     """HF takes ``kv_length`` from the unsliced 2D mask, while Q stays the local shard."""
     _patch_mask_ulysses(monkeypatch, module, apply=True)
@@ -196,7 +204,12 @@ def test_hf_create_causal_mask_with_ulysses_uses_global_lengths(monkeypatch, imp
 
     mask = create_causal_mask(config, local_embeds, full_2d, None, torch.arange(4).unsqueeze(0))
 
-    visible = flex_visible(mask, 8, 8) if impl == "veomni_flex_attention" else mask[0, 0]
+    if impl == "veomni_flex_attention":
+        visible = flex_visible(mask, 8, 8)
+    elif impl == "veomni_eager":
+        visible = mask[0, 0] == 0
+    else:
+        visible = mask[0, 0]
     torch.testing.assert_close(visible, torch.ones(8, 8, dtype=torch.bool).tril() & full_2d)
 
 
@@ -215,6 +228,12 @@ def test_hf_create_causal_mask_with_ulysses_uses_global_lengths(monkeypatch, imp
             torch.ones(1, 4, dtype=torch.bool),
             "post-Ulysses key length",
         ),
+        (
+            eager_attention_mask_builder,
+            sdpa_mask,
+            torch.ones(1, 4, dtype=torch.bool),
+            "post-Ulysses key length",
+        ),
     ],
 )
 def test_flex_and_sdpa_ulysses_reject_incomplete_2d_mask(monkeypatch, builder, module, attention_mask, match):
@@ -228,6 +247,7 @@ def test_flex_and_sdpa_ulysses_reject_incomplete_2d_mask(monkeypatch, builder, m
     (
         (flex_attention_mask_builder, flex_mask),
         (sdpa_attention_mask_builder, sdpa_mask),
+        (eager_attention_mask_builder, sdpa_mask),
     ),
 )
 def test_flex_and_sdpa_ulysses_allow_canonical_mask_without_metadata(monkeypatch, builder, module):
@@ -241,6 +261,7 @@ def test_flex_and_sdpa_ulysses_allow_canonical_mask_without_metadata(monkeypatch
     (
         (flex_attention_mask_builder, flex_mask),
         (sdpa_attention_mask_builder, sdpa_mask),
+        (eager_attention_mask_builder, sdpa_mask),
     ),
 )
 def test_flex_and_sdpa_ulysses_reject_custom_mask_without_metadata(monkeypatch, builder, module):
@@ -254,16 +275,61 @@ def test_flex_and_sdpa_ulysses_reject_custom_mask_without_metadata(monkeypatch, 
     (
         (flex_attention_mask_builder, flex_mask),
         (sdpa_attention_mask_builder, sdpa_mask),
+        (eager_attention_mask_builder, sdpa_mask),
     ),
 )
 def test_flex_and_sdpa_ulysses_allow_sliding_window_without_metadata(monkeypatch, builder, module):
     _patch_mask_ulysses(monkeypatch, module, apply=True)
     mask = builder(1, 4, 4, sliding_window=2, device="cpu")
     assert tuple(mask.shape[-2:]) == (8, 8)
-    visible = flex_visible(mask, 8, 8) if builder is flex_attention_mask_builder else mask[0, 0]
+    if builder is flex_attention_mask_builder:
+        visible = flex_visible(mask, 8, 8)
+    elif builder is eager_attention_mask_builder:
+        visible = mask[0, 0] == 0
+    else:
+        visible = mask[0, 0]
     positions = torch.arange(8)
     distance = positions[:, None] - positions[None, :]
     torch.testing.assert_close(visible, (distance >= 0) & (distance < 2))
+
+
+@pytest.mark.parametrize("order", ("overlay-first", "canonical-first"))
+@pytest.mark.parametrize("bidirectional", (False, True))
+def test_ulysses_accepts_sliding_window_composition_in_either_order(monkeypatch, order, bidirectional):
+    """Both ``and_masks`` orders are the same canonical sliding-window pattern."""
+    from transformers.masking_utils import (
+        and_masks,
+        bidirectional_mask_function,
+        causal_mask_function,
+        sliding_window_bidirectional_overlay,
+        sliding_window_overlay,
+    )
+
+    _patch_mask_ulysses(monkeypatch, sdpa_mask, apply=True)
+    base = bidirectional_mask_function if bidirectional else causal_mask_function
+    overlay = sliding_window_bidirectional_overlay(2) if bidirectional else sliding_window_overlay(2)
+    parts = (overlay, base) if order == "overlay-first" else (base, overlay)
+    mask = sdpa_attention_mask_builder(1, 4, 4, device="cpu", mask_function=and_masks(*parts))
+    assert mask is not None
+    assert tuple(mask.shape[-2:]) == (8, 8)
+
+
+@pytest.mark.parametrize("impl", ("veomni_sdpa", "veomni_eager"))
+def test_hf_create_sliding_window_causal_mask_with_ulysses_without_metadata(monkeypatch, impl):
+    """Transformers' sliding-window helper composes a canonical pattern that expands under Ulysses without a 2D mask."""
+    _patch_mask_ulysses(monkeypatch, sdpa_mask, apply=True)
+    config = PreTrainedConfig(sliding_window=3)
+    config._attn_implementation = impl
+    local_embeds = torch.randn(1, 4, 16)
+
+    mask = create_sliding_window_causal_mask(config, local_embeds, None, None)
+
+    assert mask is not None
+    assert tuple(mask.shape) == (1, 1, 8, 8)
+    visible = mask[0, 0] == 0 if impl == "veomni_eager" else mask[0, 0]
+    positions = torch.arange(8)
+    distance = positions[:, None] - positions[None, :]
+    torch.testing.assert_close(visible, (distance >= 0) & (distance < 3))
 
 
 def test_magi_hf_builder_expands_ulysses_local_lengths(monkeypatch):

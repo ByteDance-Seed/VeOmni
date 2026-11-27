@@ -86,6 +86,10 @@ def test_shape_masks_treat_veomni_prefix_as_the_stock_name():
     aliased = causal_mask(4, 4, impl="veomni_sdpa", device="cpu")
     torch.testing.assert_close(stock, aliased)
     torch.testing.assert_close(
+        causal_mask(4, 4, impl="eager", device="cpu"),
+        causal_mask(4, 4, impl="veomni_eager", device="cpu"),
+    )
+    torch.testing.assert_close(
         flex_visible(causal_mask(4, 4, impl="flex_attention", device="cpu"), 4, 4),
         flex_visible(causal_mask(4, 4, impl="veomni_flex_attention", device="cpu"), 4, 4),
     )

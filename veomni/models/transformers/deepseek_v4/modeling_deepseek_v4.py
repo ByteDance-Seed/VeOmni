@@ -16,6 +16,7 @@
 # Base-Transformers-Version: 5.16.1
 
 from functools import partial
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -1127,102 +1128,6 @@ class DeepseekV4CSACompressor(nn.Module):
         return compressed_kv, CompressedCandidates(topk_indices=top_k_indices, indexer_scores=indexer_scores)
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-# ======================================================================
-# [PATCHED FUNCTION] eager_attention_forward
-# Reason: Always call the local dsa_attention deepseek_v4 VeomniOp
-# ======================================================================
-# ================================================================
-# Patch: eager_attention_forward
-# Hand the local dsa_attention deepseek_v4 VeomniOp the structured sparse
-# contract that DeepseekV4Attention.forward assembled, translated out of the
-# Transformers attention-interface call face.
-# ================================================================
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float | int = 0.0,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-    del value
-    output_attentions = bool(kwargs.get("output_attentions", False)) or bool(
-        getattr(module.config, "output_attentions", False)
-    )
-    compressed_kv = kwargs.get("dsa_compressed_kv")
-    # ``[B, S_kv, D]`` rows: MQA, so the single KV head is squeezed out rather
-    # than carried through the op and squeezed by each implementation.
-    compressed_rows = None if compressed_kv is None else compressed_kv[:, 0]
-    candidates = kwargs.get("dsa_compressed_candidates")
-    # ``indexer_target_width`` is how ``DeepseekV4Attention.forward`` asks for the
-    # indexer loss's teacher distribution: the width of the compressed slice it
-    # wants scored, and the signal that this call returns three values instead of
-    # two. Only that forward sets it, and only when its own gate is on.
-    target_width = kwargs.get("indexer_target_width")
-    query_rows = query.transpose(1, 2)
-    attn_result = module.veomni_dsa_attention(
-        query_rows,
-        key[:, 0],
-        compressed_rows,
-        kwargs.get("s_aux", module.sinks),
-        kwargs["dsa_position_ids"],
-        sliding_window=module.sliding_window,
-        compress_ratio=getattr(module.compressor, "compress_rate", 1),
-        candidates=candidates,
-        packed_sequence_slices=kwargs.get("packed_sequence_slices"),
-        query_offset=kwargs.get("dsa_query_offset", 0),
-        attention_mask=attention_mask,
-        sm_scale=scaling,
-        return_lse=target_width is not None,
-        dropout=dropout,
-        return_attn_weights=output_attentions,
-    )
-    if target_width is not None:
-        attn_output, lse = attn_result
-        # One forward, and the teacher reads *its* LSE. That LSE is the true CSA
-        # denominator only because the attention above scored the sliding window
-        # as well as the compressed entries and folded the sink into the same
-        # sumexp. A second forward over the compressed slice alone would produce a
-        # plausible, decreasing loss that trains the indexer toward the wrong
-        # distribution.
-        target = sparse_mqa_target_fwd(
-            query_rows.contiguous(),
-            compressed_rows.contiguous(),
-            candidates.topk_indices.to(torch.int32).contiguous(),
-            lse,
-            scaling,
-        )
-        # A row the teacher gave no mass at all goes out as exactly zero rather
-        # than as ``0 / tiny``. The two differ: dividing by the clamp raises the
-        # denominator instead of the numerator, so a row whose mass is denormal
-        # rather than zero comes back summing to something in (0, 1) -- neither a
-        # distribution nor an absence of one, and ``indexer_kl_terms`` weights it
-        # as though it were the former. Zero is the case that says "nothing to
-        # learn from this row", and the KL excludes it from both of its terms.
-        target_mass = target.sum(-1, keepdim=True)
-        tiny = torch.finfo(torch.float32).tiny
-        target = torch.where(target_mass > tiny, target / target_mass.clamp_min(tiny), 0.0)
-        return attn_output, None, target
-    if output_attentions:
-        attn_output, attn_weights = attn_result
-        return attn_output, attn_weights
-    return attn_result, None
-
-
 COMPRESSOR_CLASSES = {
     "sliding_attention": None,
     "compressed_sparse_attention": DeepseekV4CSACompressor,
@@ -1300,7 +1205,6 @@ class DeepseekV4Attention(nn.Module):
             "deepseek_v4",
             config.ops_config.dsa_attention_implementation,
         )
-        self.veomni_attn = VeomniOp("attention", "standard", config.ops_config.attn_implementation)
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_kv_round = VeomniOp(
             "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.window_kv"
@@ -1420,18 +1324,6 @@ class DeepseekV4Attention(nn.Module):
                 build_indexer_loss=build_indexer_loss,
             )
 
-        attention_interface = self.veomni_attn
-        kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
-        # What a query may read, in the terms the kernels are specified in: a sliding
-        # window over the full-resolution rows plus the compressor's own selection.
-        # Which of those an implementation expands into an explicit candidate list is
-        # the implementation's business, so none of it is decided here.
-        kwargs["dsa_compressed_kv"] = compressed_kv
-        kwargs["dsa_compressed_candidates"] = compressed_candidates
-        kwargs["dsa_position_ids"] = compressor_position_ids
-        # Query rows and KV rows coincide off the CP and decode paths; where they do
-        # not, this is what rebases a query onto its absolute full-resolution row.
-        kwargs["dsa_query_offset"] = query_offset
         if build_indexer_loss:
             index_score = compressed_candidates.indexer_scores if compressed_candidates is not None else None
             if index_score is None:
@@ -1443,35 +1335,79 @@ class DeepseekV4Attention(nn.Module):
             # The width of the compressed slice the teacher is asked for, read off the
             # *scores* so that the KL pairs slot ``j`` of the teacher with the score
             # ``index_score[..., j]``.
-            kwargs["indexer_target_width"] = index_score.shape[-1]
-            if kwargs["indexer_target_width"] != compressed_candidates.topk_indices.shape[-1]:
+            indexer_target_width = index_score.shape[-1]
+            if indexer_target_width != compressed_candidates.topk_indices.shape[-1]:
                 raise RuntimeError(
-                    f"the indexer scored {kwargs['indexer_target_width']} slots while the compressor selected "
+                    f"the indexer scored {indexer_target_width} slots while the compressor selected "
                     f"{compressed_candidates.topk_indices.shape[-1]}: the KL pairs slot j of the teacher with "
                     "index_score[..., j], so the two must be the same width"
                 )
-        attention_outputs = attention_interface(
-            self,
-            q,
-            kv,
-            kv,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
+
+        output_attentions = bool(kwargs.get("output_attentions", False)) or bool(
+            getattr(self.config, "output_attentions", False)
+        )
+        # ``[B, S_kv, D]`` rows: MQA, so the single KV head is squeezed out rather
+        # than carried through the op and squeezed by each implementation.
+        compressed_rows = None if compressed_kv is None else compressed_kv[:, 0]
+        query_rows = q.transpose(1, 2)
+        # Hand the local ``dsa_attention`` / ``deepseek_v4`` op the structured sparse
+        # contract directly: a sliding window over full-resolution rows plus the
+        # compressor's own selection. Query rows and KV rows coincide off the CP and
+        # decode paths; where they do not, ``query_offset`` rebases a query onto its
+        # absolute full-resolution row.
+        attn_result = self.veomni_dsa_attention(
+            query_rows,
+            kv[:, 0],
+            compressed_rows,
+            s_aux,
+            compressor_position_ids,
             sliding_window=self.sliding_window,
-            s_aux=s_aux,
-            **kwargs,
+            compress_ratio=getattr(self.compressor, "compress_rate", 1),
+            candidates=compressed_candidates,
+            packed_sequence_slices=kwargs.get("packed_sequence_slices"),
+            query_offset=query_offset,
+            attention_mask=attention_mask,
+            sm_scale=self.scaling,
+            return_lse=build_indexer_loss,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            return_attn_weights=output_attentions,
         )
         if build_indexer_loss:
-            attn_output, attn_weights, target = attention_outputs
+            attn_output, lse = attn_result
+            attn_weights = None
+            # One forward, and the teacher reads *its* LSE. That LSE is the true CSA
+            # denominator only because the attention above scored the sliding window
+            # as well as the compressed entries and folded the sink into the same
+            # sumexp. A second forward over the compressed slice alone would produce a
+            # plausible, decreasing loss that trains the indexer toward the wrong
+            # distribution.
+            target = sparse_mqa_target_fwd(
+                query_rows.contiguous(),
+                compressed_rows.contiguous(),
+                compressed_candidates.topk_indices.to(torch.int32).contiguous(),
+                lse,
+                self.scaling,
+            )
+            # A row the teacher gave no mass at all goes out as exactly zero rather
+            # than as ``0 / tiny``. The two differ: dividing by the clamp raises the
+            # denominator instead of the numerator, so a row whose mass is denormal
+            # rather than zero comes back summing to something in (0, 1) -- neither a
+            # distribution nor an absence of one, and ``indexer_kl_terms`` weights it
+            # as though it were the former. Zero is the case that says "nothing to
+            # learn from this row", and the KL excludes it from both of its terms.
+            target_mass = target.sum(-1, keepdim=True)
+            tiny = torch.finfo(torch.float32).tiny
+            target = torch.where(target_mass > tiny, target / target_mass.clamp_min(tiny), 0.0)
             kl_terms, uniform_terms = indexer_kl_terms(index_score, target)
             indexer_kl = kl_terms.sum()
             # Summed over exactly the rows the KL is summed over, so the two travel the
             # whole way to the metric through the same denominators and the ratio taken at
             # the end is a ratio of means.
             indexer_uniform = uniform_terms.sum()
+        elif output_attentions:
+            attn_output, attn_weights = attn_result
         else:
-            attn_output, attn_weights = attention_outputs
+            attn_output, attn_weights = attn_result, None
 
         if ulysses_enabled and not cp_enabled:
             # eager/TileLang return [B, S_full, H_local, D]; restore local seq + full heads.
@@ -2178,8 +2114,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 # the wrong rows.
                 mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
                 mask_position_ids = full_position_ids
+            # ``DeepseekV4Model`` already constructs full-sequence ``mask_embeds`` when
+            # SP is enabled because ``veomni_dsa_attention`` consumes the full-width 4D
+            # additive mask directly; pin the mask builder to ``"eager"`` so Ulysses SP
+            # does not scale ``q_length``/``kv_length`` a second time.
+            mask_config = SimpleNamespace(
+                _attn_implementation="eager",
+                sliding_window=self.config.sliding_window,
+                is_causal=getattr(self.config, "is_causal", True),
+            )
             causal_mask = create_sliding_window_causal_mask(
-                config=self.config,
+                config=mask_config,
                 inputs_embeds=mask_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,

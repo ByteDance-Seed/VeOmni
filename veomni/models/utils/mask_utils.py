@@ -130,8 +130,7 @@ def _is_prebuilt_mask(attention_mask: Tensor | BlockMask | MagiAttentionMask | N
 
 def _resolve_skip_ulysses(attn_impl: str, extra_kwargs: dict[str, Any]) -> bool:
     """Return whether mask construction should keep rank-local sequence lengths."""
-    canonical = attn_impl.removeprefix("veomni_")
-    return bool(extra_kwargs.get("skip_ulysses", False)) or canonical == "eager"
+    return bool(extra_kwargs.get("skip_ulysses", False)) or attn_impl == "eager"
 
 
 def _validate_existing_4d_mask(existing_4d: Tensor, q_len: int, attn_impl: str, extra_kwargs: dict[str, Any]) -> None:

@@ -148,7 +148,7 @@ from veomni.models import get_veomni_config_class
 
 Config = get_veomni_config_class(LlamaConfig)
 config = Config(ops_implementation={"attn_implementation": "eager"})
-assert config.ops_config.attn_implementation == "eager"
+assert config.ops_config.attn_implementation == "veomni_eager"
 ```
 
 Generated model specs replace the HF model base import with the VeOmni base:

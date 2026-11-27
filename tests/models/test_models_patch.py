@@ -262,10 +262,17 @@ def _verify_selected_ops(model: torch.nn.Module, mode: ModelMode, config: OpsImp
         assert moe_impls == [mode.moe_implementation], (
             f"[{mode}] moe_experts should use {mode.moe_implementation!r}, got {moe_impls}"
         )
-    attn_impls = {handle.impl for handle in handles["attention"]}
-    assert mode.attn_implementation in attn_impls, (
-        f"[{mode}] no attention handle uses {mode.attn_implementation!r}, got {sorted(attn_impls)}"
-    )
+    assert handles["attention"] or handles["dsa_attention"], f"[{mode}] model holds no attention handles"
+    if handles["attention"]:
+        attn_impls = {handle.impl for handle in handles["attention"]}
+        assert config.attn_implementation in attn_impls, (
+            f"[{mode}] no attention handle uses {config.attn_implementation!r}, got {sorted(attn_impls)}"
+        )
+    if handles["dsa_attention"]:
+        dsa_impls = {handle.impl for handle in handles["dsa_attention"]}
+        assert config.dsa_attention_implementation in dsa_impls, (
+            f"[{mode}] no dsa_attention handle uses {config.dsa_attention_implementation!r}, got {sorted(dsa_impls)}"
+        )
 
 
 # --- Data and comparison -----------------------------------------------------------

@@ -43,6 +43,7 @@ logger = logging.get_logger(__name__)
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4", "qwen4_exp"})
 
 _VEOMNI_SP_ATTN = (
+    "veomni_eager",
     "veomni_flex_attention",
     "veomni_magi_attention",
     "veomni_flash_attention_2",
@@ -178,6 +179,7 @@ def build_foundation_model(
             "flex_attention",
             "aiter",
             "magi_attention",
+            "veomni_eager",
             "veomni_flash_attention_2",
             "veomni_flash_attention_2_hub",
             "veomni_flash_attention_3",

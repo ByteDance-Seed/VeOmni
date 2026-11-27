@@ -42,6 +42,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
@@ -222,43 +223,6 @@ class GlmMoeDsaIndexer(nn.Module):
         ).to(torch.int32)
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-
 def yarn_get_mscale(scale=1, mscale=1):
     if scale <= 1:
         return 1.0
@@ -358,10 +322,10 @@ class GlmMoeDsaAttention(nn.Module):
             # only the eager and SDPA rows consume; any other row would silently
             # run dense attention.
             attn_impl = config.ops_config.attn_implementation
-            if attn_impl not in ("eager", "sdpa", "veomni_sdpa"):
+            if attn_impl not in ("eager", "veomni_eager", "sdpa", "veomni_sdpa"):
                 raise ValueError(
                     "GLM-MoE-DSA with dsa_attention_implementation='eager' requires attn_implementation "
-                    f"'eager' or 'sdpa', got {attn_impl!r}."
+                    f"'eager', 'veomni_eager', 'sdpa', or 'veomni_sdpa', got {attn_impl!r}."
                 )
             self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
 
@@ -415,6 +379,14 @@ class GlmMoeDsaAttention(nn.Module):
 
         eager_attention = self.veomni_dsa_attention.impl == "eager"
         if eager_attention:
+            if should_apply_ulysses(skip_ulysses=False):
+                # Top-k indices address the local sequence. Gathering Q/K/V inside
+                # attention leaves this mask too small, and skip_ulysses would only
+                # attend inside each rank.
+                raise ValueError(
+                    "GLM-MoE-DSA eager top-k attention does not support Ulysses sequence parallelism; "
+                    "the top-k mask uses local sequence coordinates and cannot be applied to gathered Q/K/V."
+                )
             # Eager keeps Hugging Face's expanded MLA: kv_b_proj K/V on the cache and
             # standard attention over the top-k mask, so it matches HF bitwise.
             query_states = torch.cat((q_nope, q_pe), dim=-1)

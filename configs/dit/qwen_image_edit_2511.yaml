@@ -9,14 +9,14 @@ model:
   condition_model_cfg:
     enable_edit: true
     processor_path: /path/to/Qwen-Image-Edit-2511
-    text_encoder_attn_implementation: eager
+    text_encoder_attn_implementation: sdpa
     max_sequence_length: 512
     height: 1024
     width: 1024
     training_recipe: diffsynth
     image_resize_mode: center_crop
   ops_implementation:
-    attn_implementation: eager
+    attn_implementation: sdpa
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
     gated_mlp_implementation: eager

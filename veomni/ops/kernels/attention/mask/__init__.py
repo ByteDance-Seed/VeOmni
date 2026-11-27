@@ -14,6 +14,7 @@
 
 """Mask builders. Not registered on ``OP_REGISTRY``."""
 
+from .eager import eager_attention_mask_builder
 from .flash import flash_attention_mask_builder
 from .flex import flex_attention_mask_builder
 from .magi import MagiAttentionMask, magi_attention_mask_builder
@@ -24,6 +25,7 @@ from .shape import causal_mask, packed_causal_mask, sliding_window_mask
 __all__ = [
     "MagiAttentionMask",
     "causal_mask",
+    "eager_attention_mask_builder",
     "magi_attention_mask_builder",
     "flash_attention_mask_builder",
     "flex_attention_mask_builder",

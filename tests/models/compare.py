@@ -298,7 +298,10 @@ def assert_sequence_classification_matches_hf(ours: torch.nn.Module, *, supervis
         torch.testing.assert_close(pooled.loss, reference_loss, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     output = ours(input_ids=input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
-    torch.testing.assert_close(output.logits, reference_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    # Left-padding queries can be fully blocked. veomni_eager zeroes those rows;
+    # HF eager softmaxes them uniformly. Compare tokens the mask keeps visible.
+    visible = attention_mask.bool()
+    torch.testing.assert_close(output.logits[visible], reference_logits[visible], atol=EAGER_ATOL, rtol=EAGER_RTOL)
     torch.testing.assert_close(output.loss, reference_loss, atol=EAGER_ATOL, rtol=EAGER_RTOL)
     reference_loss.backward()
     output.loss.backward()

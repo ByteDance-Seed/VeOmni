@@ -79,7 +79,8 @@ def batch(glyph=False):
     ("initial_attention", "constructor_kwargs", "expected_attention"),
     [
         pytest.param("flash_attention_2", {"attn_implementation": "sdpa"}, "sdpa", id="override-sdpa"),
-        pytest.param("flash_attention_2", {"attn_implementation": "eager"}, "eager", id="override-eager"),
+        pytest.param("flash_attention_2", {"attn_implementation": "eager"}, None, id="reject-eager"),
+        pytest.param("flash_attention_2", {"attn_implementation": "veomni_eager"}, None, id="reject-veomni-eager"),
         pytest.param(
             "flash_attention_2", {"attn_implementation": "veomni_sdpa"}, "veomni_sdpa", id="override-veomni-sdpa"
         ),
@@ -111,7 +112,7 @@ def test_constructor_attention_uses_config_before_hf_init(
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("attention", [None, "eager", "veomni_sdpa"])
+@pytest.mark.parametrize("attention", [None, "veomni_sdpa"])
 def test_dense_attention_ops_config_roundtrip(monkeypatch, tmp_path, attention):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     config = tiny_config()
@@ -158,7 +159,7 @@ def test_condition_construction_preserves_component_dtypes(
             condition_dtype="float32", ops_implementation={"attn_implementation": "eager"}
         ).save_pretrained(tmp_path)
         config = HunyuanVideo15ConditionConfig.from_pretrained(tmp_path, **overrides)
-        assert config.ops_config.attn_implementation == "eager"
+        assert config.ops_config.attn_implementation == "veomni_eager"
     elif config_source == "from_pretrained":
         (tmp_path / "config.json").write_text("{}")
         config = HunyuanVideo15ConditionConfig.from_pretrained(tmp_path, **overrides)
@@ -906,7 +907,7 @@ def test_foundation_loader_preserves_native_weights(tmp_path):
             weights_path=str(tmp_path),
             torch_dtype="float32",
             init_device="cpu",
-            ops_implementation=make_eager_ops_config(),
+            ops_implementation=make_eager_ops_config(attn_implementation="sdpa"),
         ).eval()
     finally:
         torch.distributed.destroy_process_group()
@@ -1049,7 +1050,7 @@ def test_full_backbone_npu():
     torch.manual_seed(42)
     with torch.device(get_device_type(), 0):
         model = HunyuanVideo15Model._from_config(
-            HunyuanVideo15Config(), dtype=torch.bfloat16, attn_implementation="eager"
+            HunyuanVideo15Config(), dtype=torch.bfloat16, attn_implementation="sdpa"
         )
         initialize_nonzero_linears(model)
     assert sum(p.numel() for p in model.parameters()) == 8326608160

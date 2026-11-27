@@ -654,8 +654,8 @@ For diffusers models this is done via an **attention processor** installed with
 
 1. In `YourSPAttnProcessor.__init__(self, config=None)`, read the attention
    implementation from `config.ops_config` and bind an instance-local `VeomniOp`
-   handle. The registered `eager` row forwards to `veomni_sdpa` when the module's
-   defining file has no local `eager_attention_forward`:
+   handle. The registered `eager` and `veomni_eager` rows execute the
+   pure-PyTorch eager attention kernel under `veomni/ops/kernels/attention/standard/eager.py`:
 
    ```python
    from types import SimpleNamespace

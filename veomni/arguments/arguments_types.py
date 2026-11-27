@@ -1575,6 +1575,7 @@ class OpsImplementationConfig:
             "magi_attention",
             "sage_attention",
             "native-sparse",
+            "veomni_eager",
             "veomni_flash_attention_2",
             "veomni_flash_attention_2_hub",
             "veomni_flash_attention_3",
@@ -1589,7 +1590,7 @@ class OpsImplementationConfig:
     ] = field(
         default="flash_attention_2",
         metadata={
-            "help": "Attention implementation. Short names (flash_attention_2, flex_attention, "
+            "help": "Attention implementation. Short names (eager, flash_attention_2, flex_attention, "
             "aiter, magi_attention, sage_attention, sdpa) rewrite to the matching veomni_* adapter when "
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
@@ -1853,6 +1854,7 @@ class OpsImplementationConfig:
         }.get(implementation, implementation)
         if veomni_names and get_env("MODELING_BACKEND") == "veomni":
             return {
+                "eager": "veomni_eager",
                 "flash_attention_2": "veomni_flash_attention_2",
                 "flash_attention_3": "veomni_flash_attention_3",
                 "flash_attention_4": "veomni_flash_attention_4",

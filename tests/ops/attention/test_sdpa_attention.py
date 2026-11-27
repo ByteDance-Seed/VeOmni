@@ -95,8 +95,6 @@ _MAX_LENGTH_KEYS = ("max_length_q", "max_length_k", "max_seqlen_q", "max_seqlen_
 def _sdpa_forward(entrypoint):
     if entrypoint == "adapter":
         return sdpa_backend.sdpa_attention_forward
-    if entrypoint == "eager_sdpa":
-        return VeomniOp("attention", "standard", "eager")
     return VeomniOp("attention", "standard", entrypoint)
 
 
@@ -171,7 +169,7 @@ def test_sdpa_accepts_packing_isolated_by_dense_mask(entrypoint):
     torch.testing.assert_close(output[0, 2], query[0, :, 2], rtol=ATTN_RTOL, atol=ATTN_ATOL)
 
 
-@pytest.mark.parametrize("entrypoint", ("sdpa", "veomni_sdpa", "adapter", "eager", "eager_sdpa"))
+@pytest.mark.parametrize("entrypoint", ("sdpa", "veomni_sdpa", "adapter"))
 @pytest.mark.parametrize("is_causal", (False, True))
 @pytest.mark.parametrize(
     "metadata_keys",
@@ -192,26 +190,11 @@ def test_sdpa_splits_unmasked_packed_cu_seqlens(entrypoint, is_causal, metadata_
     grad_out = torch.randn(1, 9, 4, 8, generator=generator)
     scaling = 8**-0.5
 
-    module = SimpleNamespace(training=False) if entrypoint == "eager_sdpa" else _FakeAttentionModule()
+    module = _FakeAttentionModule()
     module.is_causal = is_causal
     module.num_key_value_groups = 2
     forward = _sdpa_forward(entrypoint)
     metadata = dict.fromkeys(metadata_keys, cu_seqlens) | {"max_length_q": 4, "max_length_k": 4}
-
-    if entrypoint == "eager" and is_causal:
-        with pytest.raises(ValueError, match="does not support is_causal=True"):
-            forward(
-                module,
-                query,
-                key,
-                value,
-                None,
-                dropout=0.0,
-                scaling=scaling,
-                is_causal=True,
-                **metadata,
-            )
-        return
 
     ref_q, ref_k, ref_v = clone_qkv(query, key, value)
     q_splits = torch.split(ref_q, lengths, dim=2)
@@ -403,7 +386,7 @@ def test_sdpa_attention_rejects_softcap():
         )
 
 
-@pytest.mark.parametrize("entrypoint", ("adapter", "eager"))
+@pytest.mark.parametrize("entrypoint", ("adapter", "veomni_sdpa"))
 def test_sdpa_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch, entrypoint):
     group = object()
     state = SimpleNamespace(ulysses_group=group, ulysses_size=2)
@@ -639,7 +622,7 @@ def test_sdpa_builder_preserves_visibility_and_gradients(mask_case, padding, req
         torch.testing.assert_close(actual_gradient, reference_gradient, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.parametrize("entrypoint", ("adapter", "eager"))
+@pytest.mark.parametrize("entrypoint", ("adapter", "veomni_sdpa"))
 @pytest.mark.parametrize("mask_case", ("causal", "full", "2d_mask"))
 def test_sdpa_attention_matches_math_reference(mask_case, entrypoint):
     sequence_length = 32

@@ -297,9 +297,9 @@ def test_ltx_automatic_eager_binds_registered_eager():
     config._set_ops_implementation(eager_ops_config())
     adapter = AttentionFunction.AUTOMATIC.to_callable(config=config)
     masked = MaskedAttentionFunction.AUTOMATIC.to_callable(config=config)
-    assert adapter.veomni_attn.impl == "eager"
+    assert adapter.veomni_attn.impl == "veomni_eager"
     assert adapter.veomni_attn_masked is adapter.veomni_attn
-    assert masked.veomni_attn.impl == "eager"
+    assert masked.veomni_attn.impl == "veomni_eager"
 
 
 def test_ltx_adapter_expands_mask_and_skips_ulysses():

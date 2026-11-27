@@ -227,6 +227,7 @@ def test_qwen3_5_moe_attention_binds_ops_and_runs_eager_forward_without_npu_varl
     from veomni.models.transformers.qwen3_5_moe import modeling_qwen3_5_moe as modeling
     from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
 
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     recorded: list[dict[str, object]] = []
 
     def fake_precompute(**kwargs):
@@ -240,7 +241,7 @@ def test_qwen3_5_moe_attention_binds_ops_and_runs_eager_forward_without_npu_varl
     model = modeling.Qwen3_5MoeForCausalLM(config).eval()
     attn = model.model.layers[0].self_attn
     assert attn.veomni_rope.impl == "eager"
-    assert attn.veomni_attn.impl == "eager"
+    assert attn.veomni_attn.impl == "veomni_eager"
     assert attn.q_norm.veomni_rms_norm.impl == "eager"
     assert attn.k_norm.veomni_rms_norm.impl == "eager"
 

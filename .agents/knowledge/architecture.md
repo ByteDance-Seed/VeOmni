@@ -247,8 +247,8 @@ after dictionary changes; runtime caches are excluded from exports. Child defaul
 resets use `null` markers in saved ops diffs to block parent inheritance on reload.
 
 Modeling passes `config.ops_config.<field>` directly to `VeomniOp`. The attention
-`eager` row uses model-local eager math when present and otherwise forwards to
-`veomni_sdpa`. On NPU, unweighted RMSNorm supports only `eager`; explicit
+`eager` row forwards to `veomni_eager`
+(`veomni/ops/kernels/attention/standard/eager.py`). On NPU, unweighted RMSNorm supports only `eager`; explicit
 `torch_npu`/`npu` is rejected rather than remapped across variants.
 
 MiniMax M3 sparse layers call two packed operators in sequence.

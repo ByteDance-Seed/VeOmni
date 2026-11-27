@@ -55,7 +55,7 @@ _PACKED_FLASH_BACKENDS = (
 
 
 def _veomni_attn_impl(attn_implementation: str | None) -> str | None:
-    if attn_implementation in (None, "eager", "sdpa", "veomni_sdpa"):
+    if attn_implementation in (None, "eager", "veomni_eager", "sdpa", "veomni_sdpa"):
         return None
     if attn_implementation.startswith("flash_attention_"):
         return f"veomni_{attn_implementation}"
@@ -161,7 +161,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
     def _load_packed_attention_kernel(self):
         implementation = self._packed_attn_implementation
-        if implementation in (None, "eager", "sdpa", "veomni_sdpa"):
+        if implementation in (None, "eager", "veomni_eager", "sdpa", "veomni_sdpa"):
             return
         impl = _veomni_attn_impl(implementation)
         if impl is None or implementation not in _PACKED_FLASH_BACKENDS:

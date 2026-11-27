@@ -158,12 +158,12 @@ def test_wan_t2v_flash_kernel_passes_full_sequence_varlen_kwargs(monkeypatch, av
     assert captured["cu_seq_lens_k"].tolist() == [0, 8, 16]
 
 
-def test_wan_t2v_registered_eager_runs_through_sdpa():
-    """The processor retains eager selection and its registered row executes SDPA."""
+def test_wan_t2v_registered_eager_runs_through_veomni_eager():
+    """The processor normalizes eager selection to veomni_eager."""
     model = _build_ours(_tiny_config(), eager_ops_config()).to(dtype=torch.bfloat16)
     attn = model.blocks[0].attn1
     processor = attn.processor
-    assert processor.veomni_attn.impl == "eager"
+    assert processor.veomni_attn.impl == "veomni_eager"
     assert not processor._use_flash
 
     hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)

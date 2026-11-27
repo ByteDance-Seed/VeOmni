@@ -11,7 +11,7 @@ model:
     train_timestep_shift: 3.0
     max_text_length: 1000
   ops_implementation:
-    attn_implementation: eager
+    attn_implementation: sdpa
     rotary_pos_emb_implementation: eager
   optimizer:
     type: adamw

@@ -332,6 +332,7 @@ def test_qwen3_5_attention_binds_ops_and_runs_eager_forward_without_npu_varlen_h
         recorded.append(kwargs)
         return ([0, 6], None, None)
 
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     monkeypatch.setattr(fla_npu, "precompute_varlen_metadata", fake_precompute)
     torch.manual_seed(0)
     config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
@@ -339,7 +340,7 @@ def test_qwen3_5_attention_binds_ops_and_runs_eager_forward_without_npu_varlen_h
     model = modeling.Qwen3_5ForCausalLM(config).eval()
     attn = model.model.layers[0].self_attn
     assert attn.veomni_rope.impl == "eager"
-    assert attn.veomni_attn.impl == "eager"
+    assert attn.veomni_attn.impl == "veomni_eager"
     assert attn.q_norm.veomni_rms_norm.impl == "eager"
     assert attn.k_norm.veomni_rms_norm.impl == "eager"
 

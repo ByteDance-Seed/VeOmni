@@ -167,6 +167,7 @@ selection is known; do not bypass its dataclass constructor or introduce an
 ambient validation context. Caches stay out of saved config dictionaries.
 
 Pass selections directly to the owning variant. On NPU, unweighted RMSNorm
-supports only `eager`; explicit `torch_npu`/`npu` must raise. The attention
-`eager` row preserves model-local eager math when present and otherwise
-forwards to `veomni_sdpa`; consumers do not remap eager themselves.
+supports only `eager`; explicit `torch_npu`/`npu` must raise. Under
+`MODELING_BACKEND=veomni`, `OpsImplementationConfig` normalizes `eager` to
+`veomni_eager`, and the registered `eager` and `veomni_eager` rows execute the
+pure-PyTorch implementation in `veomni/ops/kernels/attention/standard/eager.py`.

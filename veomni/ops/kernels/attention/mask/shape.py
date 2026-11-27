@@ -26,6 +26,7 @@ from transformers.masking_utils import (
 )
 
 from ..ulysses import effective_sequence_lengths
+from .eager import _to_eager_additive
 from .flash import flash_attention_mask_builder
 from .flex import flex_attention_mask_builder
 from .magi import MagiAttentionMask, magi_attention_mask_builder
@@ -72,18 +73,6 @@ def _compose_or_and(kwargs: dict[str, Any], *, compose_overlays: bool = True) ->
     extra["mask_function"] = mask_function
     extra.pop("device", None)
     return extra
-
-
-def _to_eager_additive(mask: torch.Tensor | None, dtype: torch.dtype) -> torch.Tensor | None:
-    """HF eager adds the mask onto scores, so keep 0 / ``finfo.min`` rather than bool."""
-    if mask is None:
-        return None
-    if mask.dtype.is_floating_point:
-        return mask
-    if mask.dtype != torch.bool:
-        mask = mask != 0
-    min_dtype = torch.finfo(dtype).min
-    return torch.where(mask, torch.zeros((), device=mask.device, dtype=dtype), min_dtype)
 
 
 def _require_canonical_causal(

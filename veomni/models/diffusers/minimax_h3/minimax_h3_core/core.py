@@ -61,5 +61,9 @@ def is_flash_attn_impl(impl: str) -> bool:
 
 
 def is_sdpa_attn_impl(impl: str) -> bool:
-    """True when MiniMax attention uses the SDPA path, including its eager row."""
-    return impl in ("eager", "sdpa", "veomni_sdpa")
+    """True when packed segments should use ``F.scaled_dot_product_attention``.
+
+    ``eager`` and ``veomni_eager`` stay on ``minimax_attention`` so the bound
+    VeOmni kernel runs.
+    """
+    return impl in ("sdpa", "veomni_sdpa")

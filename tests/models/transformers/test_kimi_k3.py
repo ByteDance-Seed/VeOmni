@@ -63,6 +63,7 @@ from veomni.distributed.parallel_state import get_parallel_state, init_parallel_
 from veomni.distributed.sequence_parallel.data import sp_pad_and_slice
 from veomni.models.auto import build_foundation_model
 from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
+    KimiMLAAttention,
     _shard_dim0_offset_length,
 )
 from veomni.ops.registry import VeomniOp
@@ -707,8 +708,8 @@ def test_vlm_attention_override_preserves_child_selections():
     # root selection written without the setter's tree-wide recursion
     cfg.ops_implementation["attn_implementation"] = "veomni_sage_attention"
     model = build_foundation_model(cfg, torch_dtype="float32", init_device="cpu")
-    assert model.config.text_config._attn_implementation == "eager"
-    assert model.config.vision_config._attn_implementation == "eager"
+    assert model.config.text_config._attn_implementation == "veomni_eager"
+    assert model.config.vision_config._attn_implementation == "veomni_eager"
 
     # an sdpa-flavored selection on the vision child itself (raw dict
     # spelling -- both the normalizing setter and HF's own 'sdpa'
@@ -860,6 +861,40 @@ def test_chunk_kda_handles_are_instance_local():
         assert attn_2.veomni_chunk_kda is handle
     finally:
         attn_1.veomni_chunk_kda = handle
+
+
+def test_kimi_mla_veomni_eager_keeps_full_sequence_mask_under_sp(monkeypatch):
+    """A full-sequence 4D mask still restricts keys when SP routes through veomni_eager."""
+    from types import SimpleNamespace
+
+    import veomni.models.transformers.kimi_k3.modeling_kimi_k3 as kimi_modeling
+
+    config = _tiny_linear_config()
+    config._attn_implementation = "veomni_eager"
+    attention = KimiMLAAttention(config, 0).eval()
+    attention.veomni_attn = VeomniOp("attention", "standard", "veomni_eager")
+    hidden = torch.randn(1, 4, config.hidden_size)
+    query_idx = torch.arange(4)[:, None]
+    key_idx = torch.arange(4)[None, :]
+    visible = key_idx <= query_idx
+    visible[:, 1] = False
+    mask = torch.zeros(1, 1, 4, 4)
+    mask = mask.masked_fill(~visible, torch.finfo(mask.dtype).min)
+
+    def run(sp_enabled: bool) -> torch.Tensor:
+        monkeypatch.setattr(
+            kimi_modeling,
+            "get_parallel_state",
+            lambda: SimpleNamespace(sp_enabled=sp_enabled, ulysses_size=1),
+        )
+        return attention(hidden, attention_mask=mask)
+
+    with torch.no_grad():
+        reference = run(False)
+        sharded = run(True)
+        cleared = attention(hidden, attention_mask=None)
+    torch.testing.assert_close(sharded, reference)
+    assert not torch.allclose(cleared, reference)
 
 
 # ---------------------------------------------------------------------------
@@ -1294,26 +1329,23 @@ def test_vision_attention_family_removed_tower_binds_standard_row():
     model = _build_model()
     for blk in model.vision_tower.encoder.blocks:
         assert isinstance(blk.veomni_attn, VeomniOp)
-        assert blk.veomni_attn.impl == "eager"
+        assert blk.veomni_attn.impl == "veomni_eager"
 
 
 def test_vision_tower_dispatches_through_bound_op_handle():
     """The patched tower dispatches through the bound attention/standard
-    VeomniOp and is output-identical to the module-local packed eager
-    reference (the vendored math the dedicated family used to dispatch to)
-    across multimodal shapes (multi-image rows, mixed grids, video-style
-    T>1) -- round-9 review: no kernel is lost by the family removal. The
-    two paths run the same eager math with different kernels (the row goes
-    through the wrapper's per-segment split of the module-resolved
-    ``eager_attention_forward``, the reference stays packed-varlen), so the
-    comparison carries a tolerance instead of bit-equality."""
+    VeomniOp and is output-identical to a packed-varlen eager reference across
+    multimodal shapes (multi-image rows, mixed grids, video-style T>1). The two
+    paths run the same eager math (the row splits segments through
+    ``veomni_eager`` while the reference builds a full block-diagonal mask), so
+    the comparison carries a tolerance instead of bit-equality."""
+    import math
+
     model = _build_model()
     model.eval()
     for blk in model.vision_tower.encoder.blocks:
         assert isinstance(blk.veomni_attn, VeomniOp)
-        assert blk.veomni_attn.impl == "eager"
-
-    from veomni.models.transformers.kimi_k3 import modeling_kimi_k3 as k3_modeling
+        assert blk.veomni_attn.impl == "veomni_eager"
 
     grids = [[1, 4, 4], [1, 2, 2], [2, 2, 2]]
     grid_thws = torch.tensor(grids)
@@ -1321,23 +1353,23 @@ def test_vision_tower_dispatches_through_bound_op_handle():
     with torch.no_grad():
         out_handle = model.vision_tower(pixel_values, grid_thws)
 
+    def packed_eager_reference(q3: torch.Tensor, k3: torch.Tensor, v3: torch.Tensor, cu_seqlens: torch.Tensor):
+        seq_length = q3.shape[0]
+        attention_mask = torch.zeros([1, seq_length, seq_length], device=q3.device, dtype=torch.bool)
+        for i in range(1, len(cu_seqlens)):
+            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
+        q_h, k_h, v_h = q3.transpose(0, 1), k3.transpose(0, 1), v3.transpose(0, 1)
+        attn_weight = q_h @ k_h.transpose(-2, -1) / math.sqrt(q_h.shape[-1])
+        attn_weight = attn_weight.masked_fill(~attention_mask, torch.finfo(attn_weight.dtype).min)
+        attn_weight = torch.softmax(attn_weight, dim=-1, dtype=torch.float32).to(q_h.dtype)
+        return (attn_weight @ v_h).transpose(0, 1).reshape(seq_length, -1)
+
     def local_eager_adapter(module, q, k, v, **kwargs):
-        # [1, H, T, D] -> the module-local packed [T, H, D] eager reference
+        # [1, H, T, D] -> packed [T, H, D] eager reference
         q3 = q.squeeze(0).transpose(0, 1)
         k3 = k.squeeze(0).transpose(0, 1)
         v3 = v.squeeze(0).transpose(0, 1)
-        cu_q = kwargs["cu_seq_lens_q"]
-        max_len = (cu_q[1:] - cu_q[:-1]).max()
-        out = k3_modeling.eager_attention(
-            q3,
-            k3,
-            v3,
-            q_cu_seqlens=cu_q,
-            k_cu_seqlens=kwargs["cu_seq_lens_k"],
-            max_seqlen_q=max_len,
-            max_seqlen_k=max_len,
-        )
-        return out, None
+        return packed_eager_reference(q3, k3, v3, kwargs["cu_seq_lens_q"]), None
 
     saved = [blk.veomni_attn for blk in model.vision_tower.encoder.blocks]
     try:
@@ -1429,7 +1461,7 @@ def test_npu_fused_vision_attention_matches_eager_across_multimodal_shapes():
     fused_impls = {blk.veomni_attn.impl for blk in fused.vision_tower.encoder.blocks}
     eager_impls = {blk.veomni_attn.impl for blk in eager.vision_tower.encoder.blocks}
     assert fused_impls == {"veomni_flash_attention_2"}
-    assert eager_impls == {"eager"}
+    assert eager_impls == {"veomni_eager"}
 
     scenarios = [
         [[1, 4, 4]],

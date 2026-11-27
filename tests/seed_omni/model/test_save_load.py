@@ -255,7 +255,7 @@ def test_loaded_module_config_applies_slot_overwrites_with_ops_priority(tmp_path
     assert loaded.processor_config == {"packed_preprocess": True}
     assert loaded.ops_implementation == {
         "rms_norm_implementation": "eager",
-        "attn_implementation": "eager",
+        "attn_implementation": "veomni_eager",
     }
 
 
@@ -349,7 +349,7 @@ def test_from_pretrained_takes_each_module_attention_from_the_checkpoint(tmp_pat
 
     loaded = OmniModel.from_pretrained(tmp_path)
 
-    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "veomni_eager"
     assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "veomni_sdpa"
 
 
@@ -370,7 +370,7 @@ def test_a_persisted_attention_wins_over_the_callers_load_kwarg(tmp_path):
 
     loaded = OmniModel.from_pretrained(tmp_path, attn_implementation="sdpa")
 
-    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "veomni_eager"
     assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "veomni_sdpa"
 
 
@@ -396,7 +396,7 @@ def test_kernel_layers_merge_per_field_across_the_model_and_the_module(tmp_path)
 
     loaded = OmniModel.from_pretrained(tmp_path)
 
-    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "veomni_eager"
     assert loaded.config._module_configs[FAKE_A].ops_implementation["rms_norm_implementation"] == "eager"
     # The module that stated nothing still gets the model-level default.
     assert loaded.config._module_configs[FAKE_B].ops_implementation["rms_norm_implementation"] == "eager"
@@ -417,7 +417,7 @@ def test_a_module_scoped_kwarg_overrides_what_the_composition_states(tmp_path):
 
     loaded = OmniModel.from_pretrained(tmp_path, **{f"{FAKE_A}.attn_implementation": "eager"})
 
-    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "veomni_eager"
 
 
 @pytest.mark.parametrize(
@@ -501,12 +501,12 @@ def test_a_kwarg_lands_on_the_layer_it_overrides_and_is_saved_there(tmp_path):
     _state_module_ops(tmp_path / FAKE_B, {"attn_implementation": "sdpa"})
 
     loaded = OmniModel.from_pretrained(tmp_path, **{f"{FAKE_A}.attn_implementation": "eager"})
-    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
+    assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "veomni_eager"
     # The slot keeps the caller's say. The loaded module config holds the resolved kernels.
     assert loaded.config._module_entries[FAKE_A]["ops_implementation"] == {"attn_implementation": "eager"}
     assert loaded.config._module_configs[FAKE_A].ops_implementation == {
         "rms_norm_implementation": "eager",
-        "attn_implementation": "eager",
+        "attn_implementation": "veomni_eager",
     }
 
     resaved = tmp_path / "resaved"
@@ -522,7 +522,7 @@ def test_a_kwarg_lands_on_the_layer_it_overrides_and_is_saved_there(tmp_path):
     }
 
     reloaded = OmniModel.from_pretrained(resaved)
-    assert reloaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "eager"
+    assert reloaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "veomni_eager"
     assert reloaded.config._module_configs[FAKE_B].ops_implementation == {
         "rms_norm_implementation": "eager",
         "attn_implementation": "veomni_sdpa",
@@ -552,7 +552,7 @@ def test_a_kernel_block_kwarg_merges_per_field_like_any_other_layer(tmp_path):
         "attn_implementation": "sdpa",
     }
     assert loaded.get_module(FAKE_A).config.ops_implementation["attn_implementation"] == "veomni_sdpa"
-    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "eager"
+    assert loaded.get_module(FAKE_B).config.ops_implementation["attn_implementation"] == "veomni_eager"
 
 
 def test_resolving_the_config_first_loads_the_same_model(tmp_path):
@@ -1038,7 +1038,7 @@ def test_omni_typed_ops_preserve_composed_merge_precedence(tmp_path, entry):
     loader = OmniConfig.from_pretrained if entry == "direct" else build_config
     loaded = loader(tmp_path, ops_implementation=selection)
     assert loaded.ops_implementation == {"rms_norm_implementation": "eager", **selection.to_dict()}
-    assert loaded._module_configs[FAKE_A].ops_config.attn_implementation == "eager"
+    assert loaded._module_configs[FAKE_A].ops_config.attn_implementation == "veomni_eager"
     assert loaded._module_configs[FAKE_B].ops_config.attn_implementation == "veomni_sdpa"
     assert loaded._module_configs[FAKE_B].ops_config.rms_norm_implementation == "eager"
     loaded.save_pretrained(tmp_path / "resaved")
@@ -1051,8 +1051,8 @@ def test_omni_typed_ops_preserve_composed_merge_precedence(tmp_path, entry):
     ("entry_attention", "attention_kwargs", "expected_attention"),
     [
         pytest.param("flash_attention_2", {"attn_implementation": "sdpa"}, "sdpa", id="explicit-wins"),
-        pytest.param("eager", {}, "eager", id="preserve-omitted"),
-        pytest.param("eager", {"attn_implementation": None}, "eager", id="preserve-none"),
+        pytest.param("eager", {}, "veomni_eager", id="preserve-omitted"),
+        pytest.param("eager", {"attn_implementation": None}, "veomni_eager", id="preserve-none"),
     ],
 )
 def test_standalone_module_attention_applies_after_composed_ops(
