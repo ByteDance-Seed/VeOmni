@@ -21,8 +21,12 @@ import os
 import pytest
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 CONFIG_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "configs", "seed_omni")
@@ -171,7 +175,13 @@ def test_every_infer_recipe_pairs_its_graph_with_a_matching_module_list() -> Non
         assert os.path.isfile(modules_path), f"{path} has no sibling modules.yaml"
 
         spec = _spec(path)
-        used = {edge["from"].split(".")[0] for state in spec["states"].values() for edge in state["body"]}
+        used = {
+            endpoint.split(".")[0]
+            for state in spec["states"].values()
+            for edge in state["body"]
+            for endpoint in (edge["from"], edge["to"])
+            if endpoint != "end"
+        }
         with open(modules_path) as handle:
             declared = set(yaml.safe_load(handle) or {})
 

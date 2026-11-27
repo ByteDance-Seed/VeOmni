@@ -18,11 +18,15 @@ import os
 import pytest
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import GradientCheckpointingConfig
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs.base import is_end
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 from veomni.models.seed_omni.modules import OMNI_ACCELERATED_MODEL_REGISTRY
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 CONFIG_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "configs", "seed_omni")

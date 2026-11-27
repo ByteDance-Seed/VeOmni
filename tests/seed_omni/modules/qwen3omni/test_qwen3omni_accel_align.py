@@ -443,10 +443,9 @@ def _run_alignment_matrix(
     # switched globally because the objective is *not* reproducible across a
     # data-parallel split: it is a product of two per-batch means, so two ranks
     # holding one conversation each compute a different denominator than one run
-    # over both. At SP=1 the same packed batch is sharded instead of split, which
-    # leaves the term comparable, so that is the mode where the router is checked
-    # on its own. SP=1 with the objective on is covered too, but only for values
-    # that stay comparable — see the note at the comparison below.
+    # over both. At SP=1 (`dp=2`), the router objective is therefore off; at SP=2
+    # (`dp=1`), the same packed batch is sharded instead of split, so the router
+    # term stays comparable and is checked with `router=True`.
     #
     # ``sp2_skip_gather`` runs the same SP=2 batch through the shard handoff
     # instead of the gather: every producer writes only this rank's window onto
