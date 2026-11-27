@@ -42,6 +42,14 @@ def _build_ours(config, ops: SimpleNamespace | None = None, architecture: str = 
     return _glm5_cls(architecture)(config)
 
 
+def _freeze_dsa_indexers(model: torch.nn.Module) -> None:
+    """Match VeOmni's indexer freeze (no indexer_loss / @torch.no_grad forward)."""
+    for module in model.modules():
+        if module.__class__.__name__ == "Glm5NextTextIndexer":
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+
 def test_glm5_next_text_eager_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config()
@@ -52,6 +60,8 @@ def test_glm5_next_text_eager_matches_hf():
     assert ours.layers[1].self_attn.next_skip_topk
     assert ours.layers[2].self_attn.skip_topk
     ours.load_state_dict(hf.state_dict())
+    # HF keeps indexer params trainable; VeOmni freezes them (no training objective).
+    _freeze_dsa_indexers(hf)
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
     gradient_weights = torch.randn(2, 8, config.hidden_size)
