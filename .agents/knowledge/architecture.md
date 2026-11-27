@@ -251,6 +251,12 @@ Modeling passes `config.ops_config.<field>` directly to `VeomniOp`. The attentio
 `veomni_sdpa`. On NPU, unweighted RMSNorm supports only `eager`; explicit
 `torch_npu`/`npu` is rejected rather than remapped across variants.
 
+MiniMax M3 sparse layers call two packed operators in sequence.
+`minimax_sparse_indexer` selects key blocks per KV group and
+`minimax_sparse_attention` consumes those indices. Both padded attention
+backends build the token mask per KV group before applying PyTorch eager or
+Ascend fused attention.
+
 The public configuration field remains `model.ops_implementation`. Trainer and
 inference entry points pass it to the model builder as
 `ops_implementation`; changing the config field would break existing CLI

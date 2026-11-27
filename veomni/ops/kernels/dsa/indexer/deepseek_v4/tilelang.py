@@ -31,7 +31,6 @@ def wrapper(
     cu_seqlen_ke: Tensor | None = None,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     position_ids: Tensor | None = None,
-    positions_are_canonical: bool | None = None,
     require_score_grad: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Run the TileLang lighting indexer for compressed-KV selection.
@@ -45,7 +44,7 @@ def wrapper(
     ``cu_seqlen_ke`` are omitted and ``position_ids`` is given, per-query
     causal ranges are built directly without a host sync.
     """
-    del packed_sequence_slices, positions_are_canonical, require_score_grad
+    del packed_sequence_slices, require_score_grad
     if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
     if cu_seqlen_ks is None and position_ids is not None:

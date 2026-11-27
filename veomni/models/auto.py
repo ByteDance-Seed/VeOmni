@@ -102,8 +102,6 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if isinstance(config, OmniModuleConfig):
         inner_config = getattr(config, "text_config", None) or getattr(config, "vision_config", None)
         inner_model_type = getattr(inner_config, "model_type", None)
-        if inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
-            check_cp_platform_support(inner_config)
         if getattr(config, "_supports_context_parallel", False) or inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
             return
 

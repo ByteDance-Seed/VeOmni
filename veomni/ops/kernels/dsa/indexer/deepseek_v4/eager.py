@@ -56,7 +56,6 @@ def wrapper(
     cu_seqlen_ke: Tensor | None = None,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     position_ids: Tensor | None = None,
-    positions_are_canonical: bool | None = None,
     require_score_grad: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Compute HF-aligned index scores and selected compressed-KV indices.
@@ -70,7 +69,7 @@ def wrapper(
     ``position_ids = arange(S)``). ``packed_sequence_slices`` names the query
     segments those ranges came from and is unused here.
     """
-    del packed_sequence_slices, positions_are_canonical, require_score_grad
+    del packed_sequence_slices, require_score_grad
     if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
 

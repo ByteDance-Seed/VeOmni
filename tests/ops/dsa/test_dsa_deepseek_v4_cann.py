@@ -1188,10 +1188,12 @@ def test_attention_explicit_topk_idxs_delegates_to_eager_dense_sparse_attn(flash
     topk_idxs = torch.tensor([[[0, 1], [0, 1], [1, 2], [1, 2], [2, 3], [3, 4]]], dtype=torch.int32)
     sm_scale = 8**-0.5
 
+    # A non-empty compressed table would otherwise stay on the CANN kernel.
+    # Explicit topk_idxs has to take the eager path on its own.
     actual = cann_attention.wrapper(
         q,
         kv,
-        None,
+        torch.randn(1, 2, 8),
         sink,
         position_ids,
         sliding_window=4,

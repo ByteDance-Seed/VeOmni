@@ -164,6 +164,9 @@ _BUILTIN_ENTRIES = (
     ("qsa_attention", "standard", "tilelang", "cuda", _GPU_NVIDIA, ("tilelang",)),
     ("qsa_attention", "standard", "torch_npu", "npu", _NPU, ()),
     ("qsa_indexer", "standard", "eager", "any", _ANY, ()),
+    ("minimax_sparse_indexer", "standard", "eager", "any", _ANY, ()),
+    ("minimax_sparse_attention", "standard", "eager", "any", _ANY, ()),
+    ("minimax_sparse_attention", "standard", "torch_npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "eager", "any", _ANY, ()),
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),
@@ -174,6 +177,9 @@ _BUILTIN_ENTRIES = (
     ("moe_experts", "standard", "fused_mlu", "mlu", _MLU, ("apex",)),
     ("moe_experts", "gpt_oss", "eager", "any", _ANY, ()),
     ("moe_experts", "gpt_oss", "fused_quack", "cuda", _GPU_NVIDIA_SM90, ("quack",)),
+    ("moe_experts", "swiglu_oai", "eager", "any", _ANY, ()),
+    ("moe_experts", "swiglu_oai", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
+    ("moe_experts", "swiglu_oai", "fused_npu", "npu", _NPU, ()),
     ("moe_experts", "kimi_k3", "eager", "any", _ANY, ()),
     ("moe_experts", "kimi_k3", "fused_npu", "npu", _NPU, ("triton",)),
     ("moe_experts_lora", "shared", "eager", "any", _ANY, ()),
@@ -289,6 +295,7 @@ def test_builtin_entry_catalog_is_exact():
 
 
 _BUILTIN_DEFAULT_ENTRIES = {
+    ("minimax_sparse_attention", "standard", "torch_npu", "npu"),
     ("chunk_kda", "kimi_k3", "ascendc", "npu"),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
     ("cross_entropy_loss", "standard", "liger_kernel", "mlu"),
@@ -301,6 +308,8 @@ _BUILTIN_DEFAULT_ENTRIES = {
     ("moe_experts", "standard", "fused_mlu", "mlu"),
     ("moe_experts", "standard", "fused_triton", "mlu"),
     ("moe_experts", "standard", "fused_npu", "npu"),
+    ("moe_experts", "swiglu_oai", "fused_triton", "cuda"),
+    ("moe_experts", "swiglu_oai", "fused_npu", "npu"),
     ("rms_norm", "standard", "liger_kernel", "cuda"),
     ("rms_norm", "standard", "liger_kernel", "mlu"),
     ("rms_norm", "standard", "torch_npu", "npu"),

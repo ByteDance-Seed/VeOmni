@@ -50,7 +50,7 @@ when the selected implementation runs.
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
 | `gated_mlp` | `standard`, `geglu` | `eager`, `liger_kernel`; `qat` (`dtype=fp8`, SM90+), `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`) and `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100) are `standard` only. `liger_kernel` computes SiLU on `standard` and GELU-tanh on `geglu` — the variant fixes the activation, so it is not a choice on that row. Rows take the MLP **module** (`op(self, x, activation=...)`) and pick weights or projections themselves |
 | `linear` | `standard`, `grouped` | `eager`, `qat` (`dtype=fp8`, SM90+), `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`, `standard` only), `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100). Rows take the projection **module** (`op(self.q_a_proj, x)`), not a weight tensor. A non-quantizing row calls the module, so adapters work; `qat`, `torchao` and `deepgemm` read `weight` and therefore **refuse** a LoRA-wrapped projection — use `eager` for adapter training |
-| `moe_experts` | `standard`, `gpt_oss`, `kimi_k3` | `eager`, `fused_triton`, `fused_quack`, `qat` (`dtype=fp8` or `fp4`), `deepgemm` (standard, SM90/SM100), `fused_npu` (also the `kimi_k3` Situ experts), `fused_mlu` as supported by the variant |
+| `moe_experts` | `standard`, `gpt_oss`, `kimi_k3`, `swiglu_oai` | `eager`, `fused_triton`, `fused_quack`, `qat` (`dtype=fp8` or `fp4`), `deepgemm` (standard, SM90/SM100), `fused_npu` (also the `kimi_k3` Situ experts), `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `token_logprobs` | `standard` | `eager`, `flash_attn` (GPU Triton cross-entropy), `torch_npu` (Ascend NPU cross-entropy) |
@@ -63,6 +63,8 @@ when the selected implementation runs.
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 | `qsa_indexer` | `standard` | `eager` |
+| `minimax_sparse_indexer` | `standard` | `eager` |
+| `minimax_sparse_attention` | `standard` | `eager`, `torch_npu` (Ascend default) |
 
 The MLU `liger_kernel` rows reuse the CUDA adapters and use
 `MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
@@ -99,6 +101,18 @@ ReLU block scores and a visibility mask. Projections, RoPE, packed metadata,
 and the compressed-row gather stay in the model. `eager` fills invisible
 blocks with `-1.0`, which stays below ReLU scores (`>= 0`) and avoids the
 `-inf` rows that fault Ascend `TopKV2`. The NPU validity gather uses `int8`.
+
+MiniMax M3 uses two packed TND ops with `cu_seqlens` and `max_seqlen`.
+`minimax_sparse_indexer` returns sequence-local int32 block indices
+`[T, G, topk]` per query and KV group, with unused slots set to -1.
+`minimax_sparse_attention` consumes these indices and enforces token-level
+causality. Set `minimax_sparse_attention_implementation` to `eager` for the
+PyTorch reference or `torch_npu` for Ascend fusion with matching FP16/BF16 Q/K/V.
+An omitted selection uses `torch_npu` on Ascend and `eager` elsewhere. Dense
+MiniMax layers select standard attention through `attn_implementation`. MoE
+`swiglu_oai` keeps the merged gate/up layout and replaces SiLU with the clamped
+`(up + 1) * gate * sigmoid(alpha * gate)` activation on the standard fused
+Triton and NPU paths, including EP.
 
 The registry is the source of truth for the exact rows available in a given
 revision:
