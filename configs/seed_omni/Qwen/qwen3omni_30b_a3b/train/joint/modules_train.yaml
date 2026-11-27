@@ -1,7 +1,7 @@
 # Joint round: every module is declared, and nothing is frozen.
 #
-# The two single-round lists each freeze one half — `train/modules_train.yaml`
-# omits the talker and codec entirely, `train_talker/modules_train.yaml` freezes
+# The two single-round lists each freeze one half — `train/thinker/modules_train.yaml`
+# omits the talker and codec entirely, `train/talker/modules_train.yaml` freezes
 # the four thinker modules. Here all six are declared and trainable, because the
 # graph in `graph_train.yaml` carries both losses.
 #

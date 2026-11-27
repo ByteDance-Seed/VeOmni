@@ -3,9 +3,9 @@
 # Every sample has to carry both a thinker target and a talker target:
 #
 #   * supervised assistant **text** — the thinker's CE target, as in
-#     `train/data.yaml`;
+#     `train/thinker/data.yaml`;
 #   * the assistant's **speech** for that same turn — the waveform the codec
-#     turns into RVQ codes, as in `train_talker/data.yaml`.
+#     turns into RVQ codes, as in `train/talker/data.yaml`.
 #
 # `voice_assistant_talker` (`veomni/data/seed_omni/preprocess.py`) produces
 # exactly that shape: a text question, then an assistant turn carrying its text

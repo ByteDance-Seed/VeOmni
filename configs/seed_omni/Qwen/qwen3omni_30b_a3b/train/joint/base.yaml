@@ -12,25 +12,25 @@
 # Prerequisite — the same split checkpoint the two rounds use, including the
 # Mimi encoder half:
 #   python scripts/seed_omni/convert_model.py \
-#     --model_path /path/to/Qwen3-Omni-30B-A3B-Instruct \
-#     --output_dir /path/to/qwen3omni-split \
-#     --extra mimi_path=kyutai/mimi
+#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-Omni-30B-A3B-Instruct \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct \
+#     --extra mimi_path=/mnt/hdfs/veomni/models/kyutai/mimi
 #
 # Launch:
 #   bash train.sh tasks/omni/train_omni.py \
-#     configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_joint/base.yaml
+#     configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/joint/base.yaml
 #
 # The data mix has to carry both halves of a sample: supervised assistant *text*
 # (the thinker's target) and the assistant *audio* the talker learns to speak.
-# `train/data.yaml` has the text but no assistant speech; `train_talker/data.yaml`
+# `train/thinker/data.yaml` has the text but no assistant speech; `train/talker/data.yaml`
 # has the speech but its text is the transcript of the same turn, which is what
 # the thinker is scored on here. See this directory's `data.yaml`.
 
 model:
-  model_path: /path/to/qwen3omni-split
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
   model_config:
-    modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_joint/modules_train.yaml
-    train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_joint/graph_train.yaml
+    modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/joint/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/joint/graph_train.yaml
     infer_graph:
       audio_output: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_audio.yaml
       thinker_only: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_thinker_only.yaml
@@ -86,7 +86,7 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_joint/data.yaml
+  train_path: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/joint/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000

@@ -72,20 +72,24 @@ Three Qwen3-Omni specifics worth knowing before you touch the configs:
 
 Config dir: `configs/seed_omni/Qwen/qwen3omni_30b_a3b/`
 
+Three training recipes live under `train/`, each a complete, runnable launcher
+plus its own module list, graph and data mix. They are independent: nothing is
+shared by include, so every recipe can be read and run on its own.
+
 | File | Role |
 |------|------|
-| `train/base.yaml` | Launcher: `model` / `accelerator` / `data` / `train` + `infer` block. |
-| `train/modules_train.yaml` | Per-module training overrides — thinker only (`audio` / `vision` / `text_encoder` / `llm`). |
-| `train/graph_train.yaml` | Training DAG for the thinker. |
-| `train/data.yaml` | Weighted multisource data list. |
-| `train_talker/base.yaml` | Launcher for the speech round. |
-| `train_talker/modules_train.yaml` | All six modules — thinker frozen, talker the only trainee. |
-| `train_talker/graph_train.yaml` | Training DAG for the talker. |
-| `train_talker/data.yaml` | Points at the generated assistant-speech corpus (see §4). |
-| `train_joint/base.yaml` | Launcher for the joint round — thinker and talker in one backward. |
-| `train_joint/modules_train.yaml` | All six modules, nothing frozen. |
-| `train_joint/graph_train.yaml` | Training DAG carrying both the text CE and the talker CE. |
-| `train_joint/data.yaml` | The talker corpus — the one shape carrying both targets. |
+| `train/thinker/base.yaml` | Launcher: `model` / `accelerator` / `data` / `train` + `infer` block. |
+| `train/thinker/modules_train.yaml` | Per-module training overrides — thinker only (`audio` / `vision` / `text_encoder` / `llm`). |
+| `train/thinker/graph_train.yaml` | Training DAG for the thinker. |
+| `train/thinker/data.yaml` | Weighted multisource data list. |
+| `train/talker/base.yaml` | Launcher for the speech round. |
+| `train/talker/modules_train.yaml` | All six modules — thinker frozen, talker the only trainee. |
+| `train/talker/graph_train.yaml` | Training DAG for the talker. |
+| `train/talker/data.yaml` | Points at the generated assistant-speech corpus (see §4). |
+| `train/joint/base.yaml` | Launcher for the joint round — thinker and talker in one backward. |
+| `train/joint/modules_train.yaml` | All six modules, nothing frozen. |
+| `train/joint/graph_train.yaml` | Training DAG carrying both the text CE and the talker CE. |
+| `train/joint/data.yaml` | The talker corpus — the one shape carrying both targets. |
 | `infer/modules_infer_eager.yaml` | Single-process eager module list (no FSDP wrap). |
 | `infer/modules_infer_eager_audio.yaml` | The same list plus the checkpoint's speech system turn. |
 | `infer/graph_infer_audio.yaml` | Generation FSM: thinker text → talker codes → waveform. |
@@ -150,7 +154,7 @@ and the talker's sampling loop mixes `pad_token_id` with `next_tokens` without a
 device cast, so an `auto` split across GPUs dies on a `cuda:0`/`cuda:N` mismatch.
 
 ```bash
-python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/base.yaml \
+python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/base.yaml \
   --model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/modules_infer_eager_audio.yaml \
   --model.model_config.infer_type audio_output \
   --infer.prompt "Hello! Please say this sentence out loud." \
@@ -203,7 +207,7 @@ tolerance rather than bit equality.
 ## 3. Training
 
 ```bash
-bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/base.yaml \
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/base.yaml \
   --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
 ```
 
@@ -306,18 +310,18 @@ trace.
 ## 4. The talker round
 
 ```bash
-bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_talker/base.yaml \
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/talker/base.yaml \
   --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
 ```
 
-`train_talker/graph_train.yaml` has two roots, because the talker needs two
+`train/talker/graph_train.yaml` has two roots, because the talker needs two
 unrelated things: a prefill derived from the frozen thinker's pass, and the RVQ
 codes to score it against. The codec is a root — it reads the assistant's
 waveform straight off the carrier and owes nothing to the thinker.
 `qwen3omni_text_encoder.decode` is absent, unlike the thinker graph: the thinker
 is frozen here, so its text CE would build a loss with no parameter behind it.
 
-Four things to keep in mind when editing `train_talker/modules_train.yaml`:
+Four things to keep in mind when editing `train/talker/modules_train.yaml`:
 
 * Every sample must carry an assistant audio turn. The talker all-gathers its
   sharded layers once per utterance, so a partly-speech mix would give the ranks

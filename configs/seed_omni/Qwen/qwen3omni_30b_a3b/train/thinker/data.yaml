@@ -4,7 +4,7 @@
 # `voice_assistant` is the audio one — spoken question, text answer, so the clip
 # is a `role="user"` item and an input to the tower. It is not talker data: the
 # talker is trained on `role="assistant"` audio, which is a label, and no source
-# here carries any (see `../train_talker/data.yaml`). The clips are 22.05 kHz,
+# here carries any (see `../talker/data.yaml`). The clips are 22.05 kHz,
 # matching neither the tower (16 kHz) nor the codec (24 kHz), which is why the
 # data layer declares each clip's rate instead of normalising it.
 sources:
