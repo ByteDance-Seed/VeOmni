@@ -76,6 +76,7 @@ examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
 examples/minimax_h3_smoke_test.md
+examples/minimax_m3_vl.md
 examples/minimax_h3_image.md
 examples/hunyuanvideo15.md
 examples/wan2.1.md
@@ -99,6 +100,7 @@ key_features/sharded_embedding.md
 key_features/ulysses.md
 key_features/lora.md
 key_features/activation_offload.md
+key_features/torch_compile.md
 key_features/moe_router_monitor.md
 key_features/channel_loss.md
 key_features/dcp_async_save.md

@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import functools
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -26,11 +25,11 @@ from transformers import (
     PreTrainedModel,
 )
 
+from veomni.distributed.context_parallel.support import check_cp_platform_support
 from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from veomni.models.loader import get_loader
 from veomni.models.registry import get_model_config, get_model_processor
 from veomni.utils import logging
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 if TYPE_CHECKING:
@@ -97,43 +96,14 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
-    # deepseek_v4's context parallelism is validated on Ascend; every other model
-    # stays GPU-only.
-    if IS_NPU_AVAILABLE:
-        if getattr(config, "model_type", None) != "deepseek_v4":
-            raise NotImplementedError(
-                "Context parallelism is GPU-only in this release except for deepseek_v4; "
-                "set cp_size=1 on Ascend/NPU runs."
-            )
-
-        # The CANN adapters are written against one KV row per query row: sparse
-        # attention keeps the query local and the KV global and passes a nonzero
-        # ``query_offset``, and the indexer derives visibility from the query row
-        # where CP supplies explicit ``cu_seqlen`` ranges over the global
-        # sequence. Both reject the first compressed layer, so only the eager
-        # operators are admitted.
-        ops_config = config.ops_config
-        for field in ("dsa_indexer_implementation", "dsa_attention_implementation"):
-            # ``ops_config`` resolves the dataclass defaults, so an unset field
-            # reads back as its default rather than ``None``.
-            implementation = getattr(ops_config, field)
-            if implementation != "eager":
-                raise NotImplementedError(
-                    f"Context parallelism on Ascend/NPU requires {field}='eager'; got {implementation!r}. "
-                    "The CANN DeepSeek-V4 sparse attention rejects CP's local-query/global-KV geometry and "
-                    "the CANN indexer rejects CP's explicit cu_seqlen ranges, so training fails in the first "
-                    "compressed layer. Set both DSA operators to 'eager' in configs/text/deepseek_v4_npu.yaml, "
-                    "or set cp_size=1."
-                )
+    check_cp_platform_support(config)
 
     from .seed_omni.modules.module_configuration_base import OmniModuleConfig
 
     if isinstance(config, OmniModuleConfig):
-        if getattr(config, "_supports_context_parallel", False):
-            return
         inner_config = getattr(config, "text_config", None) or getattr(config, "vision_config", None)
         inner_model_type = getattr(inner_config, "model_type", None)
-        if inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
+        if getattr(config, "_supports_context_parallel", False) or inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
             return
 
     model_type = getattr(config, "model_type", None)
@@ -330,22 +300,6 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
-
-    if IS_NPU_AVAILABLE:
-        logger.info_rank0(
-            "We override the model’s forward method on NPU devices to ensure that the FA kwargs are on CPU, since the npu_fused_attention requires cpu FA kwargs"
-        )
-        original_forward = model.forward
-
-        @functools.wraps(original_forward)
-        def wrapped_forward(*args, **kwargs):
-            if "cu_seq_lens_q" in kwargs and kwargs["cu_seq_lens_q"] is not None:
-                kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_q"].cpu()
-            if "cu_seq_lens_k" in kwargs and kwargs["cu_seq_lens_k"] is not None:
-                kwargs["cu_seq_lens_k"] = kwargs["cu_seq_lens_k"].cpu()
-            return original_forward(*args, **kwargs)
-
-        model.forward = wrapped_forward
 
     assert not getattr(model, "use_kernels", False), (
         "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "

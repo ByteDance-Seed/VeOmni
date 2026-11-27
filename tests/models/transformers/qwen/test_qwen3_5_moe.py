@@ -223,8 +223,8 @@ def test_qwen3_5_moe_eager_matches_hf_aux_loss():
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=1e-6, rtol=1e-6)
 
 
-def test_qwen3_5_moe_npu_generated_attention_binds_ops_and_runs_eager_forward(monkeypatch):
-    from veomni.models.transformers.qwen3_5_moe import modeling_qwen3_5_moe as npu_modeling
+def test_qwen3_5_moe_attention_binds_ops_and_runs_eager_forward_without_npu_varlen_hook(monkeypatch):
+    from veomni.models.transformers.qwen3_5_moe import modeling_qwen3_5_moe as modeling
     from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
 
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
@@ -234,12 +234,11 @@ def test_qwen3_5_moe_npu_generated_attention_binds_ops_and_runs_eager_forward(mo
         recorded.append(kwargs)
         return ([0, 6], None, None)
 
-    monkeypatch.setattr(npu_modeling, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(fla_npu, "precompute_varlen_metadata", fake_precompute)
     torch.manual_seed(0)
     config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
     config._set_ops_implementation(eager_ops_config())
-    model = npu_modeling.Qwen3_5MoeForCausalLM(config).eval()
+    model = modeling.Qwen3_5MoeForCausalLM(config).eval()
     attn = model.model.layers[0].self_attn
     assert attn.veomni_rope.impl == "eager"
     assert attn.veomni_attn.impl == "veomni_eager"
@@ -257,6 +256,4 @@ def test_qwen3_5_moe_npu_generated_attention_binds_ops_and_runs_eager_forward(mo
             use_cache=False,
         )
     assert torch.isfinite(out.logits).all()
-    assert len(recorded) == 1
-    assert torch.equal(recorded[0]["cu_seqlens"], linear_cu_seq_lens_q)
-    assert recorded[0].get("device") is None
+    assert recorded == []

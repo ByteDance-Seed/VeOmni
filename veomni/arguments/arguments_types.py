@@ -498,11 +498,9 @@ class GradientCheckpointingConfig:
         default=False,
         metadata={
             "help": (
-                "Use reentrant gradient checkpointing. Kept off by default, and not usable "
-                "on a model whose block loop passes its block arguments by keyword "
-                "(MiniMax-H3): reentrant checkpointing saves positional tensors only, so "
-                "the first recomputed block raises. torch also refuses "
-                "enable_reentrant=True together with SAC."
+                "Use reentrant gradient checkpointing. Kept off by default. MiniMax-H3 rejects "
+                "this when enabling checkpointing because differentiable block inputs are passed "
+                "by keyword. Reentrant checkpointing also does not support SAC."
             )
         },
     )
@@ -612,9 +610,19 @@ class TorchCompileConfig:
         default=True,
         metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
     )
-    dynamic: bool = field(
-        default=False,
-        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
+    dynamic: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether to pass dynamic=True to torch.compile. Unset keeps torch's default: the first call "
+                "compiles a static graph and a shape change promotes it to a symbolic one covering the rest of "
+                "the run. Leave it unset. False is not the safe choice: with fullgraph=True a re-cache is a "
+                "hard failure, so one new shape per step raises FailOnRecompileLimitHit once "
+                "torch._dynamo.config.cache_size_limit (8) is exhausted. True survives a moving shape but pays "
+                "for it on the first call, and it breaks a custom autograd Function that chains two Triton "
+                "kernels (the fused-Triton MoE experts)."
+            )
+        },
     )
 
 
@@ -801,6 +809,21 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    extra_parallel_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Apply the model's ExtraParallel plan (ep / emb) but skip the FSDP2 wrap. "
+                "Only applies when fsdp_mode='fsdp2'; ignored under 'ddp' or 'eager'. "
+                "The plan shards the dimension it names (e.g. experts on dim0) and the wrap "
+                "shards the rest (dim1 for experts); without the wrap that second axis must "
+                "be size 1, so this only fits a dimension already as wide as the shard axis. "
+                "For inference on a checkpoint kept quantized (fp8/fp4 storage), whose layer "
+                "mixes several floating-point dtypes that an FSDP parameter group refuses; "
+                "a training run dequantizes at load and does not need it for that reason."
+            )
+        },
+    )
     hyper_parallel: HyperParallelFSDPConfig = field(default_factory=HyperParallelFSDPConfig)
 
     def __post_init__(self):
@@ -840,8 +863,8 @@ class OffloadConfig:
             "help": (
                 "Enable async activation offload to CPU via stream-based D2H/H2D transfers. "
                 "More efficient than synchronous offload. Mutually exclusive with "
-                "`enable_activation`. Uses `model._no_split_modules` when "
-                "`activation_offload_modules` is empty."
+                "`enable_activation`. When `activation_offload_modules` is empty, uses "
+                "`model._activation_offload_target_classes` if defined, otherwise `model._no_split_modules`."
             )
         },
     )
@@ -967,20 +990,28 @@ class AcceleratorConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
+    @property
+    def resolved_extra_parallel(self) -> tuple[list[str], list[int], list[bool]]:
+        """Effective ``(names, sizes, placement_innermost)`` with ``ep`` folded in on demand.
+
+        Keeps the raw dataclass fields untouched so ``asdict()`` and per-module overlay
+        merging never inherit a pre-folded ``"ep"`` entry that shadows ``ep_size``.
+        """
+        names = list(self.extra_parallel_names)
+        sizes = list(self.extra_parallel_sizes)
+        innermost = list(self.extra_parallel_placement_innermost)
+        if "ep" not in names:
+            names.append("ep")
+            sizes.append(self.ep_size)
+            innermost.append(self.ep_outside)
+        return names, sizes, innermost
+
     def __post_init__(self):
         from ..distributed.hccl_options import validate_ep_hccl_options
 
         validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
-        # although expert parallel and extra parallel are both provided in the arguments,
-        # the implementation is configuring extra parallelism to include expert parallelism.
-        # Guarded so re-instantiating from a saved config (asdict round-trip) does not
-        # append a second "ep" dimension.
-        if "ep" not in self.extra_parallel_names:
-            self.extra_parallel_sizes.append(self.ep_size)
-            self.extra_parallel_names.append("ep")
-            self.extra_parallel_placement_innermost.append(self.ep_outside)
-
-        ep_size = dict(zip(self.extra_parallel_names, self.extra_parallel_sizes)).get("ep", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = self.resolved_extra_parallel
+        ep_size = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ep", 1)
         if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
             raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
 
@@ -1429,6 +1460,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"torch_npu"}),
     "situ_and_mul_implementation": frozenset({"triton"}),
     "chunk_kda_implementation": frozenset({"ascendc"}),
 }
@@ -1438,6 +1470,7 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"torch_npu"}),
 }
 
 _AITER_ATTENTION_IMPLEMENTATIONS = frozenset(
@@ -1596,7 +1629,8 @@ class OpsImplementationConfig:
         metadata={
             "help": "Gated MLP (act(gate(x)) * up(x)). 'liger_kernel' (SiLU only; GPU, MLU) | "
             "'qat' (SM90+, dtype='fp8') | 'torchao' (dtype='fp8', 'nvfp4', or 'mxfp4', needs the "
-            "'torchao' package) | 'eager'. "
+            "'torchao' package) | 'deepgemm' (native FP8 GEMM forward/dgrad/wgrad, dtype='fp8', "
+            "SiLU only, SM90/SM100) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
@@ -1605,7 +1639,8 @@ class OpsImplementationConfig:
         metadata={
             "help": "Dense projection. 'qat' (fake quantization of both GEMM operands, SM90+, dtype='fp8') | "
             "'torchao' (dynamic FP8 GEMMs or FP4 fake quantization, 'standard' variant only, needs the "
-            "'torchao' package, dtype='fp8', 'nvfp4', or 'mxfp4') | 'eager' (calls the projection module). "
+            "'torchao' package, dtype='fp8', 'nvfp4', or 'mxfp4') | 'deepgemm' (native FP8 GEMM "
+            "forward/dgrad/wgrad, dtype='fp8', SM90/SM100) | 'eager' (calls the projection module). "
             "Unset: 'eager'. Selected independently of gated_mlp_implementation: a model that owns its "
             "own projections reads this field, a model that runs the fused gated-MLP row reads that one."
         },
@@ -1693,6 +1728,12 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
+    minimax_sparse_attention_implementation: Optional[Literal["eager", "torch_npu"]] = field(
+        default=None,
+        metadata={
+            "help": "MiniMax sparse language attention. Defaults to NPU fusion on Ascend and PyTorch elsewhere."
+        },
+    )
     qsa_attention_implementation: Literal["eager", "tilelang", "torch_npu"] = field(
         default="eager",
         metadata={
@@ -1703,6 +1744,15 @@ class OpsImplementationConfig:
             "torch_npu.npu_fusion_attention (requires bf16, Ascend NPU). "
             "Both fused backends cover training forward/backward only, no KV cache, and raise on an "
             "attention mask. Nonzero attention dropout falls back to eager with a warning."
+        },
+    )
+    qsa_indexer_implementation: Literal["eager"] = field(
+        default="eager",
+        metadata={
+            "help": "Qwen4-Exp QSA block top-k. 'eager' masks invisible blocks with finite -1.0 "
+            "and runs PyTorch topk. Visible scores are ReLU outputs (>= 0), so -1.0 stays below "
+            "them without an -inf sentinel that faults Ascend TopKV2. On NPU the validity gather "
+            "uses int8. Projections, RoPE, and the compressed-row gather stay in the model."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
@@ -2118,7 +2168,7 @@ class ModelArguments(BaseModelArguments):
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
         },
     )
-    ep_sharded_stream_load: bool = field(
+    extra_parallel_stream_load: bool = field(
         default=False,
         metadata={
             "help": "Opt-in fast/low-memory loader for large ExtraParallel-sharded checkpoint tensors (for example MoE experts or PLE embedding tables): each rank reads only its dim-0 slice straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
@@ -2141,17 +2191,17 @@ class ModelArguments(BaseModelArguments):
                 "model.optimizer.state_offload='cpu' cannot be combined with "
                 "model.accelerator.fsdp_config.offload; both move training state to host."
             )
-        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # extra_parallel_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.
-        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
-            "model.ep_sharded_stream_load requires "
+        assert not (self.extra_parallel_stream_load and self.broadcast_model_weights_from_rank0), (
+            "model.extra_parallel_stream_load requires "
             "model.broadcast_model_weights_from_rank0=False "
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
 
-        extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
-        ple_size = extra_parallel_sizes.get("ple", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = self.accelerator.resolved_extra_parallel
+        ple_size = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ple", 1)
         if ple_size > 1:
             effective_fsdp_shard_size = (
                 self.accelerator.dp_shard_size * self.accelerator.ulysses_size * self.accelerator.cp_size
@@ -2160,9 +2210,9 @@ class ModelArguments(BaseModelArguments):
                 raise ValueError(
                     f"PLE size ({ple_size}) must divide the effective FSDP shard size ({effective_fsdp_shard_size})."
                 )
-            if not self.ep_sharded_stream_load:
+            if not self.extra_parallel_stream_load:
                 raise ValueError(
-                    "PLE two-dimensional parallelism requires model.ep_sharded_stream_load=true so each rank "
+                    "PLE two-dimensional parallelism requires model.extra_parallel_stream_load=true so each rank "
                     "reads only its local row-by-column checkpoint rectangle."
                 )
 

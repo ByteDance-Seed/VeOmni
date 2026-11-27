@@ -12,7 +12,8 @@ Supported in this correctness stage:
   exchange over the active SP/CP group, and only the merged features are
   gathered for the global placeholder scatter.
 - CP-style QSA selection plus main-attention KV all-gather. The indexer uses
-  local block pooling, compressed-row all-gather, and local queries to return
+  local block pooling, compressed-row all-gather, and local queries. Block
+  top-k is `qsa_indexer` (`qsa_indexer_implementation`, eager). It returns
   local `[B, S_local, K]` compact global token indices; `Qwen4ExpTextAttention`
   keeps `query_states` local (`[B, H_q, S_local, D]`) with all query heads intact
   and all-gathers only `key_states` and `value_states` (`[B, H_kv, S_global, D]`).
@@ -49,7 +50,7 @@ Supported in this correctness stage:
 
 The internal example uses `ple_size=8`, `ep_size=4`,
 `broadcast_model_weights_from_rank0=false`, and
-`ep_sharded_stream_load=true`. The world size and every padded PLE shard row
+`extra_parallel_stream_load=true`. The world size and every padded PLE shard row
 count must be divisible by `ple_size`; the number of experts must be divisible
 by `ep_size`. PLE and EP may be enabled together because their parameter sets
 and communication meshes are independent.

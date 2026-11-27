@@ -44,7 +44,6 @@ from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
-from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
 
@@ -168,12 +167,11 @@ class GlmMoeDsaIndexer(nn.Module):
         self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
         self.veomni_rope = VeomniOp("rope", "interleave", "eager")
-        if not IS_NPU_AVAILABLE:
-            self.veomni_dsa_indexer = VeomniOp(
-                "dsa_indexer",
-                "glm",
-                config.ops_config.dsa_indexer_implementation,
-            )
+        self.veomni_dsa_indexer = VeomniOp(
+            "dsa_indexer",
+            "glm",
+            config.ops_config.dsa_indexer_implementation,
+        )
 
     @torch.no_grad()
     def forward(
@@ -203,19 +201,6 @@ class GlmMoeDsaIndexer(nn.Module):
             k = past_key_values.update_indexer(k, self.layer_idx)
 
         weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (self.n_heads**-0.5)
-        if IS_NPU_AVAILABLE:
-            scores = torch.matmul(q.float(), k.transpose(-1, -2).float().unsqueeze(1)) * self.softmax_scale
-            scores = F.relu(scores)
-            index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
-            if attention_mask is not None:
-                index_scores = index_scores + attention_mask
-            else:
-                key_positions = torch.arange(index_scores.shape[-1], device=index_scores.device)
-                causal = key_positions[None, None, :] > position_ids[:, :, None]
-                index_scores = index_scores.masked_fill(causal, float("-inf"))
-            topk = min(self.index_topk, index_scores.shape[-1])
-            return index_scores.topk(topk, dim=-1).indices.to(torch.int32)
-
         kv_len = k.shape[1]
         attention_mask = translate_fused_dsa_mask(
             attention_mask,

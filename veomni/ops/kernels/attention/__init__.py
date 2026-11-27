@@ -38,6 +38,7 @@ from ...platform import (
 )
 from ...registry import register_op
 from .helper import (
+    ensure_npu_host_cu_seqlens,
     extract_packed_varlen_cu_seqlens,
     packed_split_attention_forward,
 )
@@ -111,6 +112,11 @@ def lookup(impl: str) -> Callable:
                 softcap=softcap,
                 **kwargs,
             )
+
+        if interface == "flash_attention_2":
+            # standard/flash.py calls the same helper for the bound veomni_* rows.
+            # A later NPU flash entry has to call it too; skipping it only drops the cache.
+            kwargs = ensure_npu_host_cu_seqlens(kwargs, query.device.type)
 
         return forward(
             module,

@@ -217,14 +217,17 @@ def collate_multimodal_metadata(batch, sp_pad, window_size, spatial_merge_size, 
             spatial_merge_size,
             patch_size,
         )
-        # The omni ViT consumes cu_seqlens / cu_window_seqlens / window_index;
-        # `sub` also carries max_seqlen / win_max_seqlen (the shared helper is
-        # identical to qwen2.5-VL's) but the omni vision attention computes its
-        # varlen `.max()` on-device, so those are not written into the batch.
         md[f"{modality}_grid_thw_list"] = sub["grid_thw_list"]
         md[f"vit_{modality}_cu_seqlens"] = sub["cu_seqlens"]
         md[f"vit_{modality}_cu_window_seqlens"] = sub["cu_window_seqlens"]
         md[f"vit_{modality}_window_index"] = sub["window_index"]
+        # The full-attention and window-attention blocks read a different
+        # ``cu_seqlens``, so each needs its own host maximum. Emitting both here is
+        # what keeps the ViT off the per-block
+        # ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()``, a device tensor that
+        # FlashAttention turns into a Python int with ``.item()``.
+        md[f"vit_{modality}_max_seqlen"] = sub["max_seqlen"]
+        md[f"vit_{modality}_win_max_seqlen"] = sub["win_max_seqlen"]
 
     if md:
         batch["multimodal_metadata"] = md
@@ -1038,6 +1041,17 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
                 padded_mask_after_cnn.sum(1).cumsum(0),
             )
         ).to(torch.int32)
+        # ``chunk_lengths`` is already read back as a host list for the split above,
+        # so the varlen segment lengths — and their maximum — are known here without
+        # a device read. Each chunk's after-conv length is ``(L - 1) // 2 + 1``:
+        # ``conv1`` keeps the length and ``conv2`` has stride 2.
+        #
+        # Forwarding this keeps the per-layer attention off
+        # ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()``, a device tensor that
+        # FlashAttention turns into a Python int with ``.item()``. That ``.item()``
+        # is an unconditional sync: the compiled forward measured 1.70ms with it
+        # against 0.30ms without, because it stalls every kernel enqueued before it.
+        max_seqlen = max((length - 1) // 2 + 1 for length in chunk_lengths.tolist())
         # --- Patch.3 ---
         if get_parallel_state().sp_enabled:
             unpadded_dim_len = cu_seqlens[-1]
@@ -1049,6 +1063,9 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
                 # samples on the last rank.
                 new_cumsum = cu_seqlens[-1] + pad_seq_len
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+                # The padded tail becomes its own segment, so the host maximum has to
+                # account for it exactly as the layer's fallback would.
+                max_seqlen = max(max_seqlen, pad_seq_len.item())
         # --- Patch.3 ---
 
         for encoder_layer in self.layers:
@@ -1062,9 +1079,14 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
             # ``attention_interface(..., attention_mask=None, ..., **kwargs)``,
             # raising ``TypeError: got multiple values for keyword argument
             # 'attention_mask'``.
+            # The layer forwards ``**kwargs`` straight to attention, so a caller
+            # that already put ``max_seqlen`` there would collide with the explicit
+            # argument below.
+            kwargs.pop("max_seqlen", None)
             layer_outputs = encoder_layer(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
@@ -1479,16 +1501,20 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
         # selects from `multimodal_metadata` and passes as the single
         # `vit_metadata` kwarg. qwen2.5-omni's window-attention ViT consumes
         # cu_seqlens / cu_window_seqlens / window_index (the get_window_index
-        # permutation) — all derived host-side by the collator hook. (Unlike
-        # qwen2.5-VL it needs no precomputed max_seqlen: the vision attention
-        # computes `.max()` on-device, no host sync.) All .get() below fall back
-        # to None for callers bypassing MainCollator, in which case the in-forward
-        # derivation runs unchanged. See .agents/knowledge/multimodal_metadata.md.
+        # permutation) — all derived host-side by the collator hook — plus
+        # max_seqlen / win_max_seqlen, which are forwarded into the blocks. Without
+        # those a block recomputes `.max()` on-device, costing a device sync per
+        # batch and a graph break on torch builds without
+        # `capture_scalar_outputs`. All .get() below fall back to None for callers
+        # bypassing MainCollator, in which case the in-forward derivation runs
+        # unchanged. See .agents/knowledge/multimodal_metadata.md.
         vit_metadata = kwargs.pop("vit_metadata", None) or {}
         precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
         precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
         precomputed_cu_window_seqlens = vit_metadata.get("cu_window_seqlens")
         precomputed_window_index = vit_metadata.get("window_index")
+        precomputed_max_seqlen = vit_metadata.get("max_seqlen")
+        precomputed_win_max_seqlen = vit_metadata.get("win_max_seqlen")
         use_precompute = precomputed_cu_seqlens is not None
 
         hidden_states = self.patch_embed(hidden_states)
@@ -1597,13 +1623,20 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
+                max_seqlen_now = precomputed_max_seqlen
             else:
                 cu_seqlens_now = cu_window_seqlens
+                max_seqlen_now = precomputed_win_max_seqlen
 
+            # The blocks take ``**kwargs`` straight through to attention, so a
+            # caller that already put ``max_seqlen`` there would collide with the
+            # explicit argument below.
+            kwargs.pop("max_seqlen", None)
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens_now,
                 position_embeddings=rotary_pos_emb,
+                max_seqlen=max_seqlen_now,
                 **kwargs,
             )
 
@@ -2052,7 +2085,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
     config: Qwen2_5OmniThinkerConfig
     base_model_prefix = "thinker"
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _no_split_modules = ["Qwen2_5OmniAudioEncoder", "Qwen2_5OmniVisionEncoder"]
+    _no_split_modules = [
+        "Qwen2_5OmniAudioEncoderLayer",
+        "Qwen2_5OmniVisionBlock",
+        "Qwen2_5OmniDecoderLayer",
+    ]
     _can_compile_fullgraph = True
 
     # ================================================================
@@ -2337,6 +2374,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
                 "cu_window_seqlens": multimodal_metadata.get("vit_image_cu_window_seqlens"),
                 "window_index": multimodal_metadata.get("vit_image_window_index"),
+                "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+                "win_max_seqlen": multimodal_metadata.get("vit_image_win_max_seqlen"),
             }
         }
         video_vit_kwargs = {
@@ -2345,6 +2384,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
                 "cu_window_seqlens": multimodal_metadata.get("vit_video_cu_window_seqlens"),
                 "window_index": multimodal_metadata.get("vit_video_window_index"),
+                "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+                "win_max_seqlen": multimodal_metadata.get("vit_video_win_max_seqlen"),
             }
         }
         # --- Patch.7 ---

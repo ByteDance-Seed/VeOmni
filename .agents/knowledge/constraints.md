@@ -55,6 +55,10 @@ Core entry points:
    - Flattens subviews for common usage: `dp` (all data-parallel), `sp` (ulysses+cp), `dp_shard_sp` (FSDP shard × SP), `dp_sp` (for loss/grad sync across SP+DP).
    - For each ExtraParallel name (e.g. `ep`), builds a `[para_size × para_fsdp_size]` submesh via `init_para_mesh_matrix()`.
 
+6a. **Async activation offload must wrap the checkpoint boundary**
+   - Selected modules must own checkpointing inside their `__call__`, as `GradientCheckpointingLayer` does. Calling checkpoint outside a selected module nests the offload saved-tensor hooks inside checkpoint hooks and can suppress recomputation. Regression tests must assert that backward reruns the block, not only that forward/backward succeeds.
+   - FSDP parent wrapping targets are not necessarily offload targets. A model can restrict auto-discovery with `_activation_offload_target_classes`; avoid selecting both a parent and its checkpointed children.
+
 ### Sequence Parallel (Ulysses)
 
 7. **SP uses all-to-all head/sequence exchange, not all-gather**
@@ -92,7 +96,7 @@ Core entry points:
    - `should_skip_hf_weight_load` must be honoured here too: a distributed-checkpoint resume is about to overwrite every parameter, so reading the HF snapshot doubles peak memory, and the snapshot may not exist at all.
    - `broadcast_model_weights_from_rank0` is honoured here under both FSDP2 and DDP. `rank0_load_and_broadcast_weights()` broadcasts over the default (world) group from global rank0 (`dist.broadcast(..., src=0)`, no `group=`), which is what a DDP replica wants. It defaults to `True`.
    - After the load pass, `parallelize_model_ddp()` re-checks `param.is_meta` and raises with the offending parameter names. A loader that leaves one behind would otherwise surface inside DDP's constructor as `Tensor.item() cannot be called on meta tensors`, which names neither the parameter nor the cause.
-   - ExtraParallel is refused on the DDP path, keyed on **the model's plan** (`_has_extra_parallel_plan()`), not on `ParallelState.any_extra_parallel_enabled`. Only `parallelize_model_fsdp2()` applies the plan that shards expert weights, so DDP experts are whole and loading a sharded-expert config into them — previously prevented only by the meta crash — would silently produce full tensors. But the mesh alone does not identify such a model: a SeedOmni V2 sub-module's accelerator is `_deep_update(global, override)`, so a DDP vision tower inherits the backbone's ep dim while owning no experts, and refusing on the mesh would block it. The same predicate gates `ep_sharded_stream_load` in `_materialize_and_load_weights()`: a plan-less model skips the fast path with a log line (there was never one to take), while a model that *does* have a plan still lets the loader's `NotImplementedError` propagate, because that one means the checkpoint layout is unsupported — the distinction `tests/utils/test_moe_ep_sharded_load_matrix.py` pins for `nonmerged x ep_sharded`. A per-expert checkpoint is supported only when the model's converter implements `fused_expert_target` + `for_expert_range` (each rank then reads and stacks just its own experts); a converter without them still raises.
+   - ExtraParallel is refused on the DDP path, keyed on **the model's plan** (`_has_extra_parallel_plan()`), not on `ParallelState.any_extra_parallel_enabled`. Only `parallelize_model_fsdp2()` applies the plan that shards expert weights, so DDP experts are whole and loading a sharded-expert config into them — previously prevented only by the meta crash — would silently produce full tensors. But the mesh alone does not identify such a model: a SeedOmni V2 sub-module's accelerator is `_deep_update(global, override)`, so a DDP vision tower inherits the backbone's ep dim while owning no experts, and refusing on the mesh would block it. The same predicate gates `extra_parallel_stream_load` in `_materialize_and_load_weights()`: a plan-less model skips the fast path with a log line (there was never one to take), while a model that *does* have a plan still lets the loader's `NotImplementedError` propagate, because that one means the checkpoint layout is unsupported — the distinction `tests/utils/test_extra_parallel.py` pins for `nonmerged x ep_sharded`. A per-expert checkpoint is supported only when the model's converter implements `fused_expert_target` + `for_expert_range` (each rank then reads and stacks just its own experts); a converter without them still raises.
 
 ### Expert Parallel (MoE)
 
@@ -112,6 +116,15 @@ Core entry points:
    - Qwen4-Exp's `ple` dimension is currently the only persistent ExtraParallel use. Its lookup, gradient scaling, optimizer, and checkpoint paths operate over the complete flattened PLE mesh while inputs remain sequence-sharded.
    - See [Qwen4-Exp checkpoint row contract](../../docs/design/qwen4_exp_ple_2d_parallelism.md#dcp-model-and-optimizer-state) for per-table logical and padded shapes.
 
+8a-i. **`fsdp_config.extra_parallel_only` applies the plan and drops the FSDP2 wrap**
+   - `parallelize_model_fsdp2(extra_parallel_only=True)` returns through `_finish_without_fsdp_wrap()`: the plan still slices along its own dim, but nothing shards for storage. Every parameter the plan does not name stays whole on every rank.
+   - `extra_parallel_only` requires `mixed_precision.enable=False` (rejected in `build_parallelize_model` and `parallelize_model_fsdp2`): FSDP2's `MixedPrecisionPolicy` is part of the skipped wrap, so leaving mixed precision on would upcast weights to FP32 with nothing to cast them back to the compute dtype. Inference defaults `mixed_precision.enable` to `False`; training runs using `extra_parallel_only` must disable it explicitly.
+   - Because the wrap is skipped, `<para>_fsdp_size` must be `1` (otherwise the FSDP axis would be unsharded and replicate experts), and `fsdp_config.offload` / `torch_compile.enable` are rejected.
+   - Without the wrap, `clip_grad_norm` calls `_average_extra_parallel_only_replicated_grads()` and skips the FSDP sum for `non_extra_parallel` groups, and `_divide_extra_parallel_grads_like_fsdp()` installs the `extra_parallel_gradient_divide_factor` tensor hook on non-persistent plan-sharded params (persistent params such as Qwen4-Exp PLE already divide in their own backward).
+   - Shared-expert LoRA (`share_expert_lora: true`, `LoraSharedExperts`) is supported on this path: `_collect_ep_replicated_lora_param_ids` accepts plain params when `ParallelState.extra_parallel_only` is set, and `LoraSharedExperts._ensure_ep_grad_sync_hooks` divides the EP-summed accumulated grad by `ps.world_size` when `ps.extra_parallel_only` is set.
+   - DCP has no `*_fsdp` axis to describe a slice on, so `restore_extra_parallel_dim()` places a plain tensor on the ExtraParallel dim alone.
+   - It pairs with `dim0_rowwise_companion` / `convert_rows` on the checkpoint converter so row-sharded tables and their per-row scales stream matching row ranges.
+
 8b. **Qwen4-Exp QSA indices are global full-resolution token indices**
    - `qsa_attention_implementation` selects blocks with local queries and globally gathered pooled keys, returning local `[B,L,K]` selections for each rank's query shard while `Qwen4ExpTextAttention` keeps `query_states` local (`[B,H_q,L,D]`) and all-gathers `key_states`/`value_states` (`[B,H_kv,S,D]`) over the active sequence- or context-parallel group.
    - Index values address global full-resolution K/V directly; `-1` is the only invalid-slot sentinel. Do not rebase them by rank or lift them past a compressed-KV segment.
@@ -121,6 +134,11 @@ Core entry points:
 
 8c. **Differentiable SP collectives must remain in every rank's autograd graph**
    - Rank-local packed boundaries can make a gathered halo unused on some ranks. Preserve a zero-valued dependency on the gathered tensor so every rank executes the same backward collective sequence; otherwise a later all-reduce can be matched against another rank's gather backward and fail with inconsistent collective counts.
+
+8d. **A shared MoE load-balancing loss is valid only when it matches the model's router semantics**
+   - Do not attach the Switch-style `load_balancing_loss_func` merely because a model exposes raw router logits. That loss applies `softmax(router_logits)` and performs its own top-k selection.
+   - Routers such as MiniMax M3 instead select experts from `sigmoid(router_logits) + e_score_correction_bias`, then derive expert weights from the unbiased sigmoid scores. A softmax-based auxiliary loss can therefore optimize a different expert assignment from the one executed by the model.
+   - For these models, leave router-logit capture and the generic auxiliary loss disabled until a model-specific balancing algorithm, statistics scope, and distributed update rule are verified against the model's training recipe.
 
 ## Data Pipeline
 
@@ -170,8 +188,9 @@ Core files:
 ### Multimodal Data
 
 15. **Multimodal preprocessing pipeline (`veomni/data/multimodal/` + `veomni/data/data_transform.py`)**
-    - The two orchestrators differ in where tokenization and label masking happen — do not assume a single shared order.
+    - The orchestrators differ in where tokenization and label masking happen — do not assume a single shared order.
       - `process_sample_qwen_vl()`: `conv_preprocess()` → `fetch_images` / `fetch_videos_metadata` → `processor.image_processor` / `processor.video_processor` for pixel features only → `chat_template.encode_messages()`, which does **both** tokenization and label masking.
+      - `process_sample_minimax_m3_vl()`: shares the image/video loading of `process_sample_qwen_vl()` (`_prepare_vlm_media_inputs`, which also calls `processor.video_processor` with metadata), then `MiniMaxM3VLChatTemplate` renders the checkpoint's native template through `processor.apply_chat_template`, tokenizes the text and masks labels turn by turn.
       - `process_sample_qwen_omni()`: takes no chat template. `conv_preprocess()` → `fetch_images/videos/audios` → `processor(text=..., images=..., videos=..., audios=...)` for tokenization → labels masked inline by a user/assistant token scan.
     - Images: load → RGB PIL → `smart_resize` (pixel min/max, scale_factor for grid alignment, max aspect ratio).
     - Videos: `torchcodec` decode → `calculate_frame_indices` (FPS, min/max frames, `frame_factor`/`frame_factor_remainder` for VAE-friendly counts); optional paired audio.

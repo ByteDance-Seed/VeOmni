@@ -1148,3 +1148,163 @@ def test_torchao_fp8_validates_and_dispatches_three_projections(monkeypatch):
         (mlp.up_proj.weight.shape, "rowwise_with_gw_hp", False),
         (mlp.down_proj.weight.shape, "rowwise_with_gw_hp", False),
     ]
+
+
+def test_the_deepgemm_row_is_registered_on_sm90_or_sm100():
+    from veomni.ops import OP_REGISTRY
+
+    assert "deepgemm" in OP_REGISTRY.list_registered("gated_mlp", "standard")
+    entry = {e.impl: e for e in OP_REGISTRY.list_entries("gated_mlp", "standard")}["deepgemm"]
+    assert entry.requires == ("deep_gemm", "triton")
+    assert {(p.min_cc, p.max_cc) for p in entry.requirement.platforms} == {(90, 90), (100, 100)}
+
+
+def test_the_deepgemm_row_declares_the_activations_its_kernel_fuses():
+    """``RecomputedSwiGLU`` fuses ``aten.silu``, so the row cannot serve another activation.
+
+    ``render`` consults ``ROW_ACTIVATIONS`` before the call, so a ``gelu`` model is
+    routed to its projection fallback. Declaring the set here is what makes that
+    routing right rather than accidental -- an entry missing from the map falls back
+    to ``eager``'s behaviour, which would claim the row can compute anything.
+    """
+    from veomni.ops.kernels.gated_mlp._module import ROW_ACTIVATIONS
+
+    assert ROW_ACTIVATIONS["deepgemm"] == frozenset({"silu", "swish"})
+
+
+def test_the_deepgemm_row_refuses_a_block_size_it_cannot_honor():
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    mlp = torch.nn.Module()
+    mlp.gate_proj = torch.nn.Linear(256, 384, bias=False, dtype=torch.bfloat16)
+    mlp.up_proj = torch.nn.Linear(256, 384, bias=False, dtype=torch.bfloat16)
+    mlp.down_proj = torch.nn.Linear(384, 256, bias=False, dtype=torch.bfloat16)
+    x = torch.randn(2, 256, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="only block_size=128"):
+        deepgemm.wrapper(mlp, x, block_size=64)
+
+
+def test_the_deepgemm_row_refuses_a_wrapped_projection():
+    """It quantizes the weight it multiplies, so a LoRA wrapper has to be refused.
+
+    ``render`` raises instead of falling back to the projection modules, because a
+    fallback would train at full precision under a config that said otherwise.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    class _Wrapped(nn.Module):
+        """Stand-in for ``LoraLinear``: no ``weight``, keeps the base at ``base_layer``."""
+
+        def __init__(self):
+            super().__init__()
+            self.base_layer = nn.Linear(256, 384, bias=False)
+
+        def forward(self, x):
+            return self.base_layer(x)
+
+    mlp = nn.Module()
+    mlp.gate_proj = _Wrapped()
+    mlp.up_proj = nn.Linear(256, 384, bias=False)
+    mlp.down_proj = nn.Linear(384, 256, bias=False)
+    with pytest.raises(ValueError, match="quantizes the projection weights"):
+        deepgemm.wrapper(mlp, torch.randn(2, 256), activation="silu")
+
+
+def test_the_deepgemm_row_refuses_an_activation_its_kernel_cannot_fuse():
+    """``render`` keeps a non-SiLU model off this row; a direct call must also refuse.
+
+    ``render`` raises first here, before the row's own check runs -- which is the
+    right order, because it has the wider message (it names the config field to
+    change). The row's ``_FUSED_ACTIVATIONS`` check is the second line of defence
+    for a caller that reaches the kernel some other way.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    mlp = nn.Module()
+    mlp.gate_proj = nn.Linear(256, 384, bias=False)
+    mlp.up_proj = nn.Linear(256, 384, bias=False)
+    mlp.down_proj = nn.Linear(384, 256, bias=False)
+    with pytest.raises(ValueError, match="no quantizing row evaluates that activation"):
+        deepgemm.wrapper(mlp, torch.randn(2, 256), activation="gelu")
+
+
+def test_the_row_states_which_activations_it_serves():
+    """The served set is declared once and is what both the router and the row use.
+
+    This replaces a test that asserted substrings of `deepgemm_moe.md`. That test
+    passed while the prose was wrong — it required "SiLU-only" and an `eager`
+    mention, and the wrong sentence contained both, since it said every non-SiLU
+    activation was rejected and `swish` is SiLU under its other name. So it pinned
+    wording rather than behaviour, and would fail on any equivalent rephrasing.
+
+    What is worth pinning is the set: `render` routes on `ROW_ACTIVATIONS` and the
+    row re-checks the same names, so a row that serves a name it does not declare (or
+    declares one it cannot compute) is the bug this catches.
+    """
+    from veomni.ops.kernels.gated_mlp._module import ROW_ACTIVATIONS
+    from veomni.ops.kernels.gated_mlp.standard.deepgemm import _FUSED_ACTIVATIONS
+
+    declared = ROW_ACTIVATIONS["deepgemm"]
+    assert declared == _FUSED_ACTIVATIONS
+    # ``swish`` is ``ACT2FN``'s alias for SiLU, so a SiLU kernel serves it; a set
+    # without it would send those models down the unquantized path for nothing.
+    assert declared == frozenset({"silu", "swish"})
+
+
+def test_the_deepgemm_row_accepts_a_str_enum_activation():
+    """The row's membership check accepts ``ActivationType`` without unwrapping it.
+
+    ``render`` canonicalizes through ``normalize_activation``, which unwraps
+    ``Enum.value``; a raw ``activation in _FUSED_ACTIVATIONS`` then still has to
+    agree with it. It does, and only because ``ActivationType`` is a ``str`` enum:
+    ``__hash__`` is ``str.__hash__``, so the set lookup matches ``"silu"``. Pinning
+    that keeps a future non-``str`` enum (which *would* need ``is_silu``'s ``.value``
+    unwrapping) from silently diverging from ``render``.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+    from veomni.ops.kernels.moe_experts.shared.group_gemm import ActivationType
+
+    assert issubclass(ActivationType, str), "premise: a str enum hashes like its value"
+    assert ActivationType.SILU in deepgemm._FUSED_ACTIVATIONS
+    assert ActivationType.GELU not in deepgemm._FUSED_ACTIVATIONS
+
+    mlp = nn.Module()
+    mlp.gate_proj = nn.Linear(128, 128, bias=False)
+    mlp.up_proj = nn.Linear(128, 128, bias=False)
+    mlp.down_proj = nn.Linear(128, 128, bias=False)
+
+    # ``SILU`` gets past the activation check and stops at the hardware guard: on a
+    # host without SM90/SM100 that is a ``RuntimeError``, which is how this proves
+    # the activation check let it through. ``GELU`` is refused by ``render`` first.
+    with pytest.raises(RuntimeError, match="deepgemm requires NVIDIA"):
+        deepgemm.wrapper(mlp, torch.randn(2, 128), activation=ActivationType.SILU)
+    with pytest.raises(ValueError, match="no quantizing row evaluates that activation"):
+        deepgemm.wrapper(mlp, torch.randn(2, 128), activation=ActivationType.GELU)
+
+
+def test_the_routed_expert_row_has_the_same_activation_restriction():
+    """`moe_experts` rows take `activation=` too, so `linear` is the only row without one.
+
+    The doc claimed the routed experts "take no activation", which would imply no
+    restriction on them. They do take it, and `deepgemm` refuses anything outside
+    `{silu, swish}` because its grouped GEMM fuses the activation as well.
+    """
+    import inspect
+
+    from veomni.ops.kernels.moe_experts.shared.activation import is_silu
+    from veomni.ops.kernels.moe_experts.standard import deepgemm as moe_deepgemm
+
+    assert "activation" in inspect.signature(moe_deepgemm.wrapper).parameters
+    assert is_silu("silu") and is_silu("swish")
+    assert not is_silu("gelu")
+
+    # `linear` is the one row with no activation argument.
+    from veomni.ops.kernels.linear.standard import deepgemm as linear_deepgemm
+
+    assert "activation" not in inspect.signature(linear_deepgemm.wrapper).parameters

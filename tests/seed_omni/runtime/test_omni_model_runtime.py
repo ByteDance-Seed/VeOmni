@@ -424,14 +424,19 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     vae = MagicMock()
     vae.reads_offline_cache = True
     vae.model = meta_module
-    vae.args = SimpleNamespace(model_path="vae", lora_config=None)
+    # `module_compile_config` reads each module's own resolved accelerator.
+    module_accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=False),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+    )
+    vae.args = SimpleNamespace(model_path="vae", lora_config=None, accelerator=module_accelerator)
     vae.weights_path = "vae"
     vae.build_after_omni_model_wrap = MagicMock()
 
     llm = MagicMock()
     llm.reads_offline_cache = False
     llm.model = model.module_b
-    llm.args = SimpleNamespace(model_path="llm", lora_config=None)
+    llm.args = SimpleNamespace(model_path="llm", lora_config=None, accelerator=module_accelerator)
     llm.weights_path = "llm"
     llm.skip_hf_weight_load = False
     llm.build_after_omni_model_wrap = MagicMock()
@@ -441,6 +446,9 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
         accelerator=SimpleNamespace(
             fsdp_config=SimpleNamespace(
                 fsdp_scope="model",
+                # The composed wrap follows the top-level fsdp_mode; `fsdp2` keeps
+                # the compile path reachable (a `ddp` wrap would select no child).
+                fsdp_mode="fsdp2",
                 reshard_after_forward=True,
                 mixed_precision=SimpleNamespace(enable=False),
                 forward_prefetch=False,
@@ -463,7 +471,7 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
         ),
         optimizer=None,
         broadcast_model_weights_from_rank0=False,
-        ep_sharded_stream_load=False,
+        extra_parallel_stream_load=False,
     )
 
     captured = {}
@@ -473,6 +481,7 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
         captured["expert_fsdp_shard_dim"] = kwargs["expert_fsdp_shard_dim"]
         captured["weights_path"] = kwargs["weights_path"]
         captured["children"] = list(dict(model.named_children()))
+        captured["compile_config"] = kwargs.get("compile_config")
         return model
 
     monkeypatch.setattr(
@@ -503,6 +512,13 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     assert vae.model is meta_module
     llm.build_after_omni_model_wrap.assert_called_once()
     vae.build_after_omni_model_wrap.assert_not_called()
+
+    # The composed wrap must not compile: every module compiled itself before
+    # handing the wrap over (see `ModuleRuntime._build_parallelized_model`).
+    # Asserting the forwarded config here is what catches a launcher-level enable
+    # being reintroduced in this caller — the per-module helper test cannot.
+    assert captured["compile_config"] is not None
+    assert captured["compile_config"].enable is False
 
 
 def _exporting_runtime(checkpoint):

@@ -41,6 +41,7 @@ def eager_ops_config() -> SimpleNamespace:
         chunk_gated_delta_rule_implementation="eager",
         dsa_indexer_implementation="eager",
         dsa_attention_implementation="eager",
+        minimax_sparse_attention_implementation="eager",
         mhc_implementation="eager",
     )
 

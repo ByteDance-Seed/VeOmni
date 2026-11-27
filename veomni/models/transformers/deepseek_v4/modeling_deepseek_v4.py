@@ -75,7 +75,6 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
 )
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
-from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -422,8 +421,8 @@ class DeepseekV4HCACompressor(nn.Module):
         self.position_bias = nn.Parameter(torch.empty(self.compress_rate, self.head_dim))
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        if IS_NPU_AVAILABLE:
-            self.position_bias._veomni_fsdp_shard_dim = 1
+        # compress_rate can be smaller than the FSDP world; shard the long dim.
+        self.position_bias._veomni_fsdp_shard_dim = 1
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_kv_round = VeomniOp(
             "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.hca_kv"
@@ -445,6 +444,7 @@ class DeepseekV4HCACompressor(nn.Module):
         # compressor called directly is unaffected.
         build_indexer_loss: bool = False,
     ) -> tuple[torch.Tensor, CompressedCandidates]:
+        del build_indexer_loss
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
         batch, _, _ = hidden_states.shape
@@ -507,10 +507,8 @@ class DeepseekV4HCACompressor(nn.Module):
                 rate_metadata,
                 overlap=False,
                 apply_rope=self.veomni_rope,
+                anchor_empty=True,
             )
-            if IS_NPU_AVAILABLE and compressed.shape[1] == 0:
-                anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
-                compressed = compressed + anchor.to(compressed.dtype)
             if cp_enabled:
                 compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
             compressed = self.veomni_kv_round(compressed, rope_features=self.rotary_emb.config.qk_rope_head_dim)
@@ -653,8 +651,8 @@ class DeepseekV4Indexer(nn.Module):
         )
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.scorer = DeepseekV4IndexerScorer(config)
-        if IS_NPU_AVAILABLE:
-            self.position_bias._veomni_fsdp_shard_dim = 1
+        # compress_rate can be smaller than the FSDP world; shard the long dim.
+        self.position_bias._veomni_fsdp_shard_dim = 1
         self.veomni_dsa_indexer = VeomniOp(
             "dsa_indexer",
             "deepseek_v4",
@@ -705,18 +703,14 @@ class DeepseekV4Indexer(nn.Module):
         # replicated. So the compressed *keys* have to stay global, and the indexer
         # runs the same own-your-windows-then-all-gather compression its compressor
         # does -- it cannot reuse that result, because it summarises the same windows
-        # through its own projections at ``index_head_dim``. Only the query axis is
-        # local, and ``query_offset`` is what keeps a local query row addressing its
-        # absolute position.
+        # through its own projections at ``index_head_dim``.
         parallel_state = get_parallel_state()
         cp_enabled = parallel_state.cp_enabled and cache_layer is None
-        query_offset = 0
         if cp_enabled:
             cp_group = parallel_state.cp_group
             cp_rank = parallel_state.cp_rank
             local_seq_len = seq_len
             rate = self.compress_rate
-            query_offset = cp_rank * local_seq_len
             shard = plan_compressor_shard(
                 role="DeepSeek V4 Lightning Indexer",
                 rate=rate,
@@ -853,25 +847,9 @@ class DeepseekV4Indexer(nn.Module):
         query_weights = weights.transpose(0, 1)
         query_range_starts = None if packed_ranges is None else packed_ranges[0]
         query_range_ends = None if packed_ranges is None else packed_ranges[1]
-        # A local query row ``i`` is global row ``query_offset + i``; off the context
-        # parallel path ``query_offset`` is zero and this is the arange it always was.
-        # Only the CANN indexer kernel switches layout when ``query_range_starts`` is
-        # ``None``; ``eager`` and ``tilelang`` always construct causal ranges when none
-        # are passed, so computing them directly from ``position_ids`` avoids a
-        # data-dependent ``torch.equal`` check (host sync + ``torch.compile`` graph break).
-        if query_range_starts is None:
-            if cp_enabled or getattr(self.veomni_dsa_indexer, "impl", None) != "cann":
-                query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
-                query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
-            else:
-                canonical_positions = (
-                    (torch.arange(seq_len, device=position_ids.device) + query_offset)
-                    .unsqueeze(0)
-                    .expand_as(position_ids)
-                )
-                if not torch.equal(position_ids, canonical_positions):
-                    query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
-                    query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
+        if query_range_starts is None and cp_enabled:
+            query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
+            query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
         # Ulysses partitions the full-sequence queries here and stitches the
         # selection back together below; CP received them already partitioned and
         # wants the result per shard, so both halves fall away together. One flag
@@ -880,8 +858,7 @@ class DeepseekV4Indexer(nn.Module):
         if ulysses_query_partition:
             if query_range_starts is None and query_range_ends is None:
                 query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
-                query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32)
-                query_range_ends = (query_positions + 1) // self.compress_rate
+                query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
             if seq_len % parallel_state.ulysses_size != 0:
                 raise ValueError(
                     f"DeepSeek-V4 indexer sequence length ({seq_len}) must be divisible by "
@@ -896,6 +873,19 @@ class DeepseekV4Indexer(nn.Module):
                 query_range_starts = query_range_starts[query_start:query_end]
                 query_range_ends = query_range_ends[query_start:query_end]
 
+        # Packed, CP, and Ulysses already pass ranges. On the plain path the CANN
+        # kernel selects by query row and never reads ``position_ids``. Attention
+        # has already appended this step, so the cache length is the KV buffer.
+        # Queries that fill it are ``0..S-1``, including an empty-cache prefill.
+        # A shorter query is decode. The length is a Python int from the cache
+        # shape, so this does not sync the position values.
+        cann_kwargs: dict[str, bool] = {}
+        if query_range_starts is None and self.veomni_dsa_indexer.impl == "cann":
+            if past_key_values is None:
+                queries_fill_kv = True
+            else:
+                queries_fill_kv = past_key_values.get_seq_length(layer_idx) == seq_len
+            cann_kwargs["positions_are_canonical"] = queries_fill_kv
         index_score, top_k_indices = self.veomni_dsa_indexer(
             query,
             compressed_kv.transpose(0, 1),
@@ -905,6 +895,9 @@ class DeepseekV4Indexer(nn.Module):
             cu_seqlen_ks=query_range_starts,
             cu_seqlen_ke=query_range_ends,
             packed_sequence_slices=packed_sequence_slices,
+            position_ids=position_ids if query_range_starts is None else None,
+            require_score_grad=build_indexer_loss,
+            **cann_kwargs,
         )
         if ulysses_query_partition:
             top_k_indices = gather_outputs(
@@ -961,8 +954,8 @@ class DeepseekV4CSACompressor(nn.Module):
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.indexer = DeepseekV4Indexer(config, layer_idx)
-        if IS_NPU_AVAILABLE:
-            self.position_bias._veomni_fsdp_shard_dim = 1
+        # compress_rate can be smaller than the FSDP world; shard the long dim.
+        self.position_bias._veomni_fsdp_shard_dim = 1
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_kv_round = VeomniOp(
             "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.csa_kv"
@@ -981,12 +974,6 @@ class DeepseekV4CSACompressor(nn.Module):
     ) -> tuple[torch.Tensor, CompressedCandidates]:
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
-        if IS_NPU_AVAILABLE and build_indexer_loss:
-            raise NotImplementedError(
-                "dsa_indexer_loss is not implemented on NPU: the objective's student "
-                "distribution is the TileLang Lightning Indexer's per-slot scores, and that "
-                "kernel is CUDA-only. Set dsa_indexer_loss: false under model.model_config."
-            )
         batch = hidden_states.shape[0]
         cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
         kv = self.kv_proj(hidden_states)
@@ -1041,10 +1028,8 @@ class DeepseekV4CSACompressor(nn.Module):
                 rate_metadata,
                 overlap=True,
                 apply_rope=self.veomni_rope,
+                anchor_empty=True,
             )
-            if IS_NPU_AVAILABLE and compressed.shape[1] == 0:
-                anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
-                compressed = compressed + anchor.to(compressed.dtype)
             if cp_enabled:
                 compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
             compressed = self.veomni_kv_round(compressed, rope_features=self.rotary_emb.config.qk_rope_head_dim)
