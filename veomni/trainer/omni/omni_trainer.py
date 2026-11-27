@@ -51,6 +51,7 @@ Division of labour
 
 import json
 import os
+import time
 from collections import defaultdict
 from dataclasses import asdict
 from typing import Any, Dict, List, Mapping
@@ -82,6 +83,8 @@ from ...utils.device import (
     is_nccl_backend,
     synchronize,
 )
+from ...utils.dist_utils import raise_if_any_rank_failed
+from ...utils.loss_utils import contains_padding, reject_objective_padding, synchronize_step_begin_error
 from ...utils.omni_helper import OmniEnvironMeter
 from ..base import VeOmniIter
 from ..callbacks import (
@@ -328,6 +331,10 @@ class OmniTrainer:
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
+        if dataloader_type == "native":
+            dataloader_kwargs["resume_replay_timeout_seconds"] = getattr(
+                args.data, "resume_replay_timeout_seconds", 7200
+            )
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
@@ -407,18 +414,22 @@ class OmniTrainer:
                 step resumed by a training run, or the reverse.
         """
         load_path = self.args.train.checkpoint.load_path
-        manifest = layout.read_manifest(load_path) if load_path else None
-        if manifest is not None and bool(manifest.get("model_state", True)) != self.saves_model_state:
-            if self.saves_model_state:
-                mismatch = (
-                    f"{load_path} holds no model state (an offline_embedding step), but this run trains modules."
-                )
-            else:
-                mismatch = f"{load_path} holds model state, but this offline_embedding run saves none."
-            raise ValueError(
-                f"{mismatch} An offline_embedding run and a training run must not share "
-                "train.checkpoint.output_dir: load_path: auto resumes the newest complete step in it."
-            )
+        if load_path:
+            error = None
+            try:
+                manifest = layout.read_manifest(load_path)
+                if manifest is not None and bool(manifest.get("model_state", True)) != self.saves_model_state:
+                    if self.saves_model_state:
+                        mismatch = f"{load_path} holds no model state (an offline_embedding step), but this run trains modules."
+                    else:
+                        mismatch = f"{load_path} holds model state, but this offline_embedding run saves none."
+                    raise ValueError(
+                        f"{mismatch} An offline_embedding run and a training run must not share "
+                        "train.checkpoint.output_dir: load_path: auto resumes the newest complete step in it."
+                    )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "checking Omni checkpoint mode")
         self.model.load()
 
     @property
@@ -510,6 +521,8 @@ class OmniTrainer:
         over micro-batches, not a sum that grows with the accumulation count. The
         returned loss stays unscaled for logging.
         """
+        if contains_padding(micro_batch):
+            raise ValueError("Omni training does not support padded micro-batches")
         micro_batch = self.preforward(micro_batch)
 
         # Forward: spill activations to CPU (if enabled) + batch-invariant ops.
@@ -545,10 +558,21 @@ class OmniTrainer:
         # Fetch first: an iterator that runs dry before ``train_steps`` raises
         # here, and must not leave a step counted that never ran.
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self._step_preflight_start_time = time.time()
+        reject_objective_padding(micro_batches, "Omni training")
+        previous_step = self.state.global_step
         self.state.global_step += 1
-
-        self._reset_async_activation_offload_if_enabled()
-        self.on_step_begin(micro_batches=micro_batches)
+        try:
+            error = None
+            try:
+                self._reset_async_activation_offload_if_enabled()
+                self.on_step_begin(micro_batches=micro_batches)
+            except Exception as exc:  # noqa: BLE001 - synchronize before distributed model collectives
+                error = exc
+            synchronize_step_begin_error(error, "Omni training")
+        except BaseException:
+            self.state.global_step = previous_step
+            raise
         self.sync_before_train_step()
 
         total_loss = 0.0
@@ -575,9 +599,20 @@ class OmniTrainer:
             raise RuntimeError("offline_cache_step requires an initialized SeedOmniOfflineCacheWriter.")
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self._step_preflight_start_time = time.time()
+        reject_objective_padding(micro_batches, "Omni training")
+        previous_step = self.state.global_step
         self.state.global_step += 1
-
-        self.on_step_begin(micro_batches=micro_batches)
+        try:
+            error = None
+            try:
+                self.on_step_begin(micro_batches=micro_batches)
+            except Exception as exc:  # noqa: BLE001 - synchronize before distributed model collectives
+                error = exc
+            synchronize_step_begin_error(error, "Omni training")
+        except BaseException:
+            self.state.global_step = previous_step
+            raise
         self.sync_before_train_step()
 
         num_micro_steps = len(micro_batches)

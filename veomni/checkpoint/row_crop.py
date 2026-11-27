@@ -42,7 +42,7 @@ def crop_dense_state_dict(state_dict, rows_by_name):
     return cropped
 
 
-class RowCropSavePlanner(_ExtraParallelSavePlanner):
+class _RowCropSaveMixin:
     """Clip selected write chunks to logical rows while retaining their global offsets."""
 
     def __init__(self, rows_by_name, **kwargs):
@@ -86,11 +86,15 @@ class RowCropSavePlanner(_ExtraParallelSavePlanner):
         return tensor
 
 
-class RowCropLoadPlanner(_ModelStrictLoadPlanner):
+class RowCropSavePlanner(_RowCropSaveMixin, _ExtraParallelSavePlanner):
+    """Logical-row planner using the default expert-layout proof."""
+
+
+class _RowCropLoadMixin:
     """Read logical row-cropped chunks directly into padded runtime shards."""
 
-    def __init__(self, strict_model: bool, rows_by_name):
-        super().__init__(strict_model=strict_model)
+    def __init__(self, strict_model: bool, rows_by_name, **kwargs):
+        super().__init__(strict_model=strict_model, **kwargs)
         self.rows_by_name = rows_by_name
 
     def _create_read_plan(self):
@@ -138,3 +142,7 @@ class RowCropLoadPlanner(_ModelStrictLoadPlanner):
             for local, start in tails:
                 local[start:].zero_()
         return plan
+
+
+class RowCropLoadPlanner(_RowCropLoadMixin, _ModelStrictLoadPlanner):
+    """Logical-row loader using the default expert-layout validation."""

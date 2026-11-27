@@ -15,6 +15,7 @@
 import math
 import os
 import pickle as pk
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Optional, Sequence
@@ -40,6 +41,7 @@ from ..utils.device import (
     get_device_type,
     synchronize,
 )
+from ..utils.loss_utils import contains_padding, reject_objective_padding, synchronize_step_begin_error
 from .base import BaseTrainer, VeOmniIter
 
 
@@ -104,6 +106,62 @@ class OfflineEmbeddingSaver:
             ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
             self.buffer = []
             self.index += 1
+
+    def state_dict(self):
+        """Flush rows before recording the corresponding data cursor."""
+        self.save_last()
+        return {
+            "version": 1,
+            "save_path": os.path.realpath(self.save_path),
+            "dp_rank": self.dp_rank,
+            "dataset_length": self.dataset_length,
+            "shard_num": self.shard_num,
+            "index": self.index,
+            "rest_len": self.rest_len,
+        }
+
+    def validate_state_dict(self, state):
+        """Reject missing or extra output shards before restoring a cursor."""
+        if not isinstance(state, dict) or state.get("version") != 1:
+            raise ValueError("Offline embedding checkpoint has no supported writer state")
+        expected = {
+            "save_path": os.path.realpath(self.save_path),
+            "dp_rank": self.dp_rank,
+            "dataset_length": self.dataset_length,
+            "shard_num": self.shard_num,
+        }
+        if any(state.get(key) != value for key, value in expected.items()):
+            raise ValueError("Offline embedding output or writer geometry differs from the checkpoint")
+        index, rest_len = state.get("index"), state.get("rest_len")
+        if (
+            type(index) is not int
+            or index < 0
+            or type(rest_len) is not int
+            or not 0 <= rest_len <= self.dataset_length
+            or self.buffer
+        ):
+            raise ValueError("Offline embedding writer state is invalid")
+
+        prefix, suffix = f"rank_{self.dp_rank}_shard_", ".parquet"
+        shard_files = {}
+        for name in os.listdir(self.save_path):
+            if name.startswith(prefix) and name.endswith(suffix):
+                number = name[len(prefix) : -len(suffix)]
+                if not number.isdecimal() or str(int(number)) != number or int(number) in shard_files:
+                    raise ValueError("Offline embedding output contains an unexpected shard name")
+                shard_files[int(number)] = os.path.join(self.save_path, name)
+        if set(shard_files) != set(range(index)):
+            raise ValueError("Offline embedding output shards differ from the saved writer position")
+
+        import pyarrow.parquet as parquet
+
+        rows = sum(parquet.read_metadata(shard_files[number]).num_rows for number in range(index))
+        if rows != self.dataset_length - rest_len:
+            raise ValueError("Offline embedding output row count differs from the saved writer position")
+
+    def load_state_dict(self, state):
+        self.validate_state_dict(state)
+        self.index, self.rest_len = state["index"], state["rest_len"]
 
 
 @dataclass
@@ -183,6 +241,7 @@ class DiTModelRuntime(VeOmniModelRuntime):
     """
 
     condition_model: PreTrainedModel = None
+    _veomni_offline_condition_runtime = True
 
     def _build_model(self):
         logger.info_rank0("Build model")
@@ -257,6 +316,48 @@ class DiTModelRuntime(VeOmniModelRuntime):
         else:
             loader(condition_model_rng_state)
 
+    def offline_condition_state(self) -> dict[str, Any]:
+        """Capture condition-model RNG for a cursor-only embedding checkpoint."""
+        condition = self.condition_model
+        if condition is None:
+            raise RuntimeError("Offline embedding requires a condition model")
+        getter = getattr(condition, "rng_state_dict", None)
+        setter = getattr(condition, "load_rng_state_dict", None)
+        if callable(getter) != callable(setter) or (
+            getattr(condition, "generator", None) is not None and not callable(getter)
+        ):
+            raise RuntimeError("Offline condition model cannot save and restore its private RNG")
+        rng_state = getter() if callable(getter) else None
+        if callable(getter) and not isinstance(rng_state, dict):
+            raise RuntimeError("Offline condition model returned an invalid private RNG state")
+        return {
+            "version": 1,
+            "condition_type": f"{type(condition).__module__}.{type(condition).__qualname__}",
+            "rng_state": rng_state,
+        }
+
+    def validate_offline_condition_state(self, state: dict[str, Any]) -> None:
+        condition = self.condition_model
+        getter = getattr(condition, "rng_state_dict", None)
+        setter = getattr(condition, "load_rng_state_dict", None)
+        expected_type = f"{type(condition).__module__}.{type(condition).__qualname__}"
+        if (
+            not isinstance(state, dict)
+            or state.get("version") != 1
+            or state.get("condition_type") != expected_type
+            or "rng_state" not in state
+            or callable(getter) != callable(setter)
+            or (getattr(condition, "generator", None) is not None and not callable(getter))
+            or (state["rng_state"] is None) == callable(getter)
+            or (callable(getter) and not isinstance(state["rng_state"], dict))
+        ):
+            raise ValueError("Offline condition-model RNG state cannot be safely restored")
+
+    def load_offline_condition_state(self, state: dict[str, Any]) -> None:
+        self.validate_offline_condition_state(state)
+        if state["rng_state"] is not None:
+            self.condition_model.load_rng_state_dict(state["rng_state"])
+
     def _build_parallelized_model(self) -> None:
         """``offline_embedding`` builds no DiT, so there is nothing to wrap."""
         if self.train_args.training_task != "offline_embedding":
@@ -319,6 +420,7 @@ class DiTTrainer:
         # Builds the condition model and, unless this is an embedding-only run,
         # the DiT itself along with its optimizer.
         self.base.model = self._build_model_runtime()
+        self.base.offline_embedding_runtime = self.base.model if self.training_task == "offline_embedding" else None
         self.base.LOG_SAMPLE = args.data.log_sample
 
         with use_parallel_state(self.base.model.parallel_state):
@@ -326,6 +428,7 @@ class DiTTrainer:
             self._build_data_transform()
             # rewrite _build_dataset, init offline_embedding_saver after build_dataset
             self._build_dataset()
+            self.base.offline_cache_writer = self.offline_embedding_saver
             # Do not use maincollator in dit training
             # self.base._build_collate_fn()
             # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
@@ -374,6 +477,7 @@ class DiTTrainer:
             args.train.num_train_epochs = 1
 
         self.training_task = args.train.training_task
+        self.base.saves_model_state = self.training_task != "offline_embedding"
 
     def _build_data_transform(self):
         args: VeOmniDiTArguments = self.base.args
@@ -434,6 +538,9 @@ class DiTTrainer:
         """Build dataloader with dyn_bsz=False for DiT (fixed batch)."""
         args = self.base.args
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
+            resume_kwargs = {}
+            if args.data.dataloader.type == "native":
+                resume_kwargs["resume_replay_timeout_seconds"] = args.data.resume_replay_timeout_seconds
             self.base.train_dataloader = build_dataloader(
                 dataloader_type=args.data.dataloader.type,
                 dataset=self.base.train_dataset,
@@ -459,6 +566,7 @@ class DiTTrainer:
                 shuffle=args.data.dataloader.shuffle,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
+                **resume_kwargs,
             )
         else:
             self.base.train_dataloader = None
@@ -517,6 +625,8 @@ class DiTTrainer:
         return [{k: batch[k][idx] for k in keys} for idx in range(num_items)]
 
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
+        if contains_padding(micro_batch):
+            raise ValueError("DiT does not support padded micro-batches")
         micro_batch = self.preforward(micro_batch)
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
             with torch.no_grad():
@@ -547,8 +657,6 @@ class DiTTrainer:
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        self.base.state.global_step += 1
-
         # SP broadcast of micro_batches
         with use_parallel_state(self.base.model.parallel_state):
             if get_parallel_state().sp_enabled:
@@ -567,8 +675,21 @@ class DiTTrainer:
             else:
                 micro_batches = next(data_iterator)
 
-        self.base._reset_async_activation_offload_if_enabled(self.base.model)
-        self.on_step_begin(micro_batches=micro_batches)
+        self.base._step_preflight_start_time = time.time()
+        reject_objective_padding(micro_batches, "DiT")
+        previous_step = self.base.state.global_step
+        self.base.state.global_step += 1
+        try:
+            error = None
+            try:
+                self.base._reset_async_activation_offload_if_enabled(self.base.model)
+                self.on_step_begin(micro_batches=micro_batches)
+            except Exception as exc:  # noqa: BLE001 - synchronize before distributed model collectives
+                error = exc
+            synchronize_step_begin_error(error, "DiT")
+        except BaseException:
+            self.base.state.global_step = previous_step
+            raise
 
         self.base.sync_before_train_step()
 
