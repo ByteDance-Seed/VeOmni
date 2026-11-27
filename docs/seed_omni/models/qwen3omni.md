@@ -211,7 +211,7 @@ released checkpoint); **compare audio, not codes**, when no seed is pinned.
 
 The codec halves are numerically identical to upstream to within floating-point
 reassociation (~1e-10 on CPU), which
-`tests/seed_omni/modules/qwen3omni/test_qwen3omni_codec.py` asserts with a stated
+`tests/seed_omni/modules/qwen3omni/test_qwen3omni_modules.py` asserts with a stated
 tolerance rather than bit equality.
 
 ---
@@ -435,9 +435,7 @@ speaker table, codec ids, patch/merge sizes) in a CPU-sized configuration, so
 the suite runs whole without weights.
 
 ```bash
-pytest tests/seed_omni/modules/qwen3omni/ \
-  tests/seed_omni/test_shipped_training_graphs.py \
-  tests/seed_omni/test_shipped_generation_graphs.py
+pytest tests/seed_omni/modules/qwen3omni/
 ```
 
 One case decodes the prompt back to text to read the speech-span boundaries, so

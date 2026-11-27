@@ -806,7 +806,7 @@ class Qwen3OmniTalker(InferenceMixin, PretrainedOmniModule):
         Upstream ships no talker training code, so the recipe here is derived
         from its decode loop and then held to it: replaying the codes a seeded
         ``generate`` produced through this forward reproduces the logits that
-        run saw (see ``tests/seed_omni/test_qwen3omni_talker_training.py``).
+        run saw (see ``tests/seed_omni/modules/qwen3omni/test_qwen3omni_modules.py``).
 
         Two heads are trained. The backbone's ``codec_head`` predicts the
         semantic group one frame ahead, and the nested code predictor fills
