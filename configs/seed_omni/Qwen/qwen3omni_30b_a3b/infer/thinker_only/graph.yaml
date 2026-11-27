@@ -1,6 +1,6 @@
 # Qwen3-Omni with the talker left out: audio/image/video/text in, text out.
 #
-# The thinker half of `graph_infer_audio.yaml`, stopping at `text_done` instead
+# The thinker half of `../audio_output/graph.yaml`, stopping at `text_done` instead
 # of handing over to the talker — what upstream spells `generate(return_audio=False)`.
 # Two things run on it:
 #

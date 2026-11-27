@@ -90,10 +90,18 @@ shared by include, so every recipe can be read and run on its own.
 | `train/joint/modules_train.yaml` | All six modules, nothing frozen. |
 | `train/joint/graph_train.yaml` | Training DAG carrying both the text CE and the talker CE. |
 | `train/joint/data.yaml` | The talker corpus — the one shape carrying both targets. |
-| `infer/modules_infer_eager.yaml` | Single-process eager module list (no FSDP wrap). |
-| `infer/modules_infer_eager_audio.yaml` | The same list plus the checkpoint's speech system turn. |
-| `infer/graph_infer_audio.yaml` | Generation FSM: thinker text → talker codes → waveform. |
-| `infer/graph_infer_thinker_only.yaml` | Generation FSM for text only (no speech half). |
+| `infer/audio_output/graph.yaml` | Generation FSM: thinker text → talker codes → waveform. |
+| `infer/audio_output/modules.yaml` | Its module list — all six, with the speech system turn on. |
+| `infer/thinker_only/graph.yaml` | Generation FSM for text only (no speech half). |
+| `infer/thinker_only/modules.yaml` | Its module list — the four thinker modules, speech turn off. |
+
+Each `infer/` subdirectory is one inference recipe: a graph and the module list it
+is run with, side by side. The two lists are siblings rather than a shared base
+because `model_config.modules` takes a single path and applies it whole, with no
+overlay. They differ in exactly the ways their graphs do: `thinker_only` declares
+neither the talker nor the codec (its graph never enters them) and leaves
+`collect_thinker_states` off (nothing reads the traces), so each list names
+exactly the modules its graph runs.
 
 ---
 
@@ -155,7 +163,7 @@ device cast, so an `auto` split across GPUs dies on a `cuda:0`/`cuda:N` mismatch
 
 ```bash
 python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/base.yaml \
-  --model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/modules_infer_eager_audio.yaml \
+  --model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/audio_output/modules.yaml \
   --model.model_config.infer_type audio_output \
   --infer.prompt "Hello! Please say this sentence out loud." \
   --infer.output_dir qwen3omni_out
@@ -168,7 +176,7 @@ python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/t
 * `thinker_only` also isolates faults: if it is right and `audio_output` is not,
   the fault is in the bridge or the talker, not the thinker.
 * The audio scenario needs `add_speech_system_prompt: true` on
-  `qwen3omni_text_encoder` (set in `modules_infer_eager_audio.yaml`). Without it
+  `qwen3omni_text_encoder` (set in `audio_output/modules.yaml`). Without it
   the thinker answers in numbered prose that never reaches `<|im_end|>` inside the
   token budget, so the FSM never hands over to the talker and no audio comes out.
   Text-only rounds leave it off: it caps replies at 50 words and imposes a voice

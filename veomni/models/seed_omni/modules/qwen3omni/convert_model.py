@@ -186,8 +186,8 @@ def convert_qwen3omni_checkpoint(
             "joint": "train/joint/graph_train.yaml",
         },
         generation={
-            "audio_output": "infer/graph_infer_audio.yaml",
-            "thinker_only": "infer/graph_infer_thinker_only.yaml",
+            "audio_output": "infer/audio_output/graph.yaml",
+            "thinker_only": "infer/thinker_only/graph.yaml",
         },
         training_graph=kwargs.pop("training_graph", None),
         generation_graph=kwargs.pop("generation_graph", None),

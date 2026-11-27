@@ -200,8 +200,8 @@ QWEN3OMNI_HF_LAYOUT = OmniHFLayout(
         "joint": "train/joint/graph_train.yaml",
     },
     generation_graphs={
-        "audio_output": "infer/graph_infer_audio.yaml",
-        "thinker_only": "infer/graph_infer_thinker_only.yaml",
+        "audio_output": "infer/audio_output/graph.yaml",
+        "thinker_only": "infer/thinker_only/graph.yaml",
     },
     infer_type="audio_output",
 )

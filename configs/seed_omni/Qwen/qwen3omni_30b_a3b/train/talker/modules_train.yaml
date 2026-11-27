@@ -47,7 +47,7 @@ qwen3omni_text_encoder:
     # module can capture them, and only before the backbone's scatter.
     publish_talker_prompt: true
     # Open every round with the checkpoint's speech system turn, the same as
-    # `infer/modules_infer_eager_audio.yaml` does at generation time. The
+    # `infer/audio_output/modules.yaml` does at generation time. The
     # corpus does not carry it: templating it here is what keeps the two from
     # drifting, so the talker trains on the conditioning it will be served.
     add_speech_system_prompt: true

@@ -1,11 +1,11 @@
-# Speech output, single-process eager: `modules_infer_eager.yaml` plus the
-# thinker's speech system turn.
+# Speech output, single-process eager. Paired with `graph.yaml` in this
+# directory: thinker text AR -> talker RVQ codes -> waveform.
 #
-# A near-copy rather than an include: `model_config.modules` takes one path and
-# is applied whole (no overlay), so the two inference scenarios cannot share a
-# base file. `test_seedomni_audio_ingestion.py` holds the pair to a single
-# intended difference — `qwen3omni_text_encoder.model_config`
-# `.add_speech_system_prompt` — so an edit to either file has to be mirrored.
+# A sibling of `../thinker_only/modules.yaml` rather than a shared base:
+# `model_config.modules` takes one path and is applied whole, with no overlay, so
+# the two inference recipes cannot share a file. The intended difference is the
+# `qwen3omni_text_encoder` block below — speech output needs the system turn, and
+# the text-only recipe must not have it.
 #
 # Single-process eager inference: no FSDP wrap, plain HF load on one device.
 #
@@ -26,8 +26,8 @@ qwen3omni_text_encoder:
   model_path: qwen3omni_text_encoder
   # Speech output needs this turn or the thinker answers in numbered prose that
   # never reaches `<|im_end|>` within the token budget, so the FSM never hands
-  # over to the talker and no audio comes out. Set per scenario, not in the
-  # checkpoint: `graph_infer_thinker_only.yaml` wants it off, since the 50-word
+  # over to the talker and no audio comes out. Set per recipe, not in the
+  # checkpoint: `../thinker_only/modules.yaml` leaves it off, since the 50-word
   # cap and voice persona would skew a text evaluation.
   model_config:
     add_speech_system_prompt: true
@@ -40,8 +40,7 @@ qwen3omni_llm:
   model_path: qwen3omni_llm
   # The talker reads an interior thinker layer, so the backbone has to keep the
   # whole layer stack. Set here rather than in the checkpoint because it is a
-  # property of the graph: `graph_infer_audio.yaml` needs it, and
-  # `graph_infer_thinker_only.yaml` would not, but both share this module list.
+  # property of the graph this recipe serves; the text-only recipe leaves it off.
   model_config:
     collect_thinker_states: true
   accelerator:

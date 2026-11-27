@@ -32,8 +32,8 @@ model:
     modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/joint/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/joint/graph_train.yaml
     infer_graph:
-      audio_output: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_audio.yaml
-      thinker_only: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_thinker_only.yaml
+      audio_output: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/audio_output/graph.yaml
+      thinker_only: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/thinker_only/graph.yaml
     infer_type: audio_output
 
   ops_implementation:

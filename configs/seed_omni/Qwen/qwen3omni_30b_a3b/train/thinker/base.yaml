@@ -12,7 +12,7 @@
 #
 # Speech output (single-process eager, one GPU):
 #   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/base.yaml \
-#     --model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/modules_infer_eager.yaml \
+#     --model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/thinker_only/modules.yaml \
 #     --model.model_config.infer_type audio_output \
 #     --infer.prompt "Hello! Please say this sentence out loud." \
 #     --infer.output_dir qwen3omni_out
@@ -28,8 +28,8 @@ model:
     modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/modules_train.yaml
     train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/thinker/graph_train.yaml
     infer_graph:
-      audio_output: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_audio.yaml
-      thinker_only: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_thinker_only.yaml
+      audio_output: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/audio_output/graph.yaml
+      thinker_only: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/thinker_only/graph.yaml
     infer_type: audio_output
   ops_implementation:
     attn_implementation: flash_attention_2

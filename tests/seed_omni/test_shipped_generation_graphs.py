@@ -26,7 +26,14 @@ from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 
 
 CONFIG_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "configs", "seed_omni")
-GRAPH_FILES = sorted(glob.glob(os.path.join(CONFIG_ROOT, "**", "graph_infer*.yaml"), recursive=True))
+# Two naming conventions are in use: ``graph_infer*.yaml`` (the flat form) and
+# ``infer/<recipe>/graph.yaml`` (a graph beside the module list it is run with).
+# Both must be collected — a pattern that only matched the flat form silently
+# stopped covering the recipes that moved.
+GRAPH_FILES = sorted(
+    glob.glob(os.path.join(CONFIG_ROOT, "**", "graph_infer*.yaml"), recursive=True)
+    + glob.glob(os.path.join(CONFIG_ROOT, "**", "infer", "*", "graph.yaml"), recursive=True)
+)
 
 
 def _spec(path: str) -> dict:
@@ -109,7 +116,7 @@ def test_the_qwen3omni_audio_graph_separates_the_talker_from_the_codec() -> None
     regenerated codes until the budget ran out — a run that reported a text
     reply and no audio.
     """
-    path = os.path.join(CONFIG_ROOT, "Qwen", "qwen3omni_30b_a3b", "infer", "graph_infer_audio.yaml")
+    path = os.path.join(CONFIG_ROOT, "Qwen", "qwen3omni_30b_a3b", "infer", "audio_output", "graph.yaml")
     states = _spec(path)["states"]
 
     def state_running(module: str) -> str:
@@ -126,10 +133,49 @@ def test_the_qwen3omni_audio_graph_separates_the_talker_from_the_codec() -> None
 
 
 def test_the_qwen3omni_thinker_only_graph_never_reaches_the_speech_modules() -> None:
-    """The thinker-only scenario shares the thinker states, so it is easy to over-copy."""
-    path = os.path.join(CONFIG_ROOT, "Qwen", "qwen3omni_30b_a3b", "infer", "graph_infer_thinker_only.yaml")
+    """The thinker-only scenario shares the thinker states, so it is easy to over-copy.
+
+    Its module list is a sibling file, not a shared base, so the graph and the
+    modules it is paired with have to agree on their own — this reads the graph
+    side.
+    """
+    path = os.path.join(CONFIG_ROOT, "Qwen", "qwen3omni_30b_a3b", "infer", "thinker_only", "graph.yaml")
     states = _spec(path)["states"]
     modules = {edge["from"] for state in states.values() for edge in state["body"]}
 
     assert "qwen3omni_talker" not in modules
     assert "qwen3omni_codec" not in modules
+
+
+RECIPE_GRAPH_FILES = sorted(glob.glob(os.path.join(CONFIG_ROOT, "**", "infer", "*", "graph.yaml"), recursive=True))
+
+
+def test_every_infer_recipe_pairs_its_graph_with_a_matching_module_list() -> None:
+    """Each ``infer/<recipe>/`` directory is a graph plus the modules it needs.
+
+    The two are separate files because `model_config.modules` takes one path and
+    applies it whole, with no overlay — so nothing structurally forces them to
+    agree, and a recipe that declares a module its graph never runs (or omits one
+    it does) only fails at load time, on a machine with the checkpoint.
+
+    "Agrees" is both directions: a graph module must be declared, and a declared
+    module must be one the graph enters. The exception is a module that is only
+    there to be *built* — there is none today, so any would be a deliberate choice
+    worth writing down here.
+    """
+    assert RECIPE_GRAPH_FILES, "no infer/<recipe>/graph.yaml found; the glob is wrong"
+
+    for path in RECIPE_GRAPH_FILES:
+        recipe_dir = os.path.dirname(path)
+        modules_path = os.path.join(recipe_dir, "modules.yaml")
+        assert os.path.isfile(modules_path), f"{path} has no sibling modules.yaml"
+
+        spec = _spec(path)
+        used = {edge["from"].split(".")[0] for state in spec["states"].values() for edge in state["body"]}
+        with open(modules_path) as handle:
+            declared = set(yaml.safe_load(handle) or {})
+
+        assert not used - declared, (
+            f"{recipe_dir}: graph runs modules that are not declared: {sorted(used - declared)}"
+        )
+        assert not declared - used, f"{recipe_dir}: declares modules the graph never enters: {sorted(declared - used)}"
