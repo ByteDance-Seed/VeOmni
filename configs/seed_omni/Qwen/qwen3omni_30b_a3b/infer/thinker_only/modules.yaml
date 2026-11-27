@@ -28,9 +28,11 @@ qwen3omni_vision:
 
 qwen3omni_text_encoder:
   model_path: qwen3omni_text_encoder
-  # Deliberately no `add_speech_system_prompt`: the turn belongs to the speech
-  # scenario. It lives here rather than in the checkpoint so the two recipes can
-  # differ on it.
+  # Explicitly disabled so a checkpoint exported from a talker/joint training
+  # run (which persists `add_speech_system_prompt: true`) does not inject the
+  # 50-word speech persona during text-only evaluation.
+  model_config:
+    add_speech_system_prompt: false
   accelerator:
     gradient_checkpointing:
       enable: false
@@ -39,9 +41,11 @@ qwen3omni_text_encoder:
 
 qwen3omni_llm:
   model_path: qwen3omni_llm
-  # No `collect_thinker_states`: only a talker reads the interior layer, and this
-  # graph has none. Leaving it on would retain the whole layer stack per step for
-  # traces nothing consumes.
+  # Explicitly disabled so a checkpoint exported from a talker/joint training
+  # run (which persists `collect_thinker_states: true`) does not retain unused
+  # interior-layer traces when no talker is in the graph.
+  model_config:
+    collect_thinker_states: false
   accelerator:
     fsdp_config:
       fsdp_mode: eager
