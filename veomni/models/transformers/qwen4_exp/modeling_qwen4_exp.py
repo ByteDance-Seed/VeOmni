@@ -858,7 +858,9 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1 and not (
-            self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS and not use_precomputed_states
+            self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS
+            and not use_precomputed_states
+            and (self.veomni_chunk_gated_delta_rule.impl != "fla_npu" or self.num_v_heads // self.num_k_heads <= 4)
         ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -1346,7 +1348,10 @@ class Qwen4ExpTextExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.activation = config.hidden_act
+        self._veomni_fp32_expert_wgrad = False
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
+        if "fp32_wgrad" in self.veomni_moe.kwargs:
+            raise ValueError("Set npu_expert_fp32_wgrad in mixed_precision, not fp32_wgrad in MoE op kwargs")
 
     def forward(
         self,
@@ -1366,6 +1371,7 @@ class Qwen4ExpTextExperts(nn.Module):
             self.gate_up_proj,
             num_experts=self.num_experts,
             activation=self.activation,
+            **({"fp32_wgrad": True} if self._veomni_fp32_expert_wgrad else {}),
         )
         # --- Patch.1 ---
 

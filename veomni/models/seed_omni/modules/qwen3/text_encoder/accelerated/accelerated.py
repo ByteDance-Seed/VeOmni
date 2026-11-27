@@ -5,6 +5,7 @@ this file owns the SP-aware training pre/forward/post hooks, ChatML template
 binding, and the image-mode vision-token freeze with its row-wise weight decay.
 """
 
+import hashlib
 from typing import Any, Dict, Optional
 
 import torch
@@ -179,12 +180,26 @@ class TrainingMixin(BaseTrainingMixin):
         the optimizer is built — before the lr-scheduler or any checkpoint load —
         so every save in a run has the same layout. Resuming from a checkpoint
         written by a run *without* this hook is not supported for this recipe.
+
+        Nonzero row-wise decay with an FP32-master optimizer is rejected before
+        modifying its groups or hooks; the compute-copy hook cannot update that
+        optimizer's authoritative master weight. The runtime coordinates local
+        optimizer-build failures across ranks before training starts. With zero
+        decay, a group identity binds the row mask for exact optimizer resume.
         """
         if self._trainable_row_mask is None:
             return
         weight = self.embed_tokens.weight
         sub_optimizers = getattr(optimizer, "optimizers_dict", {None: optimizer}).values()
-        owner = next((o for o in sub_optimizers if _param_group_of(o, weight) is not None), None)
+        owners = [
+            (leaf, group)
+            for leaf in sub_optimizers
+            for group in leaf.param_groups
+            if any(param is weight for param in group["params"])
+        ]
+        if len(owners) > 1:
+            raise RuntimeError("Qwen3 image-mode embedding has multiple optimizer owners")
+        owner, group = owners[0] if owners else (None, None)
         if owner is None:
             # Fail closed: silently leaving the group's decay in place is exactly the
             # state that shrinks the frozen rows, and nothing downstream would notice.
@@ -193,7 +208,28 @@ class TrainingMixin(BaseTrainingMixin):
                 "vision-row weight decay cannot be applied; its group decay (if any) stays in effect."
             )
             return
-        group = _param_group_of(owner, weight)
+        from veomni.optim.master_fp32_adamw import MasterFP32AdamW
+
+        if isinstance(owner, MasterFP32AdamW):
+            if owner.state.get(weight):
+                raise RuntimeError("Qwen3 image-mode row masking requires a fresh FP32 master optimizer")
+            if group["weight_decay"]:
+                raise RuntimeError(
+                    "Qwen3 image-mode row-wise weight decay is unsupported with FP32 master optimizers; "
+                    "use AdamW or set weight_decay=0."
+                )
+            mask = self._trainable_row_mask
+            if mask.dtype != torch.bool or mask.ndim != 1 or mask.numel() != self.embed_tokens.num_embeddings:
+                raise RuntimeError("Qwen3 image-mode trainable-row mask is invalid")
+            mask_bytes = mask.detach().to(device="cpu").contiguous().numpy().tobytes()
+            positions = [index for index, param in enumerate(group["params"]) if param is weight]
+            if len(positions) != 1:
+                raise RuntimeError("Qwen3 image-mode embedding must occur exactly once in its optimizer group")
+            identity = f"v1:{hashlib.sha256(mask_bytes).hexdigest()}:{positions[0]}"
+            marker = "qwen3_image_row_mask"
+            if marker in group and group[marker] != identity:
+                raise RuntimeError("Qwen3 image-mode optimizer group has a conflicting row-mask identity")
+            group[marker] = identity
         self._row_weight_decay = group["weight_decay"]
         if not self._row_weight_decay:
             return

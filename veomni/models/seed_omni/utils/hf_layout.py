@@ -417,10 +417,17 @@ class OmniHFLayout:
         parallel_state: Any = None,
     ) -> Mapping[str, torch.Tensor]:
         """``{module_key: tensor}`` to export for live ``model`` of ``module_name``."""
-        from ....checkpoint.dcp_checkpointer import ModelState
+        from ....checkpoint.dcp_checkpointer import ModelState, _export_extra_parallel_layout_key
 
         del module_name
-        return ModelState(model, parallel_state=parallel_state).state_dict()
+        state = {}
+        for key, tensor in ModelState(model, parallel_state=parallel_state).state_dict().items():
+            key = _export_extra_parallel_layout_key(key)
+            if key is not None:
+                if key in state:
+                    raise RuntimeError(f"Duplicate exported ExtraParallel tensor key: {key}")
+                state[key] = tensor
+        return state
 
     def build_fqn_to_index_mapping(self, weight_files: Mapping[str, str]) -> dict[str, int]:
         """Map each source key in ``weight_files`` to its 1-based ``HuggingFaceStorageWriter`` shard index."""
@@ -1056,7 +1063,12 @@ def save_hf_source_checkpoint(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
+    from ....checkpoint.dcp_checkpointer import (
+        _export_extra_parallel_layout_key,
+        _reject_unproven_extra_parallel_optimizer,
+    )
     from ....checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+    from ....utils.dist_utils import raise_if_any_rank_failed
     from ....utils.save_safetensor_utils import _consolidate_hf_safetensors, _consolidation_process_group
 
     apply_dcp_consolidation_patch()
@@ -1069,69 +1081,95 @@ def save_hf_source_checkpoint(
     # rank only, so "produced" is decided across ranks, not from save_state.
     produced: set[str] = set()
     for name, (model, parallel_state) in modules.items():
-        module_state = layout.extract_module_save_state(name, model, parallel_state)
-        tied = _tied_parameter_names(model)
-        # The hook answers in *source* terms, so it must see the source's own key
-        # layout: a model that declares weight conversions has a state dict in
-        # transformers' fused form, and an `export_state` written against the
-        # release layout would see names it does not know. `_revert_...` is a
-        # no-op for a model that declares none.
-        from ....utils.save_safetensor_utils import _revert_model_weight_conversions_for_hf
-
-        module_state = _revert_model_weight_conversions_for_hf(model, module_state)
-        module_layout = layout.modules[name]
-        # Keys this module computes instead of loading (:meth:`OmniHFModuleLayout.
-        # generated_tensors`). The source has no such tensor by construction, so
-        # they are neither written back nor counted as unmapped.
-        generated_keys = (
-            set(module_layout.generated_tensors(source.path, model.config))
-            if module_layout.generated_tensors is not None
-            else set()
-        )
-        export_state = module_layout.export_state
-        exported_keys = list(module_state)
-        if export_state is not None:
-            module_state = export_state(model, module_state)
-            exported_keys = _all_ranks_union(module_state)
-        unmapped, reshaped, bad_dtypes = [], [], []
-        for key in exported_keys:
-            source_key = layout.source_key(name, key)
-            if source_key is None or source_key not in weight_files:
-                if key in generated_keys:
+        _reject_unproven_extra_parallel_optimizer({"model": model}, parallel_state)
+        error = None
+        try:
+            module_state = layout.extract_module_save_state(name, model, parallel_state)
+            normalized_state = {}
+            for key, tensor in module_state.items():
+                key = _export_extra_parallel_layout_key(key)
+                if key is None:
                     continue
-                # A tied alias the source does not store (``tie_word_embeddings``
-                # checkpoints omit ``lm_head.weight``) is written through its original.
-                if not any(layout.source_key(name, alias) in weight_files for alias in tied.get(key, ())):
-                    unmapped.append(key)
-                continue
-            if source_key in produced:
-                raise ValueError(f"Source key {source_key!r} is produced by more than one module.")
-            produced.add(source_key)
-            if key not in module_state:
-                continue
-            tensor = module_state[key]
-            dtype, shape = source_specs[source_key]
-            if tuple(tensor.shape) != shape:
-                reshaped.append(f"{key} {tuple(tensor.shape)} vs {source_key} {shape}")
-                continue
-            try:
-                save_state[source_key] = _to_source_dtype(name, key, tensor, dtype)
-            except TypeError as exc:
-                bad_dtypes.append(str(exc))
-        if export_state is not None:
-            # An exported key may live on one rank only; every rank must agree to raise.
-            reshaped = _all_ranks_union(reshaped)
-            bad_dtypes = _all_ranks_union(bad_dtypes)
-        if bad_dtypes:
-            raise TypeError(bad_dtypes[0])
-        if unmapped or reshaped:
-            raise ValueError(
-                f"save_hf_source_checkpoint: module '{name}' cannot be written back in the `{source.model_type}` "
-                f"source layout. Keys with no source key: {unmapped}; keys whose shape differs from the source: "
-                f"{reshaped}. A module whose checkpoint tensor converter renames or reshapes tensors cannot export "
-                "to its upstream layout without an export_state; disable train.checkpoint.save_hf_weights, "
-                "or train from a split checkpoint."
+                if key in normalized_state:
+                    raise ValueError(f"Multiple checkpoint tensors map to export key {key}")
+                normalized_state[key] = tensor
+            module_state = normalized_state
+            tied = _tied_parameter_names(model)
+            # The hook answers in *source* terms, so it must see the source's own key
+            # layout: a model that declares weight conversions has a state dict in
+            # transformers' fused form, and an `export_state` written against the
+            # release layout would see names it does not know. `_revert_...` is a
+            # no-op for a model that declares none.
+            from ....utils.save_safetensor_utils import _revert_model_weight_conversions_for_hf
+
+            module_state = _revert_model_weight_conversions_for_hf(model, module_state)
+            module_layout = layout.modules[name]
+            # Keys this module computes instead of loading (:meth:`OmniHFModuleLayout.
+            # generated_tensors`). The source has no such tensor by construction, so
+            # they are neither written back nor counted as unmapped.
+            generated_keys = (
+                set(module_layout.generated_tensors(source.path, model.config))
+                if module_layout.generated_tensors is not None
+                else set()
             )
+            export_state = module_layout.export_state
+            exported_keys = list(module_state)
+            if export_state is not None:
+                module_state = export_state(model, module_state)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, f"preparing SeedOmni HF module {name}")
+        if export_state is not None:
+            exported_keys = _all_ranks_union(module_state)
+        error = None
+        try:
+            unmapped, reshaped, bad_dtypes = [], [], []
+            for key in exported_keys:
+                source_key = layout.source_key(name, key)
+                if source_key is None or source_key not in weight_files:
+                    if key in generated_keys:
+                        continue
+                    # A tied alias the source does not store (``tie_word_embeddings``
+                    # checkpoints omit ``lm_head.weight``) is written through its original.
+                    if not any(layout.source_key(name, alias) in weight_files for alias in tied.get(key, ())):
+                        unmapped.append(key)
+                    continue
+                if source_key in produced:
+                    raise ValueError(f"Source key {source_key!r} is produced by more than one module.")
+                produced.add(source_key)
+                if key not in module_state:
+                    continue
+                tensor = module_state[key]
+                dtype, shape = source_specs[source_key]
+                if tuple(tensor.shape) != shape:
+                    reshaped.append(f"{key} {tuple(tensor.shape)} vs {source_key} {shape}")
+                    continue
+                try:
+                    save_state[source_key] = _to_source_dtype(name, key, tensor, dtype)
+                except TypeError as exc:
+                    bad_dtypes.append(str(exc))
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, f"mapping SeedOmni HF module {name}")
+        error = None
+        try:
+            if export_state is not None:
+                # An exported key may live on one rank only; every rank must agree to raise.
+                reshaped = _all_ranks_union(reshaped)
+                bad_dtypes = _all_ranks_union(bad_dtypes)
+            if bad_dtypes:
+                raise TypeError(bad_dtypes[0])
+            if unmapped or reshaped:
+                raise ValueError(
+                    f"save_hf_source_checkpoint: module '{name}' cannot be written back in the `{source.model_type}` "
+                    f"source layout. Keys with no source key: {unmapped}; keys whose shape differs from the source: "
+                    f"{reshaped}. A module whose checkpoint tensor converter renames or reshapes tensors cannot export "
+                    "to its upstream layout without an export_state; disable train.checkpoint.save_hf_weights, "
+                    "or train from a split checkpoint."
+                )
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, f"validating SeedOmni HF module {name}")
 
     for key, original in layout.tied_source_keys.items():
         if key in weight_files and key not in produced and original in produced:
