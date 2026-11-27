@@ -242,6 +242,12 @@ _vlm_cases = [
         partial(_vlm_batch, patch_size=4, vocab_size=128),
         id="qwen4_exp",
     ),
+    pytest.param(
+        "glm5_next",
+        "./tests/toy_config/glm5_next_toy",
+        partial(_vlm_batch, patch_size=14),
+        id="glm5_next",
+    ),
 ]
 
 

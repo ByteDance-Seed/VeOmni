@@ -139,6 +139,89 @@ def tiny_glm_moe_dsa_config(architecture: str = "GlmMoeDsaForCausalLM") -> Pretr
     )
 
 
+def tiny_glm5_next_text_config(architecture: str = "Glm5NextTextModel") -> PretrainedConfig:
+    """Four-layer GLM-5.3-Flash text toy with KDA + DSA + sparse MoE."""
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+
+    Glm5NextTextConfig = get_veomni_config_class(Glm5NextTextConfig)
+
+    return Glm5NextTextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        n_shared_experts=1,
+        n_routed_experts=4,
+        kv_lora_rank=16,
+        q_lora_rank=32,
+        qk_rope_head_dim=0,
+        v_head_dim=16,
+        qk_nope_head_dim=16,
+        num_experts_per_tok=2,
+        max_position_embeddings=64,
+        index_topk=4,
+        index_kpool=2,
+        index_head_dim=16,
+        index_n_heads=2,
+        linear_head_dim=16,
+        linear_num_heads=4,
+        linear_conv_kernel_dim=2,
+        hc_mult=2,
+        hc_sinkhorn_iters=2,
+        pad_token_id=0,
+        # Cover full→shared DSA top-k reuse (shared must immediately follow a full DSA).
+        layer_types=[
+            "linear_attention",
+            "deepseek_sparse_attention",
+            "deepseek_sparse_attention",
+            "linear_attention",
+        ],
+        mlp_layer_types=["dense", "dense", "sparse", "sparse"],
+        indexer_types=["full", "full", "shared", "full"],
+        architectures=[architecture],
+        attn_implementation="eager",
+        experts_implementation="eager",
+    )
+
+
+def tiny_glm5_next_config(architecture: str = "Glm5NextForConditionalGeneration") -> PretrainedConfig:
+    """Tiny multimodal wrapper around :func:`tiny_glm5_next_text_config`."""
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextConfig, Glm5NextVisionConfig
+
+    Glm5NextConfig = get_veomni_config_class(Glm5NextConfig)
+    Glm5NextVisionConfig = get_veomni_config_class(Glm5NextVisionConfig)
+
+    text = tiny_glm5_next_text_config("Glm5NextTextModel")
+    vision = Glm5NextVisionConfig(
+        depth=2,
+        hidden_size=32,
+        num_heads=2,
+        image_size=28,
+        patch_size=14,
+        out_hidden_size=64,
+        intermediate_size=64,
+        projection_intermediate_size=64,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        swiglu_limit=10.0,
+    )
+    return Glm5NextConfig(
+        text_config=text,
+        vision_config=vision,
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        image_start_token_id=VISION_START_TOKEN_ID,
+        image_end_token_id=VISION_END_TOKEN_ID,
+        video_start_token_id=AUDIO_START_TOKEN_ID,
+        video_end_token_id=126,
+        architectures=[architecture],
+        attn_implementation="eager",
+    )
+
+
 def tiny_gemma3_text_config(
     architecture: str = "Gemma3ForCausalLM",
     *,

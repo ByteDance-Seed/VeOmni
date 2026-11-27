@@ -238,6 +238,15 @@ text_test_cases = [
         None,  # max_ep_size
     ),
     pytest.param(
+        "glm5_next",
+        "./tests/toy_config/glm5_next_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        1,  # max_sp_size: gather-before-attn SP is wired but not SP-aligned in CI yet
+        None,  # max_ep_size
+    ),
+    pytest.param(
         "gpt_oss",
         "./tests/toy_config/gpt_oss_toy",
         True,  # is_moe

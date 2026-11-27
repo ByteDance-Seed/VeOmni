@@ -69,6 +69,14 @@ SYNC_FORWARD_CASES = (
         dtype="bfloat16",
     ),
     ForwardCase(
+        "glm5_next-eager",
+        _toy("glm5_next_toy"),
+        "Glm5NextForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="eager",
+        dtype="bfloat16",
+    ),
+    ForwardCase(
         "qwen3_vl_moe-fa2-fused",
         _toy("qwen3vlmoe_toy"),
         "Qwen3VLMoeForConditionalGeneration",

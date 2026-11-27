@@ -67,6 +67,7 @@ from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import DeepseekV4CheckpointTensorConverter
+from veomni.models.transformers.glm5_next.checkpoint_tensor_converter import Glm5NextCheckpointTensorConverter
 from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import GlmMoeDsaCheckpointTensorConverter
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
 from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
@@ -335,6 +336,13 @@ class _PerExpertTrunkModel(nn.Module):
         pytest.param(DeepseekV3CheckpointTensorConverter, "model.layers.0", "model.layers.1", id="deepseek_v3"),
         # So does GLM-5 (``model.layers.78``).
         pytest.param(GlmMoeDsaCheckpointTensorConverter, "model.layers.0", "model.layers.1", id="glm_moe_dsa"),
+        # GLM-5.3-Flash uses the same fused expert layout under language_model.
+        pytest.param(
+            Glm5NextCheckpointTensorConverter,
+            "model.language_model.layers.0",
+            "model.language_model.layers.1",
+            id="glm5_next",
+        ),
         # VeOmni builds Qwen3-Omni-MoE with has_talker=False.
         pytest.param(
             Qwen3OmniMoeCheckpointTensorConverter,

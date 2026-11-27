@@ -28,6 +28,7 @@ _FREEZE_VIT_VLM_CASES = [
     pytest.param("./tests/toy_config/qwen3vl_toy/config.json", id="qwen3_vl"),
     pytest.param("./tests/toy_config/qwen3vlmoe_toy/config.json", id="qwen3_vl_moe"),
     pytest.param("./tests/toy_config/qwen4_exp_toy/config.json", id="qwen4_exp"),
+    pytest.param("./tests/toy_config/glm5_next_toy/config.json", id="glm5_next"),
 ]
 
 
