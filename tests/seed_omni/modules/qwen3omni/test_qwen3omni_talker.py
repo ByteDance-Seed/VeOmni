@@ -1643,3 +1643,83 @@ def test_an_accept_layer_past_the_backbone_depth_says_so():
     sample = _text_sample(module, [4])
     with pytest.raises(ValueError, match="accept_hidden_layer=99"):
         _run_forward_node(module, [sample])
+
+
+def test_an_empty_dummy_window_stays_finite():
+    """A dummy can hold a zero-row window under the shard handoff.
+
+    When the whole batch is text, the worker appends one dummy media placeholder
+    per sample so the vision tower still runs. Under SP those placeholders are
+    sliced like anything else, and a sample lying outside this rank's window gets
+    a zero-row slice. ``mean()`` of that is NaN, and ``NaN * 0`` propagates — so
+    the anchor poisons the real embeddings it was only meant to touch with a
+    zero gradient. ``sum() * 0`` is the same anchor with a finite value.
+    """
+    from veomni.models.seed_omni.modules.qwen3omni.llm.accelerated.accelerated import _fold_fsdp_dummy_anchors
+    from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN
+
+    hidden = 8
+    embeds = torch.ones(1, 4, hidden)
+    empty_dummy = ConversationItem(
+        type="image",
+        value=torch.zeros(0, hidden),
+        role="user",
+        is_dummy=True,
+        meta={_OMNI_TOKEN_LEN: 0},
+    )
+    folded = _fold_fsdp_dummy_anchors(embeds, [[empty_dummy]])
+
+    assert torch.isfinite(folded).all(), "an empty dummy window poisoned the packed row"
+    torch.testing.assert_close(folded, embeds)
+
+
+def test_a_mixed_batch_regathers_the_producers_before_packing():
+    """Producer windows only concatenate for a single-modality batch.
+
+    Each producer slices the subsequence *it* wrote — text in carrier order, then
+    images, then videos — so the window widths it used are per producer, not per
+    packed row. With a text item and an image item the two windows do not add up
+    to this rank's packed window, so the backbone has to gather each producer
+    back to full length first and slice the reassembled row itself.
+    """
+    from unittest import mock
+
+    module = _accelerated_llm()
+    sample = _text_sample(module, [4])
+    sample.append(
+        ConversationItem(
+            type="image",
+            value=torch.zeros(4, module.config.text_config.hidden_size),
+            role="user",
+            meta={"grid_thw": torch.tensor((1, 4, 4)), "deepstack": []},
+        )
+    )
+
+    gathered = {"called": False}
+
+    def fake_gather(groups, sp_group, *, meta_list_keys=()):
+        del groups, sp_group, meta_list_keys
+        gathered["called"] = True
+
+    with mock.patch(
+        "veomni.models.seed_omni.modules.qwen3omni.llm.accelerated.accelerated.gather_sp_sharded_groups",
+        side_effect=fake_gather,
+    ):
+        with mock.patch(
+            "veomni.models.seed_omni.modules.qwen3omni.llm.accelerated.accelerated.get_parallel_state"
+        ) as ps:
+            ps.return_value.sp_size = 2
+            ps.return_value.sp_group = object()
+            ps.return_value.skip_sp_gather_between_modules = True
+            ps.return_value.fsdp_enabled = False
+            # Only the decision matters here; the packed forward is covered by the
+            # alignment test. The fake gather does not repartition the carrier, so
+            # packing it for real would fail on these stand-in values.
+            with mock.patch.object(module, "_normalize_visual_inputs", side_effect=lambda e, m, d: (e, m, d)):
+                try:
+                    module.forward_pre(method="forward", conversation_list=[sample])
+                except Exception:
+                    pass
+
+    assert gathered["called"], "a mixed batch must regather its producers before packing"
+    assert module._carrier_is_sharded is False, "the carrier holds full spans again"

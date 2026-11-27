@@ -19,7 +19,13 @@ from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
 from ....base.llm_packing import item_token_len
-from ....base.sp_shard import pad_sp_shard, split_sp_sharded_tensor
+from ....base.sp_shard import (
+    gather_sp_sharded_groups,
+    modality_groups,
+    pad_sp_shard,
+    single_modality_shard_batch,
+    split_sp_sharded_tensor,
+)
 from ...carrier import is_thinker_input, scatter_hidden_states
 from ..configuration import Qwen3OmniLlmConfig
 from ..modeling import (
@@ -53,6 +59,10 @@ class TrainingMixin(TrainingModuleMixin):
         # Pre-slice row count for the router-logits gather (see
         # ``_full_sequence_router_logits``).
         self._sp_router_own_len: Optional[int] = None
+        # Whether ``forward_pre`` left the carrier holding this rank's window. Set
+        # there rather than re-derived in ``forward_post``: a mixed batch is
+        # gathered on the way in, so the carrier looks the same in both cases.
+        self._carrier_is_sharded: bool = False
 
     @pre_forward("forward")
     def forward_pre(
@@ -62,6 +72,24 @@ class TrainingMixin(TrainingModuleMixin):
     ) -> Dict[str, Any]:
         ps = get_parallel_state()
         sharded = ps.sp_size > 1 and ps.skip_sp_gather_between_modules
+        if sharded and not single_modality_shard_batch(conversation_list):
+            # Mixed producers: each one sliced only the subsequence *it* wrote
+            # (text in carrier order, then images, then videos), so concatenating
+            # their windows does not reconstruct this rank's window over the packed
+            # row — the producers' window widths differ from the packed one. Gather
+            # each producer back to full length and let the ordinary packer slice
+            # the reassembled row below. `single_modality_shard_batch` is the case
+            # where the windows already concatenate exactly, and is untouched.
+            gather_sp_sharded_groups(
+                modality_groups(conversation_list),
+                ps.sp_group,
+                meta_list_keys=("deepstack",),
+            )
+            sharded = False
+        # Remembered for ``forward_post``: it has to split on the same decision,
+        # and re-deriving it there would ask the carrier a question whose answer
+        # this method just changed.
+        self._carrier_is_sharded = sharded
         # ``sharded`` means the producers handed this rank their windows, so the
         # packed embeds are already this rank's row and the lengths/positions come
         # from ``meta``. Everything else is the same packer.
@@ -211,7 +239,8 @@ class TrainingMixin(TrainingModuleMixin):
         traces = self._thinker_traces(outputs)
 
         ps = get_parallel_state()
-        sharded = ps.sp_size > 1 and ps.skip_sp_gather_between_modules
+        sharded = self._carrier_is_sharded
+        self._carrier_is_sharded = False
         if sharded:
             # Shard handoff: this rank keeps its own window and the consumer (the
             # next module's packer, or ``decode``'s label slice) concatenates from
@@ -435,8 +464,13 @@ def _fold_fsdp_dummy_anchors(
             if not part.is_dummy:
                 continue
             if isinstance(part.value, torch.Tensor):
+                # ``sum``, not ``mean``: under the shard handoff a dummy can hold a
+                # zero-row window (it lies outside this rank's slice), and ``mean``
+                # of an empty tensor is NaN — which ``NaN * 0`` propagates into the
+                # real embeddings. ``sum`` of an empty tensor is 0.0, and the
+                # multiplication still keeps the anchor differentiable.
                 inputs_embeds = (
-                    inputs_embeds + part.value.mean().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
+                    inputs_embeds + part.value.sum().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
                 )
     return inputs_embeds
 
