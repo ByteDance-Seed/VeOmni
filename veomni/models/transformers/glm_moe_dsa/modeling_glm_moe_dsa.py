@@ -340,7 +340,7 @@ class GlmMoeDsaAttention(nn.Module):
             if attn_impl not in ("eager", "veomni_eager", "sdpa", "veomni_sdpa"):
                 raise ValueError(
                     "GLM-MoE-DSA with dsa_attention_implementation='eager' requires attn_implementation "
-                    f"'eager', 'veomni_eager', or 'sdpa', got {attn_impl!r}."
+                    f"'eager', 'veomni_eager', 'sdpa', or 'veomni_sdpa', got {attn_impl!r}."
                 )
             self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
 

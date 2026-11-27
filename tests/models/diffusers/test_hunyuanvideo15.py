@@ -79,10 +79,8 @@ def batch(glyph=False):
     ("initial_attention", "constructor_kwargs", "expected_attention"),
     [
         pytest.param("flash_attention_2", {"attn_implementation": "sdpa"}, "sdpa", id="override-sdpa"),
-        pytest.param("flash_attention_2", {"attn_implementation": "eager"}, "eager", id="override-eager"),
-        pytest.param(
-            "flash_attention_2", {"attn_implementation": "veomni_eager"}, "veomni_eager", id="override-veomni-eager"
-        ),
+        pytest.param("flash_attention_2", {"attn_implementation": "eager"}, None, id="reject-eager"),
+        pytest.param("flash_attention_2", {"attn_implementation": "veomni_eager"}, None, id="reject-veomni-eager"),
         pytest.param(
             "flash_attention_2", {"attn_implementation": "veomni_sdpa"}, "veomni_sdpa", id="override-veomni-sdpa"
         ),
@@ -114,14 +112,14 @@ def test_constructor_attention_uses_config_before_hf_init(
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("attention", [None, "eager", "veomni_sdpa"])
+@pytest.mark.parametrize("attention", [None, "veomni_sdpa"])
 def test_dense_attention_ops_config_roundtrip(monkeypatch, tmp_path, attention):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     config = tiny_config()
     if attention is not None:
         config._set_ops_implementation({"attn_implementation": attention})
     model = HunyuanVideo15Model(config)
-    expected = "veomni_eager" if attention == "eager" else (attention or "veomni_sdpa")
+    expected = attention or "veomni_sdpa"
     assert config._attn_implementation == config.ops_config.attn_implementation == expected
     config.save_pretrained(tmp_path)
     restored = HunyuanVideo15Config.from_pretrained(tmp_path)
@@ -1052,7 +1050,7 @@ def test_full_backbone_npu():
     torch.manual_seed(42)
     with torch.device(get_device_type(), 0):
         model = HunyuanVideo15Model._from_config(
-            HunyuanVideo15Config(), dtype=torch.bfloat16, attn_implementation="eager"
+            HunyuanVideo15Config(), dtype=torch.bfloat16, attn_implementation="sdpa"
         )
         initialize_nonzero_linears(model)
     assert sum(p.numel() for p in model.parameters()) == 8326608160

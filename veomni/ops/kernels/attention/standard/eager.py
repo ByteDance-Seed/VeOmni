@@ -236,7 +236,10 @@ def eager_attention_forward(
     Supports GQA expansion derived from Q/K head counts, explicit float
     additive or boolean masks, unmasked ``is_causal`` / ``sliding_window``
     visibility, ``softcap``, ``position_bias``, and attention sinks
-    (``s_aux``). When Ulysses sequence parallelism is active and
+    (``s_aux``). Masks broadcast on the right against ``(batch, heads, query, key)``:
+    ``(query, key)``, ``(1 or heads, query, key)``, or ``(batch, 1 or heads, query, key)``.
+    A 2D ``(batch, key)`` padding mask is not a query mask. When Ulysses sequence
+    parallelism is active and
     ``skip_ulysses`` is ``False``, Q/K/V are gathered along sequence and
     scattered across heads before attention (slicing global head-indexed
     masks, ``position_bias``, and ``s_aux`` to the local head shard), and the

@@ -293,6 +293,27 @@ def test_flex_and_sdpa_ulysses_allow_sliding_window_without_metadata(monkeypatch
     torch.testing.assert_close(visible, (distance >= 0) & (distance < 2))
 
 
+@pytest.mark.parametrize("order", ("overlay-first", "canonical-first"))
+@pytest.mark.parametrize("bidirectional", (False, True))
+def test_ulysses_accepts_sliding_window_composition_in_either_order(monkeypatch, order, bidirectional):
+    """Both ``and_masks`` orders are the same canonical sliding-window pattern."""
+    from transformers.masking_utils import (
+        and_masks,
+        bidirectional_mask_function,
+        causal_mask_function,
+        sliding_window_bidirectional_overlay,
+        sliding_window_overlay,
+    )
+
+    _patch_mask_ulysses(monkeypatch, sdpa_mask, apply=True)
+    base = bidirectional_mask_function if bidirectional else causal_mask_function
+    overlay = sliding_window_bidirectional_overlay(2) if bidirectional else sliding_window_overlay(2)
+    parts = (overlay, base) if order == "overlay-first" else (base, overlay)
+    mask = sdpa_attention_mask_builder(1, 4, 4, device="cpu", mask_function=and_masks(*parts))
+    assert mask is not None
+    assert tuple(mask.shape[-2:]) == (8, 8)
+
+
 @pytest.mark.parametrize("impl", ("veomni_sdpa", "veomni_eager"))
 def test_hf_create_sliding_window_causal_mask_with_ulysses_without_metadata(monkeypatch, impl):
     """Transformers' sliding-window helper composes a canonical pattern that expands under Ulysses without a 2D mask."""

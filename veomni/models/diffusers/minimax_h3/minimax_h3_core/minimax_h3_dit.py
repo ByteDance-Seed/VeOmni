@@ -203,7 +203,11 @@ class MiniMaxH3Attention(nn.Module):
         return out
 
     def _segment_attention(self, q, k, v, *, cu_seqlens, compatibility_mode=False):
-        """Attend inside each segment with the bound handle; SDPA when SDPA is bound or for packed compatibility."""
+        """Attend inside each segment with the bound handle.
+
+        ``sdpa`` and ``veomni_sdpa`` use one SDPA call per segment. Eager names
+        use ``minimax_attention``. ``compatibility_mode`` stays on SDPA.
+        """
         if compatibility_mode or is_sdpa_attn_impl(self.config._attn_implementation):
             return _sdpa_varlen_attention(
                 q,

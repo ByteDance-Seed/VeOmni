@@ -87,11 +87,16 @@ def _is_canonical_mask_function(mask_function: Callable) -> bool:
     if not closure or len(closure) != 1:
         return False
     inner = closure[0].cell_contents
-    return (
-        isinstance(inner, tuple)
-        and len(inner) == 2
-        and getattr(inner[0], "__qualname__", None) in _SLIDING_WINDOW_OVERLAY_QUALNAMES
-        and inner[1] in (causal_mask_function, bidirectional_mask_function)
+    if not isinstance(inner, tuple) or len(inner) != 2:
+        return False
+    left, right = inner
+    # ``and_masks`` keeps call order. Builders use ``(canonical, overlay)``;
+    # Transformers' sliding-window helper uses ``(overlay, canonical)``.
+    pairs = ((left, right), (right, left))
+    return any(
+        getattr(overlay, "__qualname__", None) in _SLIDING_WINDOW_OVERLAY_QUALNAMES
+        and base in (causal_mask_function, bidirectional_mask_function)
+        for overlay, base in pairs
     )
 
 
