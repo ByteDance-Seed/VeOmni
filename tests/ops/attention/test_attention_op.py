@@ -363,3 +363,82 @@ def test_lookup_raw_attention_rejects_active_ulysses_unless_skipped(monkeypatch,
         )
         torch.testing.assert_close(dsa_out, query.transpose(1, 2))
         assert dsa_meta == "eager-local"
+
+
+def test_ensure_npu_host_cu_seqlens_converts_and_caches_only_for_npu(monkeypatch):
+    from veomni.ops.kernels.attention import helper as attn_helper
+
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()
+    cu = torch.tensor([0, 3, 6], dtype=torch.int32)
+    kwargs = {"cu_seq_lens_q": cu, "cu_seq_lens_k": cu}
+
+    # Non-NPU devices leave kwargs untouched.
+    attn_helper.ensure_npu_host_cu_seqlens(kwargs, "cuda")
+    assert kwargs["cu_seq_lens_q"] is cu
+    assert kwargs["cu_seq_lens_k"] is cu
+
+    # Simulate a non-CPU tensor (device.type != "cpu") on NPU to verify one-time conversion + caching.
+    class _FakeNpuTensor(torch.Tensor):
+        cpu_calls = 0
+
+        @property
+        def device(self):
+            return SimpleNamespace(type="npu")
+
+        def cpu(self) -> torch.Tensor:
+            type(self).cpu_calls += 1
+            return torch.tensor(torch.Tensor.tolist(self), dtype=self.dtype)
+
+    fake_cu = cu.clone().as_subclass(_FakeNpuTensor)
+    first_kwargs = {"cu_seq_lens_q": fake_cu, "cu_seq_lens_k": fake_cu}
+    second_kwargs = {"cu_seq_lens_q": fake_cu, "cu_seq_lens_k": fake_cu}
+
+    first_out = attn_helper.ensure_npu_host_cu_seqlens(first_kwargs, "npu")
+    second_out = attn_helper.ensure_npu_host_cu_seqlens(second_kwargs, "npu")
+
+    assert _FakeNpuTensor.cpu_calls == 1
+    assert first_kwargs["cu_seq_lens_q"] is fake_cu
+    assert isinstance(first_out["cu_seq_lens_q"], torch.Tensor)
+    assert first_out["cu_seq_lens_q"].device.type == "cpu"
+    assert second_out["cu_seq_lens_q"] is first_out["cu_seq_lens_q"]
+    torch.testing.assert_close(first_out["cu_seq_lens_q"], cu)
+
+    # In-place mutation bumps _version and invalidates the cached host copy.
+    fake_cu[1] = 4
+    third_kwargs = {"cu_seq_lens_q": fake_cu}
+    third_out = attn_helper.ensure_npu_host_cu_seqlens(third_kwargs, "npu")
+    assert _FakeNpuTensor.cpu_calls == 2
+    assert third_out["cu_seq_lens_q"].tolist() == [0, 4, 6]
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()
+
+
+def test_ensure_npu_host_cu_seqlens_copies_inference_tensors_without_version():
+    from veomni.ops.kernels.attention import helper as attn_helper
+
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()
+
+    class _FakeNpuTensor(torch.Tensor):
+        cpu_calls = 0
+
+        @property
+        def device(self):
+            return SimpleNamespace(type="npu")
+
+        def cpu(self) -> torch.Tensor:
+            type(self).cpu_calls += 1
+            return torch.tensor(torch.Tensor.tolist(self), dtype=self.dtype)
+
+    with torch.inference_mode():
+        cu = torch.tensor([0, 3, 6], dtype=torch.int32)
+    fake_cu = cu.as_subclass(_FakeNpuTensor)
+    assert fake_cu.is_inference()
+
+    # Q and K share the tensor, and the next layer sees it again.
+    first = attn_helper.ensure_npu_host_cu_seqlens({"cu_seq_lens_q": fake_cu, "cu_seq_lens_k": fake_cu}, "npu")
+    second = attn_helper.ensure_npu_host_cu_seqlens({"cu_seq_lens_q": fake_cu}, "npu")
+    assert _FakeNpuTensor.cpu_calls == 1
+    assert first["cu_seq_lens_q"].tolist() == [0, 3, 6]
+    assert first["cu_seq_lens_q"].device.type == "cpu"
+    assert first["cu_seq_lens_q"] is first["cu_seq_lens_k"]
+    assert second["cu_seq_lens_q"] is first["cu_seq_lens_q"]
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()

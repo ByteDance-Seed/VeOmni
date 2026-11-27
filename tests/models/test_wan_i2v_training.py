@@ -121,8 +121,10 @@ def test_wan_i2v_condition_matches_inference_and_updates(condition_factory, monk
     def reject_npu_transpose(*args, **kwargs):
         pytest.fail("CPU input reached npu_confusion_transpose")
 
-    monkeypatch.setattr(transformer_module, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(transformer_module, "torch_npu", SimpleNamespace(npu_confusion_transpose=reject_npu_transpose))
+    monkeypatch.setattr(
+        "veomni.ops.layout.confusion_transpose._npu_confusion_transpose",
+        reject_npu_transpose,
+    )
     before = model.proj_out.weight.detach().clone()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     result = model(**packed)

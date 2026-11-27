@@ -24,6 +24,7 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| QSA indexer | `qsa_indexer_implementation` | `eager` | `"eager"` | Model `__init__` via an instance-local `VeomniOp` on the QSA indexer |
 | MiniMax sparse attention | `minimax_sparse_attention_implementation` | `eager`, `torch_npu` | NPU: `torch_npu`; otherwise: `eager` | Sparse layers bind `minimax_sparse_indexer/standard` for block selection and `minimax_sparse_attention/standard` for attention. Explicit `eager` uses PyTorch on every device. |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -521,6 +522,10 @@ not rebased for head-specific masks. See
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ### Qwen4-Exp QSA
+
+`qsa_indexer_implementation` is `eager`. It selects visible compressed blocks
+from ReLU scores. The model still owns the projections, RoPE, packed metadata,
+and compressed-row gather.
 
 `qsa_attention_implementation` accepts `eager`, `tilelang`, and `torch_npu`.
 `eager` expands the compact token selection into the dense reference path and

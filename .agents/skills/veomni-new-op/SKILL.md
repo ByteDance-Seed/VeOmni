@@ -39,6 +39,8 @@ Use these separate mechanisms only when their semantics require them:
 
 - `veomni/ops/batch_invariant/` for the opt-in ATen patch controlled by
   `set_batch_invariant_mode(...)`;
+- `veomni/ops/layout/` for tensor layout helpers that follow the tensor
+  device and are not selected through `VeomniOp`;
 - `veomni/ops/install.py` for idempotent process-wide integrations such as
   registration with a third-party framework;
 - `veomni/distributed/hccl_premul_sum.py` for the NPU collective compatibility

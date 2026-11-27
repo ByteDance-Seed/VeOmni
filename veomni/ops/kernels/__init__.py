@@ -33,6 +33,7 @@ from . import minimax_sparse_attention as _minimax_sparse_attention  # noqa: F40
 from . import moe_experts as _moe_experts  # noqa: F401
 from . import moe_experts_lora as _moe_experts_lora  # noqa: F401
 from . import qsa_attention as _qsa_attention  # noqa: F401
+from . import qsa_indexer as _qsa_indexer  # noqa: F401
 from . import rms_norm as _rms_norm  # noqa: F401
 from . import rope as _rope  # noqa: F401
 from . import situ_and_mul as _situ_and_mul  # noqa: F401
