@@ -10,6 +10,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from veomni.distributed.parallel_state import get_parallel_state
@@ -127,12 +128,22 @@ class TrainingMixin(TrainingModuleMixin):
         return {"hidden_states": hidden_states, "shift_labels": shift_labels}
 
     @post_forward("decode")
-    def decode_post(self, loss: torch.Tensor, logits: torch.Tensor) -> Dict[str, Any]:
+    def decode_post(
+        self,
+        loss: torch.Tensor,
+        logits: torch.Tensor,
+        loss_tokens: torch.Tensor | None = None,
+        **outputs: Any,
+    ) -> Dict[str, Any]:
+        del logits, outputs
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         # Single-loss protocol: drop logits, rename ``loss`` → ``_loss``.
         if loss is not None:
-            return {"_loss": loss, "conversation_list": conversation}
+            result: Dict[str, Any] = {"_loss": loss, "conversation_list": conversation}
+            if loss_tokens is not None:
+                result["_loss_tokens"] = loss_tokens
+            return result
         # TODO: scatter logits for rl training
         return {"conversation_list": conversation}
 
@@ -303,7 +314,8 @@ class TrainingMixin(TrainingModuleMixin):
             # denominator.
             shift_labels = F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:].contiguous()
         target_labels = shift_labels if shift_labels is not None else labels
-        fsdp_group = get_parallel_state().fsdp_group
+        ps = get_parallel_state()
+        fsdp_group = ps.fsdp_group
         num_supervised_tokens = None if target_labels is None else (target_labels != IGNORE_INDEX).sum()
 
         if target_labels is None:
@@ -348,10 +360,21 @@ class TrainingMixin(TrainingModuleMixin):
                 loss_reduction_group=fsdp_group,
             )
 
-        return {
+        out: dict[str, Any] = {
             "loss": loss,
             "logits": logits,
         }
+        if loss is not None and num_supervised_tokens is not None:
+            loss_tokens = num_supervised_tokens.detach().to(dtype=torch.int64)
+            reduce_group = (
+                fsdp_group
+                if fsdp_group is not None
+                else (getattr(ps, "sp_group", None) if getattr(ps, "sp_enabled", False) else None)
+            )
+            if reduce_group is not None and dist.is_available() and dist.is_initialized():
+                dist.all_reduce(loss_tokens, op=dist.ReduceOp.SUM, group=reduce_group)
+            out["loss_tokens"] = loss_tokens
+        return out
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

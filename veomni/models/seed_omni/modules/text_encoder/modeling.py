@@ -254,6 +254,7 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
         del kwargs
         logits = self._project(hidden_states)
         loss: torch.Tensor | None = None
+        loss_tokens: torch.Tensor | None = None
 
         # Local, parallel-state-free CE: kernel selection and the DP+SP token
         # weighting are the runtime's business, so ``accelerated.py`` overrides
@@ -266,8 +267,8 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
                 ignore_index=-100,
                 reduction="sum",
             )
-            n_valid_local = (flat_labels != -100).sum().clamp(min=1)
-            loss = ce_sum / n_valid_local
+            loss_tokens = (flat_labels != -100).sum()
+            loss = ce_sum / loss_tokens.clamp(min=1)
         elif labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_targets = labels[..., 1:].contiguous()
@@ -277,13 +278,16 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
                 ignore_index=-100,
                 reduction="sum",
             )
-            n_valid = (shift_targets != -100).sum().clamp(min=1)
-            loss = ce_sum / n_valid
+            loss_tokens = (shift_targets != -100).sum()
+            loss = ce_sum / loss_tokens.clamp(min=1)
 
-        return {
+        out: dict[str, Any] = {
             "loss": loss,
             "logits": logits,
         }
+        if loss_tokens is not None:
+            out["loss_tokens"] = loss_tokens
+        return out
 
     def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.config.tie_word_embeddings:

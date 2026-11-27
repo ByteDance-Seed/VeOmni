@@ -361,7 +361,9 @@ class JanusVqvae(InferenceMixin, PretrainedOmniModule):
         # desync it and hang). An all-dummy span is handled naturally: its rows are
         # ``-100`` so CE contributes 0 and the clamped denominator yields 0.0 (not
         # NaN), while ``generation_head`` still runs as the FSDP gradient anchor.
-        return {"loss": self._vq_loss(hidden_states, labels)}
+        labels_dev = labels.to(hidden_states.device)
+        loss_tokens = (labels_dev.reshape(-1) != -100).sum()
+        return {"loss": self._vq_loss(hidden_states, labels_dev), "loss_tokens": loss_tokens}
 
     def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:
         # ``hidden_states`` is already teacher-forcing aligned in

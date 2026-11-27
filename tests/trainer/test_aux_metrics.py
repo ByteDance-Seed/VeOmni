@@ -403,3 +403,89 @@ def test_environ_meter_tolerates_a_step_without_aux_metrics(monkeypatch, aux_met
 
     assert callback.trainer.step_train_metrics["training/foundation_loss"] == pytest.approx(2.0)
     assert callback.trainer.step_train_metrics["training/grad_norm"] == pytest.approx(0.5)
+
+
+def test_trim_wandb_config_keys_flattens_and_caps_key_length():
+    """Flattened keys stay <= ``max_len``, short paths are kept verbatim, and collisions never overwrite."""
+    import hashlib
+
+    trim = trace_callback_module._trim_wandb_config_keys
+    long_leaf = "very_long_configuration_field_name_exceeding_wandb_key_limit"
+    cfg = {
+        "short": 1,
+        "level_one_segment": {
+            "level_two_segment_name": {
+                long_leaf: "value",
+                "ok": True,
+            }
+        },
+        "empty": {},
+    }
+    trimmed = trim(cfg, max_len=64)
+    assert trimmed["short"] == 1
+    assert trimmed["empty"] == {}
+    assert trimmed["level_one_segment.level_two_segment_name.ok"] is True
+    assert len(trimmed) == 4
+    assert all(len(k) <= 64 for k in trimmed)
+    assert "value" in trimmed.values()
+
+    # Deeply nested inline module configs whose parent path alone exceeds max_len
+    # are flattened and hash-trimmed to <= max_len with no overwrites.
+    inline_cfg = {
+        "short": "kept",
+        "model_config": {
+            "modules": {
+                "qwen3_text_encoder": {
+                    "accelerator": {
+                        "fsdp_config": {
+                            "mixed_precision": {
+                                "enable": True,
+                                "param_dtype": "bf16",
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    }
+    flat_inline = trim(inline_cfg, max_len=64)
+    assert flat_inline["short"] == "kept"
+    assert len(flat_inline) == 3
+    assert set(flat_inline.values()) == {"kept", True, "bf16"}
+    assert all(len(k) <= 64 for k in flat_inline)
+
+    # A short key whose exact flattened path equals a long key's primary hash candidate
+    # must survive verbatim while the long key gets a disambiguated key.
+    long_full = f"a.{'p' * 64}.x"
+    alias = f"{'p' * 55}_{hashlib.sha1(long_full.encode()).hexdigest()[:6]}"
+    collision = trim({"a": {"p" * 64: {"x": 1}, alias: 2}}, max_len=64)
+    assert len(collision) == 2
+    assert collision[f"a.{alias}"] == 2
+    assert set(collision.values()) == {1, 2}
+    assert all(len(k) <= 64 for k in collision)
+
+
+def test_tqdm_callback_includes_efficiency_metrics_from_step_env_metrics():
+    """``TqdmCallback`` appends MFU / TFLOPs / step_time from ``step_env_metrics`` when present."""
+    from unittest.mock import MagicMock
+
+    trainer = SimpleNamespace(
+        step_train_metrics={"training/total_loss": 1.25},
+        step_env_metrics={
+            "training/mfu(%)": 42.5,
+            "training/tflops_per_gpu": 310.2,
+            "flops_achieved(T)": 2481.6,
+            "training/step_time(s)": 1.5,
+            "ignored_metric": 99.0,
+        },
+    )
+    cb = trace_callback_module.TqdmCallback(trainer)
+    cb.data_loader_tqdm = MagicMock()
+
+    cb.on_step_end(TrainerState(global_step=1))
+
+    cb.data_loader_tqdm.set_postfix_str.assert_called_once_with(
+        "total_loss: 1.25, mfu(%): 42.50, tflops_per_gpu: 310.20, flops_achieved(T): 2481.60, step_time(s): 1.50",
+        refresh=False,
+    )
+    cb.data_loader_tqdm.update.assert_called_once()

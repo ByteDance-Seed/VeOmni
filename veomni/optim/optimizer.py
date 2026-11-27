@@ -281,6 +281,13 @@ class MultiOptimizer(Optimizer, Stateful):
         self._is_multi_optimizer: bool = True
         self.key_names = key_names
 
+    @property
+    def param_groups(self) -> list[dict[str, Any]]:
+        groups: list[dict[str, Any]] = []
+        for opt in self.optimizers_dict.values():
+            groups.extend(opt.param_groups)
+        return groups
+
     def step(self) -> None:
         for opt in self.optimizers_dict.values():
             opt.step()

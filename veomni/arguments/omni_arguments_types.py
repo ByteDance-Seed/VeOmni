@@ -644,6 +644,21 @@ class OmniTrainingArguments:
         default=None,
         metadata={"help": "Global batch size. If None, use `micro_batch_size` * `data_parallel_size`."},
     )
+    loss_reduction: Literal["sample_mean", "token_mean"] = field(
+        default="sample_mean",
+        metadata={
+            "help": (
+                "How a gradient-accumulation window is averaged. 'sample_mean' divides each "
+                "micro-batch by its own supervised-token count and then weights every micro-batch "
+                "equally, so a short sample and a long one contribute the same gradient; "
+                "'token_mean' divides once by the window's total supervised tokens, so every "
+                "token contributes equally and a sample's weight follows its length. Use "
+                "'token_mean' when sources differ wildly in length (a 86k-token trace next to a "
+                "9k-token answer): under 'sample_mean' the short source gets "
+                "len(long)/len(short) times the per-token gradient."
+            )
+        },
+    )
     num_train_epochs: int = field(
         default=1,
         metadata={"help": "Epochs to train."},
@@ -763,6 +778,10 @@ class OmniTrainingArguments:
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
+            )
+        if self.loss_reduction not in ("sample_mean", "token_mean"):
+            raise ValueError(
+                f"Unknown train.loss_reduction {self.loss_reduction!r}; expected 'sample_mean' or 'token_mean'."
             )
 
         self._train_steps = -1

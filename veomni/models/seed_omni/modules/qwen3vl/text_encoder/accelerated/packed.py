@@ -95,11 +95,18 @@ class PackedTrainingMixin:
 
     @post_forward("pack_decode")
     def pack_decode_post(
-        self, loss: torch.Tensor, logits: torch.Tensor | None = None, **outputs: Any
+        self,
+        loss: torch.Tensor,
+        logits: torch.Tensor | None = None,
+        loss_tokens: torch.Tensor | None = None,
+        **outputs: Any,
     ) -> Dict[str, Any]:
         del logits, outputs
         if loss is not None:
-            return {"_loss": loss}
+            result: Dict[str, Any] = {"_loss": loss}
+            if loss_tokens is not None:
+                result["_loss_tokens"] = loss_tokens
+            return result
         return {}
 
 
