@@ -160,6 +160,9 @@ class MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, MoeCausalLMOutput
             DeepSeek-V4's ``indexer_kl`` is the first. Whatever the forward chose
             to add to ``loss`` it has already added; the trainer reports these and
             must not sum them into the backward scalar a second time.
+            Every rank in the FSDP group must emit the same keys with the same
+            meaning for each training step; use a consistent default where a
+            local observation is absent. Divergent keys can mix or block reductions.
     """
     )
 

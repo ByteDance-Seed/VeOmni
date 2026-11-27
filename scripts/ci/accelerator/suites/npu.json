@@ -180,6 +180,16 @@
     ]
   },
   {
+    "name": "qwen38-metric-schema-accelerator",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/trainer/test_metric_schema_accelerator.py"
+    ]
+  },
+  {
     "name": "npu-unit-13",
     "suite": "unit",
     "args": [

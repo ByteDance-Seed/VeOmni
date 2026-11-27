@@ -354,6 +354,12 @@ def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest
     torch.testing.assert_close(out.aux_metrics["indexer_kl_uniform"], torch.tensor(4.0))
     torch.testing.assert_close(out.aux_metrics["lm_loss_before_indexer_kl"], torch.tensor(2.0))
     torch.testing.assert_close(out.loss, torch.tensor(3.0))
+    # Different data can change the metric values but not the reduction schema.
+    metric_keys = set(out.aux_metrics)
+    outputs.indexer_kl_total = torch.tensor(0.0)
+    outputs.indexer_uniform_total = torch.tensor(0.0)
+    empty_score_out = model(input_ids=torch.ones(1, 4, dtype=torch.long), labels=torch.ones(1, 4, dtype=torch.long))
+    assert set(empty_score_out.aux_metrics) == metric_keys
 
 
 def test_the_flag_is_refused_when_no_layer_can_build_a_kl(monkeypatch: pytest.MonkeyPatch):
@@ -473,6 +479,13 @@ def test_real_model_folds_window_denominator_and_compressed_only_teacher(monkeyp
     assert expected_kl[0, 1].item() == 0.0
     assert expected_uniform[0, 1].item() == 0.0
     torch.testing.assert_close(out.loss, out.aux_metrics["lm_loss_before_indexer_kl"] + 0.5 * expected_mean)
+    # An all-masked local contribution still reports the same reduction keys.
+    # Keep the decoder/model loop; only its score/teacher kernel is replaced.
+    metric_keys = set(out.aux_metrics)
+    _install_term_attention(model.model.layers[0].self_attn, index_score, torch.zeros_like(target))
+    no_local_targets = model(input_ids=torch.ones(1, 2, dtype=torch.long), labels=labels, use_cache=False)
+    assert set(no_local_targets.aux_metrics) == metric_keys
+    torch.testing.assert_close(no_local_targets.aux_metrics["indexer_kl"], torch.tensor(0.0))
 
 
 def test_indexer_kl_does_not_train_the_language_model_trunk(monkeypatch: pytest.MonkeyPatch):
