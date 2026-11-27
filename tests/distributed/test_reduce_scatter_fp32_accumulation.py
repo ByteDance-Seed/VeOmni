@@ -804,306 +804,32 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-class TestBf16ReduceOverAnExtraParallelCollective:
-    """FSDP2 wrapping refuses BF16 reduction only on non-persistent multi-rank collectives."""
+@pytest.mark.parametrize("reduce_dtype", ["bfloat16", None])
+def test_configure_extra_parallel_reduce_scatter_fallback_without_force_sum_api(monkeypatch, reduce_dtype):
+    """Older PyTorch builds lacking set_force_sum_reduction_for_comms reject wide BF16 EP."""
+    factors = []
+    module = SimpleNamespace(set_gradient_divide_factor=factors.append)
+    mp = MixedPrecisionConfig(enable=True, param_dtype="bfloat16", reduce_dtype=reduce_dtype)
+    monkeypatch.setattr(device_utils, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(device_utils, "IS_MLU_AVAILABLE", False)
 
-    @staticmethod
-    def _run_parallelize(
-        monkeypatch,
-        mock_fsdp_builder,
-        *,
-        para_name="ep",
-        para_size=2,
-        mesh_shape=(4,),
-        reduce_dtype="bfloat16",
-        param_dtype="bfloat16",
-        enable_mp=True,
-        persistent=False,
-        declared_in_plan=True,
-        freeze_experts=False,
-        npu=False,
-        mlu=False,
-    ):
-        class FakeSubMesh:
-            def __init__(self, shape):
-                self._shape = shape
-                self.ndim = len(shape)
-
-            def size(self, dim=None):
-                if dim is None:
-                    total = 1
-                    for s in self._shape:
-                        total *= s
-                    return total
-                return self._shape[dim]
-
-        class FakeParaMesh:
-            def __init__(self, shard_mesh, para_size_val):
-                self._shard_mesh = shard_mesh
-                self._para_size = para_size_val
-                if shard_mesh.ndim == 2:
-                    self.mesh_dim_names = (f"{para_name}_replicate", f"{para_name}_fsdp", para_name)
-                else:
-                    self.mesh_dim_names = (f"{para_name}_fsdp", para_name)
-                self.ndim = len(self.mesh_dim_names)
-
-            def __getitem__(self, names):
-                if names == self.mesh_dim_names[:-1]:
-                    return self._shard_mesh
-                return FakeSubMesh((self._para_size,))
-
-            def size(self, dim=None):
-                dims = self._shard_mesh._shape + (self._para_size,)
-                if dim is None:
-                    total = 1
-                    for s in dims:
-                        total *= s
-                    return total
-                return dims[dim]
-
-        shard_mesh = FakeSubMesh(mesh_shape)
-        full_para_mesh = FakeParaMesh(shard_mesh, para_size)
-        world_size = full_para_mesh.size()
-
-        class FakeParallelState:
-            any_extra_parallel_enabled = True
-            dp_replicate_enabled = len(mesh_shape) > 1
-            extra_parallel_names = [para_name]
-            extra_parallel_sizes = {para_name: para_size}
-            fsdp_mesh = FakeSubMesh((world_size,))
-            extra_parallel_fsdp_device_mesh = {para_name: full_para_mesh}
-            extra_parallel_flat_device_mesh = {para_name: FakeSubMesh((world_size,))}
-
-            def __init__(self):
-                self.world_size = world_size
-
-            def extra_parallel_enabled(self, name):
-                return name == para_name and para_size > 1
-
-            def extra_parallel_gradient_divide_factor(self, name):
-                return float(world_size)
-
-            def extra_parallel_flat_mesh(self, name):
-                return FakeSubMesh((world_size,))
-
-        class ToyDense(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.proj = nn.Linear(4, 4, bias=False)
-
-        class ToyDecoder(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.experts = nn.Linear(4, 4, bias=False)
-
-        model = nn.Module()
-        # A dense layer precedes the EP layer so refusal verifies zero partial wrapping.
-        model.dense = ToyDense()
-        model.decoder = ToyDecoder()
-        if freeze_experts:
-            model.decoder.experts.requires_grad_(False)
-        model._no_split_modules = ["ToyDense", "ToyDecoder"]
-        model.decoder.experts.set_gradient_divide_factor = lambda factor: None
-        model.decoder.experts.set_reduce_scatter_divide_factor = lambda factor: None
-        model.decoder.experts.set_force_sum_reduction_for_comms = lambda enable: None
-
-        class FakePlan:
-            extra_parallel_plan = {para_name: {}} if declared_in_plan else {}
-
-            def apply(self, mod, meshes):
-                return {
-                    fqn: SpecInfo(
-                        para_name=para_name if (declared_in_plan and fqn.startswith("decoder.experts.")) else None,
-                        placement=Shard(0)
-                        if (declared_in_plan and fqn.startswith("decoder.experts."))
-                        else Replicate(),
-                        fqn=fqn,
-                        para_fsdp_mesh=meshes[para_name]
-                        if (declared_in_plan and fqn.startswith("decoder.experts."))
-                        else None,
-                        persistent_fsdp_shard_dim=1
-                        if (declared_in_plan and persistent and fqn.startswith("decoder.experts."))
-                        else None,
-                    )
-                    for fqn, _ in mod.named_parameters()
-                }
-
-            def get_extra_parallel_fsdp_no_shard_info(self, mod, name):
-                return {"decoder.experts": mod.decoder.experts} if declared_in_plan else {}
-
-        wrap_calls = []
-
-        def record_wrap(module, **kwargs):
-            wrap_calls.append(module)
-            module.set_modules_to_forward_prefetch = lambda mods: None
-            module.set_modules_to_backward_prefetch = lambda mods: None
-            return module
-
-        monkeypatch.setattr(device_utils, "IS_NPU_AVAILABLE", npu)
-        monkeypatch.setattr(device_utils, "IS_MLU_AVAILABLE", mlu)
-        monkeypatch.setattr(torch_parallelize, "IS_NPU_AVAILABLE", npu)
-        monkeypatch.setattr(torch_parallelize, "get_parallel_state", FakeParallelState)
-        monkeypatch.setattr(torch_parallelize, "get_runtime_parallel_plan", lambda mod: FakePlan())
-        monkeypatch.setattr(torch_parallelize, "fully_shard", record_wrap)
-        if npu:
-            from veomni.distributed import hccl_premul_sum
-
-            monkeypatch.setattr(hccl_premul_sum, "apply_hccl_premul_sum_patch", lambda: None)
-
-        try:
-            result = torch_parallelize.parallelize_model_fsdp2(
-                model,
-                mixed_precision=MixedPrecisionConfig(
-                    enable=enable_mp, param_dtype=param_dtype, reduce_dtype=reduce_dtype
-                ),
-                init_device="meta",
-            )
-        except ValueError:
-            assert wrap_calls == []
-            raise
-        return result, wrap_calls
-
-    @pytest.mark.parametrize("reduce_dtype", ["bfloat16", None])
-    def test_wide_ep_group_refuses_effective_bfloat16_before_wrapping(
-        self, monkeypatch, mock_fsdp_builder, reduce_dtype
-    ):
-        with pytest.raises(ValueError, match="zeroes every gradient"):
-            self._run_parallelize(
-                monkeypatch,
-                mock_fsdp_builder,
-                para_name="ep",
-                para_size=32,
-                mesh_shape=(4,),
-                reduce_dtype=reduce_dtype,
-            )
-
-    @pytest.mark.parametrize("reduce_dtype", ["bfloat16", None])
-    def test_frozen_ep_unit_is_exempt_from_bf16_guard(self, monkeypatch, mock_fsdp_builder, reduce_dtype):
-        # 4 ranks, ep_size=2 -> ep_fsdp=2, but experts are frozen so no EP gradient reduction runs.
-        result, wrap_calls = self._run_parallelize(
-            monkeypatch,
-            mock_fsdp_builder,
-            para_name="ep",
-            para_size=2,
-            mesh_shape=(2,),
-            reduce_dtype=reduce_dtype,
-            freeze_experts=True,
+    # Wide group without set_force_sum_reduction_for_comms fails fast on effective BF16.
+    with pytest.raises(RuntimeError, match="set_force_sum_reduction_for_comms"):
+        torch_parallelize._configure_extra_parallel_reduce_scatter(
+            module, 8.0, reduce_scatter_size=4, mixed_precision=mp
         )
-        assert result is not None
-        assert result.decoder.experts in wrap_calls
 
-    def test_singleton_ep_group_accepts_bfloat16(self, monkeypatch, mock_fsdp_builder):
-        result, wrap_calls = self._run_parallelize(
-            monkeypatch,
-            mock_fsdp_builder,
-            para_name="ep",
-            para_size=128,
-            mesh_shape=(1,),
-            reduce_dtype="bfloat16",
-        )
-        assert result is not None
-        assert wrap_calls
-
-    def test_hsdp_singleton_shard_axis_accepts_bfloat16(self, monkeypatch, mock_fsdp_builder):
-        # world=8, dp_replicate=2, ep_size=4 -> (ep_replicate=2, ep_fsdp=1): singleton shard axis.
-        result, wrap_calls = self._run_parallelize(
-            monkeypatch,
-            mock_fsdp_builder,
-            para_name="ep",
-            para_size=4,
-            mesh_shape=(2, 1),
-            reduce_dtype="bfloat16",
-        )
-        assert result is not None
-        assert wrap_calls
-
-    def test_hsdp_wide_shard_axis_refuses_bfloat16(self, monkeypatch, mock_fsdp_builder):
-        # world=8, dp_replicate=2, ep_size=2 -> (ep_replicate=2, ep_fsdp=2): 2-wide shard axis.
-        with pytest.raises(ValueError, match="zeroes every gradient"):
-            self._run_parallelize(
-                monkeypatch,
-                mock_fsdp_builder,
-                para_name="ep",
-                para_size=2,
-                mesh_shape=(2, 2),
-                reduce_dtype="bfloat16",
-            )
-
-    @pytest.mark.parametrize("reduce_dtype", ["float32", "float16"])
-    def test_float32_and_float16_are_accepted(self, monkeypatch, mock_fsdp_builder, reduce_dtype):
-        result, _ = self._run_parallelize(
-            monkeypatch,
-            mock_fsdp_builder,
-            para_name="ep",
-            para_size=32,
-            mesh_shape=(4,),
-            reduce_dtype=reduce_dtype,
-        )
-        assert result is not None
-
-    def test_disabled_mixed_precision_is_accepted(self, monkeypatch, mock_fsdp_builder):
-        result, _ = self._run_parallelize(
-            monkeypatch,
-            mock_fsdp_builder,
-            para_name="ep",
-            para_size=32,
-            mesh_shape=(4,),
-            reduce_dtype="bfloat16",
-            enable_mp=False,
-        )
-        assert result is not None
-
-    def test_persistent_ple_dimension_is_exempt_from_bf16_guard(self, monkeypatch, mock_fsdp_builder):
-        # 8 ranks, ep_size=1, ple_size=2 -> ple_fsdp=4: persistent PLE skips FSDP wrapping
-        # and scales gradients in its own backward, so BF16 reduction must stay allowed.
-        result, _ = self._run_parallelize(
-            monkeypatch,
-            mock_fsdp_builder,
-            para_name="ple",
-            para_size=2,
-            mesh_shape=(4,),
-            reduce_dtype="bfloat16",
-            persistent=True,
-        )
-        assert result is not None
-
-    def test_planless_submodule_inheriting_global_ep_is_exempt(self, monkeypatch, mock_fsdp_builder):
-        # SeedOmni FSDP2 towers without an EP plan never wrap EP modules.
-        result, _ = self._run_parallelize(
-            monkeypatch,
-            mock_fsdp_builder,
-            para_name="ep",
-            para_size=32,
-            mesh_shape=(4,),
-            reduce_dtype="bfloat16",
-            declared_in_plan=False,
-        )
-        assert result is not None
-
-    @pytest.mark.parametrize("reduce_dtype", ["bfloat16", None])
-    def test_hccl_npu_backend_accepts_wide_bf16_group(self, monkeypatch, mock_fsdp_builder, reduce_dtype):
-        result, _ = self._run_parallelize(
-            monkeypatch,
-            mock_fsdp_builder,
-            para_name="ep",
-            para_size=2,
-            mesh_shape=(4,),
-            reduce_dtype=reduce_dtype,
-            npu=True,
-        )
-        assert result is not None
-
-    def test_cncl_mlu_backend_accepts_wide_bf16_group(self, monkeypatch, mock_fsdp_builder):
-        result, _ = self._run_parallelize(
-            monkeypatch,
-            mock_fsdp_builder,
-            para_name="ep",
-            para_size=2,
-            mesh_shape=(4,),
-            reduce_dtype="bfloat16",
-            mlu=True,
-        )
-        assert result is not None
+    # Singleton group, FP32 reduction, and HCCL/CNCL backends stay allowed.
+    torch_parallelize._configure_extra_parallel_reduce_scatter(module, 8.0, reduce_scatter_size=1, mixed_precision=mp)
+    torch_parallelize._configure_extra_parallel_reduce_scatter(
+        module,
+        8.0,
+        reduce_scatter_size=4,
+        mixed_precision=MixedPrecisionConfig(enable=True, param_dtype="bfloat16", reduce_dtype="float32"),
+    )
+    monkeypatch.setattr(device_utils, "IS_NPU_AVAILABLE", True)
+    torch_parallelize._configure_extra_parallel_reduce_scatter(module, 8.0, reduce_scatter_size=4, mixed_precision=mp)
+    assert factors == [8.0, 8.0, 8.0, 8.0]
 
 
 def _verify_extra_parallel_bf16_reduce_scatter(device: torch.device) -> None:
