@@ -1426,7 +1426,7 @@ def test_npu_fused_vision_attention_matches_eager_across_multimodal_shapes():
     fused_impls = {blk.veomni_attn.impl for blk in fused.vision_tower.encoder.blocks}
     eager_impls = {blk.veomni_attn.impl for blk in eager.vision_tower.encoder.blocks}
     assert fused_impls == {"veomni_flash_attention_2"}
-    assert eager_impls == {"eager"}
+    assert eager_impls == {"veomni_eager"}
 
     scenarios = [
         [[1, 4, 4]],

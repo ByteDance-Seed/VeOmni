@@ -126,11 +126,12 @@ def test_qwen3_vl_moe_eager_matches_hf_aux_loss():
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=1e-6, rtol=1e-6)
 
 
-def test_qwen3_vl_moe_npu_generated_attention_binds_ops_and_runs_eager_forward():
+def test_qwen3_vl_moe_npu_generated_attention_binds_ops_and_runs_eager_forward(monkeypatch):
     from veomni.models.transformers.qwen3_vl_moe.modeling_qwen3_vl_moe import (
         Qwen3VLMoeForConditionalGeneration,
     )
 
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     torch.manual_seed(0)
     config = _tiny_config()
     config._set_ops_implementation(eager_ops_config())

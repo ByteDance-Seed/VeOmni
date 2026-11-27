@@ -101,9 +101,15 @@ def _fully_blocked_rows(attention_mask: torch.Tensor) -> torch.Tensor:
     """Return rows whose keys are all invisible.
 
     Boolean masks use ``False`` for blocked keys. Additive masks use non-finite
-    values, including ``-inf``. A row of finite minima is not fully blocked.
+    values and the eager builder sentinel ``finfo.min``. Other finite additive
+    biases stay visible.
     """
-    visible = attention_mask if attention_mask.dtype == torch.bool else torch.isfinite(attention_mask)
+    if attention_mask.dtype == torch.bool:
+        visible = attention_mask
+    else:
+        visible = torch.isfinite(attention_mask)
+        if attention_mask.dtype.is_floating_point:
+            visible = visible & attention_mask.ne(torch.finfo(attention_mask.dtype).min)
     return ~visible.any(dim=-1, keepdim=True)
 
 

@@ -180,6 +180,24 @@ def test_eager_attention_zeroes_fully_blocked_rows():
     assert value_grad.grad is not None
     assert torch.isfinite(value_grad.grad).all()
 
+    builder_mask = eager_mask_backend._to_eager_additive(bool_mask, query.dtype)
+    builder_out, builder_weights = eager_backend.eager_attention_forward(
+        module, query, key, value, builder_mask, dropout=0.0
+    )
+    bool_out, _ = eager_backend.eager_attention_forward(module, query, key, value, bool_mask, dropout=0.0)
+    assert builder_weights is not None
+    torch.testing.assert_close(builder_out, bool_out)
+    torch.testing.assert_close(builder_weights[0, 0, 0], torch.zeros(2))
+
+    finite_bias = torch.zeros(1, 1, 1, 2)
+    finite_bias[..., 1] = -0.5
+    _, bias_weights = eager_backend.eager_attention_forward(
+        module, query[:, :, :1], key, value, finite_bias, dropout=0.0
+    )
+    assert bias_weights is not None
+    assert bias_weights[0, 0, 0, 0] > bias_weights[0, 0, 0, 1]
+    assert bias_weights[0, 0, 0, 1] > 0
+
 
 def test_unmasked_bidirectional_sliding_window_matches_explicit_mask():
     """Unmasked bidirectional windows include the boundary token, matching the mask builder."""

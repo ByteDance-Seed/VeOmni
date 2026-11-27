@@ -332,6 +332,7 @@ def test_qwen3_5_npu_generated_attention_binds_ops_and_runs_eager_forward(monkey
         recorded.append(kwargs)
         return ([0, 6], None, None)
 
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     monkeypatch.setattr(npu_modeling, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(fla_npu, "precompute_varlen_metadata", fake_precompute)
     torch.manual_seed(0)
