@@ -1,5 +1,6 @@
-"""CPU coverage for MiniMax-H3-Image offline text-to-image conditions."""
+"""CPU coverage for MiniMax-H3-Image T2I and editing conditions."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -98,6 +99,70 @@ def test_t2i_raw_condition_round_trips_through_dit_cache(tmp_path, monkeypatch):
     offline_model = _condition_model(meta_init=True)
     assert offline_model.text_encoder is None and offline_model.vae is None
     assert offline_model.process_condition(**cached_batch)["x"].shape == (2, 8)
+
+
+def test_i2i_raw_condition_round_trips_through_dit_cache(tmp_path, monkeypatch):
+    for name, size in (("target.png", (64, 32)), ("first.png", (64, 32)), ("second.png", (32, 64))):
+        Image.new("RGB", size, (64, 128, 192)).save(tmp_path / name)
+    transform = build_data_transform("minimax_h3_image_i2i", data_dir=str(tmp_path))
+    rows = transform(
+        {"image": "target.png", "prompt": "Make it blue", "reference_images": json.dumps(["first.png", "second.png"])},
+        source_name="example",
+    )
+    mode_by_size = {
+        (32, 64): torch.ones(1, 2, 2, 4),
+        (1024, 2048): torch.full((1, 2, 2, 4), 2.0),
+        (2048, 1024): torch.full((1, 2, 4, 2), 3.0),
+    }
+
+    def encode(pixels, return_dict):
+        assert not return_dict and not torch.is_grad_enabled()
+        mode = mode_by_size[pixels.shape[-2:]]
+        return (SimpleNamespace(mode=lambda: mode),)
+
+    def encode_text(prompt, reference_images):
+        assert prompt == "Make it blue"
+        assert [image.size for image in reference_images] == [(2048, 1024), (1024, 2048)]
+        return torch.ones(1, 3, 8), torch.tensor([1, 0, 1])
+
+    sigmas = (1.0, 0.65, 0.2, 0.0)
+    model = _condition_model(pdd_sigmas=sigmas)
+    model._vae = SimpleNamespace(
+        device=torch.device("cpu"),
+        spatial_compression_ratio=16,
+        config=SimpleNamespace(latents_mean=(1, 1), latents_std=(2, 2)),
+        encode=encode,
+    )
+    monkeypatch.setattr(model, "encode_text", encode_text)
+    state = model.rng_state_dict()
+    cached = model.get_condition(**DiTDataCollator()(rows))
+    torch.testing.assert_close(model.rng_state_dict(), state, rtol=0, atol=0)
+    torch.testing.assert_close(cached["reference_latents"][0], [torch.full((1, 2, 2, 4), 0.5), torch.ones(1, 2, 4, 2)])
+    online = model.process_condition(**cached)
+    assert online["num_pdd_heads"] == 3 and online["pdd_step_index"] == 1
+    assert online["cond_rows"] == 4 and online["x"].shape == (6, 8)
+    assert online["training_target"].shape == (2, 8)
+    torch.testing.assert_close(online["inverse_indices"], torch.tensor([1, 1, 1, 0, 0, 0, 0, 1, 1]))
+    torch.testing.assert_close(online["unique_timesteps"][0], torch.tensor(REFERENCE_MODEL_TIME))
+
+    import veomni.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(parallel_state, "get_parallel_state", lambda: SimpleNamespace(dp_rank=0, dp_size=1))
+    saver = OfflineEmbeddingSaver(str(tmp_path), dataset_length=1)
+    saver.save(DiTTrainer._unpack_dict_of_list(cached)[0])
+    dataset = load_dataset("parquet", data_files=str(tmp_path / "rank_0_shard_0.parquet"), split="train")
+    offline_batch = DiTDataCollator()(build_data_transform("dit_offline")(dataset[0]))
+    torch.testing.assert_close(dict(offline_batch), cached, rtol=0, atol=0)
+    offline_model = _condition_model(pdd_sigmas=sigmas, meta_init=True)
+    offline_model.load_rng_state_dict(state)
+    torch.testing.assert_close(offline_model.process_condition(**offline_batch), online, rtol=0, atol=0)
+
+
+def test_i2i_transform_requires_references(tmp_path):
+    Image.new("RGB", (32, 32)).save(tmp_path / "target.png")
+    transform = build_data_transform("minimax_h3_image_i2i", data_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="reference_images"):
+        transform({"image": "target.png", "prompt": "Edit it", "reference_images": "[]"}, source_name="example")
 
 
 @pytest.mark.parametrize(
@@ -212,6 +277,8 @@ def test_t2i_rejects_invalid_training_geometry_and_microbatch():
         model.process_condition(**{key: values * 2 for key, values in _cached_batch().items()})
     with pytest.raises(ValueError, match="exactly one target image"):
         model.get_condition(["A rectangle"], [[]])
+    with pytest.raises(ValueError, match="micro_batch_size=1"):
+        model.get_condition(["A rectangle"], [[]], reference_images=[])
 
 
 @pytest.mark.parametrize(

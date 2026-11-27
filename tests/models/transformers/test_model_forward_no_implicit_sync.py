@@ -1010,8 +1010,10 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention, cfg_mo
     _assert_no_minimax_h3_step_syncs(model, step, mode, attention)
 
 
-@pytest.mark.parametrize("condition_source", ["cached_references", "post_encode_t2i", "online_raw_t2i"])
-def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source):
+@pytest.mark.parametrize(
+    "condition_source", ["cached_references", "post_encode_t2i", "online_raw_t2i", "online_raw_i2i"]
+)
+def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source, monkeypatch):
     """Gate cached, post-encode and raw-input H3-Image training steps."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
@@ -1041,7 +1043,9 @@ def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source)
         from tests.models.diffusers.test_minimax_h3_image import _tiny_vae
 
         class TinyTextEncoder(torch.nn.Embedding):
-            def forward(self, input_ids, attention_mask):
+            def forward(self, input_ids, attention_mask, **vision):
+                assert bool(vision) == (condition_source == "online_raw_i2i")
+                assert all(value.device == input_ids.device for value in vision.values())
                 return super().forward(input_ids[0])
 
         condition._tokenizer = lambda *args, **kwargs: {"input_ids": [0, 1, 2]}
@@ -1049,6 +1053,28 @@ def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source)
         condition._vae = _tiny_vae().to(device).eval()
         latents_dim = condition.vae.config.latent_channels
         raw_inputs = {"inputs": ["A rectangle"], "images": [[Image.new("RGB", (70, 20), (96, 128, 192))]]}
+        if condition_source == "online_raw_i2i":
+            from types import SimpleNamespace
+
+            from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition import (
+                modeling_minimax_h3_image_condition as image_condition,
+            )
+
+            class TinyImageProcessor:
+                merge_size = 1
+
+                def __call__(self, images, return_tensors):
+                    assert len(images) == 2 and return_tensors == "pt"
+                    return {"pixel_values": torch.ones(2, 3), "image_grid_thw": torch.ones(2, 3, dtype=torch.long)}
+
+            condition._tokenizer.convert_tokens_to_ids = {
+                "<|vision_start|>": 0,
+                "<|image_pad|>": 1,
+                "<|vision_end|>": 2,
+            }.get
+            condition._processor = SimpleNamespace(image_processor=TinyImageProcessor())
+            monkeypatch.setattr(image_condition, "resize_reference", lambda image, *_args: image)
+            raw_inputs["reference_images"] = [[Image.new("RGB", (64, 32)), Image.new("RGB", (32, 64))]]
     config = tiny_minimax_h3_config(
         audio_enabled=False,
         num_pdd_heads=condition.config.num_pdd_heads,
