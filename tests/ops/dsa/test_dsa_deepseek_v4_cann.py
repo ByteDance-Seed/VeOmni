@@ -1144,3 +1144,64 @@ def test_sparse_flash_mla_rejects_selections_the_operator_cannot_take(index_topk
 
     with pytest.raises(ValueError, match=match):
         vendor_flash_mla.npu_sparse_flash_mla(q, ori_kv, cmp_kv, indices, cmp_ratio=cmp_ratio)
+
+
+def test_indexer_canonical_position_ids_uses_causal_plan(fake_ops: _FakeOps):
+    q, k, weights = _bshd_inputs(batch=1, seq_len=8, compressed_len=2)
+    position_ids = torch.arange(8).unsqueeze(0)
+
+    scores, indices = cann_indexer.wrapper(
+        q.transpose(0, 1),
+        k.transpose(0, 1),
+        weights.transpose(0, 1),
+        _RATE,
+        2,
+        position_ids=position_ids,
+        positions_are_canonical=True,
+    )
+
+    assert len(fake_ops.indexer_calls) == 1
+    assert indices.shape == scores.shape == (1, 8, 2)
+
+
+def test_indexer_non_canonical_position_ids_without_slices_is_rejected(fake_ops: _FakeOps):
+    q, k, weights = _bshd_inputs(batch=1, seq_len=8, compressed_len=2)
+    position_ids = torch.cat([torch.arange(4), torch.arange(4)]).unsqueeze(0)
+
+    with pytest.raises(ValueError, match="non-canonical position_ids"):
+        cann_indexer.wrapper(
+            q.transpose(0, 1),
+            k.transpose(0, 1),
+            weights.transpose(0, 1),
+            _RATE,
+            2,
+            position_ids=position_ids,
+        )
+    assert fake_ops.indexer_calls == []
+
+
+def test_attention_explicit_topk_idxs_delegates_to_eager_dense_sparse_attn(flash_mla: _FlashMlaRecorder):
+    q = torch.randn(1, 6, 2, 8)
+    kv = torch.randn(1, 6, 8)
+    sink = torch.randn(2)
+    position_ids = torch.arange(6).unsqueeze(0)
+    topk_idxs = torch.tensor([[[0, 1], [0, 1], [1, 2], [1, 2], [2, 3], [3, 4]]], dtype=torch.int32)
+    sm_scale = 8**-0.5
+
+    # A non-empty compressed table would otherwise stay on the CANN kernel.
+    # Explicit topk_idxs has to take the eager path on its own.
+    actual = cann_attention.wrapper(
+        q,
+        kv,
+        torch.randn(1, 2, 8),
+        sink,
+        position_ids,
+        sliding_window=4,
+        compress_ratio=1,
+        topk_idxs=topk_idxs,
+        sm_scale=sm_scale,
+    )
+    expected = eager_attention.dense_sparse_attn(q, kv, sink, topk_idxs, sm_scale=sm_scale)
+
+    torch.testing.assert_close(actual, expected)
+    assert flash_mla.calls == []

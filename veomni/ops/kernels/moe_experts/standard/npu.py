@@ -25,6 +25,7 @@ from torch import Tensor
 from .....distributed.moe import cumsum_to_counts, dispatch_to_ep_class
 from .....distributed.parallel_state import get_parallel_state
 from ..shared.activation import is_silu
+from ..shared.swiglu import swiglu_oai
 
 
 def _can_rematerialize_expert_weight():
@@ -145,10 +146,16 @@ def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
     return _eager_clamped_swiglu(x, limit)
 
 
-def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
+def _swiglu(x: torch.Tensor, swiglu_limit: float | None, swiglu_alpha: float | None = None) -> torch.Tensor:
     """NPU SwiGLU, or the clamped path when ``swiglu_limit`` is set."""
     import torch_npu
 
+    if swiglu_alpha is not None:
+        gate, up = x.chunk(2, dim=-1)
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+        return swiglu_oai(gate, up, swiglu_alpha)
     if swiglu_limit is None:
         return torch_npu.npu_swiglu(x, dim=-1)
     return _clamped_swiglu(x, swiglu_limit)
@@ -164,6 +171,7 @@ def _npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
     fp32_wgrad: bool = False,
 ) -> torch.Tensor:
     """NPU single-device fused MoE forward pass (non-EP).
@@ -183,7 +191,7 @@ def _npu_fused_moe_forward(
     intermediate_hidden_states = npu_group_gemm(
         permuted_hidden_states, fc1_weight, tokens_per_expert, fp32_wgrad, fc1_1_2_weight is not None
     )
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit, swiglu_alpha)
     output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert, fp32_wgrad)
     # NPU unpermute applies routing after fc2. Equivalent for a biasless down
     # projection; bf16 rounding can differ from the pre-fc2 fused order.
@@ -192,7 +200,14 @@ def _npu_fused_moe_forward(
 
 
 def _npu_expert_math(
-    permute_tokens, cumsum, fc1_weight, fc2_weight, swiglu_limit=None, fp32_wgrad=False, rematerialize_weight=False
+    permute_tokens,
+    cumsum,
+    fc1_weight,
+    fc2_weight,
+    swiglu_limit=None,
+    swiglu_alpha=None,
+    fp32_wgrad=False,
+    rematerialize_weight=False,
 ):
     """Two Ascend grouped GEMMs with the gated activation between them.
 
@@ -207,7 +222,7 @@ def _npu_expert_math(
     """
     counts = cumsum_to_counts(cumsum)
     intermediate = npu_group_gemm(permute_tokens, fc1_weight, counts, fp32_wgrad, rematerialize_weight)
-    activated = _swiglu(intermediate, swiglu_limit)
+    activated = _swiglu(intermediate, swiglu_limit, swiglu_alpha)
     return npu_group_gemm(activated, fc2_weight, counts, fp32_wgrad)
 
 
@@ -222,6 +237,7 @@ def npu_ep_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     ep_group: dist.ProcessGroup | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
     fp32_wgrad: bool = False,
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
@@ -239,6 +255,7 @@ def npu_ep_fused_moe_forward(
         fc1_weight,
         fc2_weight.transpose(1, 2),
         swiglu_limit,
+        swiglu_alpha,
         fp32_wgrad,
         fc1_1_2_weight is not None,
     )
@@ -255,6 +272,7 @@ def npu_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
+    swiglu_alpha: float | None = None,
     fp32_wgrad: bool = False,
 ):
     """NPU fused MoE entry. Branches on EP."""
@@ -278,6 +296,7 @@ def npu_fused_moe_forward(
             fc1_1_2_weight,
             ep_group=get_parallel_state().ep_group,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
             fp32_wgrad=fp32_wgrad,
         )
     else:
@@ -291,6 +310,7 @@ def npu_fused_moe_forward(
             fc2_weight,
             fc1_1_2_weight,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
             fp32_wgrad=fp32_wgrad,
         )
     return final_hidden_states

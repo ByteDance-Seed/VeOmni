@@ -96,7 +96,8 @@ def test_npu_wrapper_accepts_quantization_options_and_forwards_fp32_wgrad(monkey
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("merged", [False, True])
-def test_ep_dispatch_preserves_fp32_wgrad_and_fc1_rematerialization(monkeypatch, merged):
+@pytest.mark.parametrize("swiglu_alpha", [None, 1.5])
+def test_ep_dispatch_preserves_fp32_wgrad_and_fc1_rematerialization(monkeypatch, merged, swiglu_alpha):
     from veomni.ops.kernels.moe_experts.standard import npu
 
     activations = torch.ones(3, 4, dtype=torch.bfloat16)
@@ -118,10 +119,24 @@ def test_ep_dispatch_preserves_fp32_wgrad_and_fc1_rematerialization(monkeypatch,
 
     monkeypatch.setattr(npu, "dispatch_to_ep_class", dispatch)
     monkeypatch.setattr(npu, "npu_group_gemm", grouped_gemm)
-    monkeypatch.setattr(npu, "_swiglu", lambda inputs, limit: inputs)
+
+    def activate(inputs, limit, alpha):
+        assert alpha == swiglu_alpha
+        return inputs
+
+    monkeypatch.setattr(npu, "_swiglu", activate)
     gate, up = (None, None) if merged else gate_up.chunk(2, dim=1)
     result = npu.npu_ep_fused_moe_forward(
-        2, routing_weights, selected_experts, activations, gate, up, down, gate_up if merged else None, fp32_wgrad=True
+        2,
+        routing_weights,
+        selected_experts,
+        activations,
+        gate,
+        up,
+        down,
+        gate_up if merged else None,
+        swiglu_alpha=swiglu_alpha,
+        fp32_wgrad=True,
     )
 
     assert result is activations

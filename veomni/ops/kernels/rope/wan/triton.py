@@ -219,29 +219,40 @@ def apply_rotary_interleaved(
 
 @dataclass(frozen=True)
 class _Meta:
-    """Whether the fused launch ran. ``False`` means the empty eager fallback."""
+    """Whether the fused launch ran, plus the caller input shape.
+
+    ``fused=False`` means the empty eager fallback. Forward returns rank-3.
+    Backward restores a rank-4 caller shape when one was saved.
+    """
 
     fused: bool
     head_dim: int
+    input_shape: tuple[int, ...] = ()
 
 
-def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedState]:
+def forward(x: Tensor, freqs: Tensor | tuple[Tensor, Tensor], *, head_dim: int) -> tuple[Tensor, SavedState]:
     """Fused interleaved RoPE. ``freqs`` is split into real/imag ``cos`` / ``sin``.
 
-    Empty ``x`` falls back to the eager pair and keeps its input rank.
-    Non-empty outputs are rank-3 after ``flatten(2)``. ``freqs`` is treated
-    as fixed: backward uses the conjugate rotation for ``dx`` and returns no
-    frequency gradient.
+    A diffusers real pair is reduced to ``[S, D/2]`` without squeezing the
+    sequence axis. Empty ``x`` falls back to the eager pair and keeps its
+    input rank. Non-empty outputs are rank-3 after ``flatten(2)``. ``freqs``
+    is treated as fixed: backward uses the conjugate rotation for ``dx`` and
+    returns no frequency gradient.
     """
     if x.numel() == 0:
         output, saved = _eager.forward(x, freqs, head_dim=head_dim)
-        return output, SavedState(saved.tensors, _Meta(False, head_dim))
+        return output, SavedState(saved.tensors, _Meta(False, head_dim, tuple(x.shape)))
 
-    cos = freqs.real.squeeze(1).contiguous()
-    sin = freqs.imag.squeeze(1).contiguous()
+    if isinstance(freqs, Tensor):
+        cos = freqs.real.squeeze(1).contiguous()
+        sin = freqs.imag.squeeze(1).contiguous()
+    else:
+        cos, sin = _eager._real_pair_cos_sin(freqs)
+        cos = cos.contiguous()
+        sin = sin.contiguous()
     shaped = x.reshape(*x.shape[:2], -1, head_dim)
     output = apply_rotary_interleaved(shaped, cos, sin).flatten(2)
-    return output, SavedState((cos, sin), _Meta(True, head_dim))
+    return output, SavedState((cos, sin), _Meta(True, head_dim, tuple(x.shape)))
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
@@ -254,4 +265,6 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
     cos, sin = saved.tensors
     shaped = grad_output.reshape(*grad_output.shape[:2], -1, meta.head_dim)
     dx = apply_rotary_interleaved(shaped, cos, sin, conjugate=True).flatten(2)
+    if meta.input_shape and tuple(dx.shape) != meta.input_shape:
+        dx = dx.reshape(meta.input_shape)
     return dx, None
