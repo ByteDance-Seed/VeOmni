@@ -123,6 +123,11 @@ hyper = [
   "hyper-parallel==1.2.0.dev0",
 ]
 
+# Optional FSDPTurbo backend; install fsdp-turbo alongside VeOmni.
+turbo = [
+  "fsdp-turbo",
+]
+
 # Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
 npu = [
   "torch==2.10.0+cpu",

@@ -123,6 +123,21 @@ Text and VLM trainers load the adapter before model construction; native jobs
 do not require HyperParallel. Normal trainer teardown removes the patch.
 The supported training entry points are the Text and VLM trainers.
 
+## Optional FSDPTurbo Integration
+
+FSDPTurbo replaces `fully_shard` with `fine_grained_fully_shard` while preserving
+native `FSDPModule` and `DTensor` semantics:
+
+```yaml
+model:
+  accelerator:
+    fsdp_config:
+      fsdp_mode: turbo_fsdp2
+```
+
+Text and VLM trainers activate `fsdp_turbo.integration.veomni` before model
+construction and remove the patch during `destroy_distributed()`.
+
 ## Trainer Hierarchy
 
 A training job splits in two. `VeOmniModelRuntime` (`veomni/models/model_runtime.py`) owns everything bound to *one* model; `BaseTrainer` *holds* one as `trainer.model` and adds everything bound to the *job*, of which there is exactly one. A single-model job is one runtime inside one trainer; a composed omni model is many runtimes under one orchestrator, which is why the trainer composes the runtime rather than inheriting it — `OmniTrainer` holds several and could not inherit them all.

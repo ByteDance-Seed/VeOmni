@@ -502,7 +502,7 @@ def _init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
-    dp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2"] = "fsdp2",
+    dp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2", "turbo_fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     extra_parallel_sizes: Tuple[int] = (1,),
@@ -545,6 +545,10 @@ def _init_parallel_state(
         hyper_adapter = getattr(sys.modules.get("hyper_parallel.integration.veomni.adapter"), "_ADAPTER", None)
         if hyper_adapter is None or not hyper_adapter.is_patched or not hyper_adapter.fsdp:
             raise ValueError("HyperParallel must be activated by TextTrainer or VLMTrainer.")
+    elif dp_mode == "turbo_fsdp2":
+        turbo_adapter = getattr(sys.modules.get("fsdp_turbo.integration.veomni.adapter"), "_ADAPTER", None)
+        if turbo_adapter is None or not turbo_adapter.is_patched or not turbo_adapter.fsdp:
+            raise ValueError("FSDPTurbo must be activated by TextTrainer or VLMTrainer.")
 
     if name is not None and name in _PARALLEL_STATE_REGISTRY:
         logger.debug(
@@ -577,7 +581,7 @@ def _init_parallel_state(
         "each extra parallel should correspond to a size, a placement and a name"
     )
 
-    if dp_mode == "hyper_fsdp2":
+    if dp_mode in ("hyper_fsdp2", "turbo_fsdp2"):
         dp_mode = "fsdp2"
 
     # Reuse an already-built state for an identical topology (e.g. the omni

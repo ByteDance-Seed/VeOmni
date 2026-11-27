@@ -147,6 +147,17 @@ class VeOmniModelRuntime:
             if is_hyper_fsdp and args.accelerator.fsdp_config != hyper_adapter.fsdp_config:
                 raise RuntimeError("Remove the existing Hyper patch before changing FSDP options.")
 
+        is_turbo_fsdp = args.accelerator.fsdp_config.fsdp_mode == "turbo_fsdp2"
+        turbo_adapter = getattr(sys.modules.get("fsdp_turbo.integration.veomni.adapter"), "_ADAPTER", None)
+        if turbo_adapter is None or not turbo_adapter.is_patched:
+            if is_turbo_fsdp:
+                raise ValueError("FSDPTurbo must be activated by TextTrainer or VLMTrainer.")
+        else:
+            if is_turbo_fsdp != turbo_adapter.fsdp:
+                raise RuntimeError("Remove the existing FSDPTurbo patch before changing backend selection.")
+            if is_turbo_fsdp and args.accelerator.fsdp_config != turbo_adapter.fsdp_config:
+                raise RuntimeError("Remove the existing FSDPTurbo patch before changing FSDP options.")
+
         self.args = args
         self.model_name = model_name
         self.train_args = train

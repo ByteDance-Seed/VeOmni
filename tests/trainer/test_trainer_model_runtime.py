@@ -159,3 +159,36 @@ def test_hyper_teardown_unpatches_and_propagates_a_failed_save(hyper_cleanup, mo
     with pytest.raises(RuntimeError, match="Async checkpoint failed"):
         trainer.destroy_distributed()
     assert events == ["save_failed", "unpatch"]
+
+
+@pytest.fixture
+def turbo_cleanup(monkeypatch):
+    events = []
+    adapter = ModuleType("fsdp_turbo.integration.veomni")
+    adapter.remove_fsdp_turbo_patch = lambda: events.append("unpatch")
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+    monkeypatch.setattr(DistributedCheckpointer, "wait_for_pending_save", lambda: events.append("save_done"))
+    monkeypatch.setattr(base.dist, "is_initialized", lambda: False)
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.args = SimpleNamespace(model=ModelArguments(model_path="somewhere"))
+    trainer.args.model.accelerator.fsdp_config.fsdp_mode = "turbo_fsdp2"
+    return trainer, events
+
+
+def test_turbo_teardown_drains_saves_and_unpatches_without_a_process_group(turbo_cleanup):
+    trainer, events = turbo_cleanup
+    trainer.destroy_distributed()
+    assert events == ["save_done", "unpatch"]
+
+
+def test_turbo_teardown_unpatches_and_propagates_a_failed_save(turbo_cleanup, monkeypatch):
+    trainer, events = turbo_cleanup
+
+    def failed_save():
+        events.append("save_failed")
+        raise RuntimeError("Async checkpoint failed.")
+
+    monkeypatch.setattr(DistributedCheckpointer, "wait_for_pending_save", failed_save)
+    with pytest.raises(RuntimeError, match="Async checkpoint failed"):
+        trainer.destroy_distributed()
+    assert events == ["save_failed", "unpatch"]

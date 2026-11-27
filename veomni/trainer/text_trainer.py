@@ -51,6 +51,19 @@ class TextTrainer:
                     "HyperParallel is required for the selected backend. Add `--extra hyper` to your uv sync command."
                 ) from exc
             apply_hyper_parallel_patch(args.model)
+        if (
+            args.model.accelerator.fsdp_config.fsdp_mode == "turbo_fsdp2"
+            or sys.modules.get("fsdp_turbo.integration.veomni") is not None
+        ):
+            try:
+                from fsdp_turbo.integration.veomni import apply_fsdp_turbo_patch
+            except ModuleNotFoundError as exc:
+                if exc.name != "fsdp_turbo":
+                    raise
+                raise ImportError(
+                    "FSDPTurbo is required for the selected backend. Add `--extra turbo` to your uv sync command."
+                ) from exc
+            apply_fsdp_turbo_patch(args.model)
         # BaseTrainer.__init__ is NOT called here; we call its private
         # helpers one-by-one so the sequence is explicit.
         self.base = BaseTrainer.__new__(BaseTrainer)

@@ -140,6 +140,16 @@
     ]
   },
   {
+    "name": "fsdp-turbo-training",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_fsdp_turbo.py"
+    ]
+  },
+  {
     "name": "npu-unit-09",
     "suite": "unit",
     "args": [
