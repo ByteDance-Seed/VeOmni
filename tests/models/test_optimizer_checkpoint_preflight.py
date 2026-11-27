@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
+from veomni.arguments.arguments_types import AcceleratorConfig
 from veomni.models import model_runtime
 from veomni.utils.device import get_device_type
 
@@ -45,7 +46,7 @@ def _runtime(multi, save_async, manager="dcp"):
         def build_checkpoint(self):
             pass
 
-    args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"))
+    args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"), accelerator=AcceleratorConfig())
     train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None, save_async=save_async, manager=manager))
     return StubRuntime(args, train=train)
 
@@ -98,7 +99,7 @@ def test_canonical_layout_requires_only_an_active_extra_parallel_plan(monkeypatc
     monkeypatch.setattr(
         model_runtime.VeOmniModelRuntime, "_build_optimizer_checked", lambda self, *_: reached.append(True)
     )
-    args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"))
+    args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"), accelerator=AcceleratorConfig())
     train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None, extra_parallel_canonical_layout=True))
     if active and has_plan:
         with pytest.raises(RuntimeError, match="requires an ExtraParallel model plan"):
