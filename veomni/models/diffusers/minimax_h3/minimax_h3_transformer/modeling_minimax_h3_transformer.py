@@ -19,6 +19,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
+from ...minimax_h3_image.layout import pack_image_samples
 from ..minimax_h3_core.batch_packing import pack_samples
 from ..minimax_h3_core.core import bind_minimax_attention, is_flash_attn_impl
 from ..minimax_h3_core.minimax_h3_dit import (
@@ -202,6 +203,24 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             loss=losses,
         )
 
+    def _forward_image_batch(self, samples):
+        for sample in samples:
+            num_pdd_heads = sample["num_pdd_heads"]
+            if num_pdd_heads is not None and num_pdd_heads != self.config.num_pdd_heads:
+                raise ValueError("Condition schedule and transformer must have the same number of PDD heads.")
+            if any(sample[key] is None for key in ("training_target", "pdd_step_index", "image_loss_weight")):
+                raise ValueError("Packed H3-Image SFT requires targets, PDD step indices and loss weights.")
+        packed_inputs, row_counts = pack_image_samples(samples)
+        self._load_packed_attention_kernel()
+        video, _ = self.dit(**packed_inputs, packed_batch=True)
+        outputs = [
+            self._finish_outputs(rows, None, **sample) for rows, sample in zip(video.split(row_counts), samples)
+        ]
+        return MiniMaxH3DiTOutput(
+            predictions=[output.predictions[0] for output in outputs],
+            loss={"mse_image": torch.stack([output.loss["mse_image"] for output in outputs]).mean()},
+        )
+
     def forward(
         self,
         x=None,
@@ -244,8 +263,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         if isinstance(x, list):
             if not x:
                 raise ValueError("H3 requires a nonempty microbatch.")
-            if not self.config.audio_enabled and len(x) != 1:
-                raise ValueError("H3-Image training requires micro_batch_size=1.")
             columns = dict(
                 x=x,
                 audio_x=audio_x,
@@ -279,6 +296,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             ]
             if len(samples) == 1:
                 return self.forward(**samples[0])
+            if not self.config.audio_enabled:
+                return self._forward_image_batch(samples)
             return self._forward_batch(samples)
 
         image_inference = not self.config.audio_enabled and position_ids is not None

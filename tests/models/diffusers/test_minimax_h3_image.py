@@ -137,6 +137,7 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, param_
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models.auto import build_foundation_model
+    from veomni.trainer.dit_trainer import DiTDataCollator
 
     torch.set_num_threads(1)
     # Spawned ranks do not inherit the CPU checkpoint default set by the CI plugin.
@@ -219,6 +220,39 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, param_
                 not parameter.requires_grad and parameter.grad is None
                 for parameter in production.dit.final_layer.pdd_out.parameters()
             )
+
+        image_positions = {"position_ids": inputs["image_indices"]}
+        samples = [
+            {
+                "x": inputs["x"].detach().clone().requires_grad_(),
+                "prompt_embeds": inputs["prompt_embeds"],
+                "img_position_ids": inputs["position_ids"].unsqueeze(0),
+                "unique_timesteps": inputs["unique_timesteps"],
+                "inverse_indices": inputs["timestep_indices"],
+                "token_tags": inputs["token_tags"],
+                "img_pos_info": image_positions,
+                "text_pos_info": {"position_ids": inputs["text_indices"]},
+                "img_pos_for_infer_output_info": image_positions,
+                "training_target": torch.zeros_like(inputs["x"]),
+                "pdd_step_index": index,
+                "image_loss_weight": 1.0,
+            }
+            for index in (rank, 1 - rank)
+        ]
+        production.zero_grad(set_to_none=True)
+        head_calls.clear()
+        wrapper_calls = []
+        production.dit.final_layer.pdd_out.register_forward_pre_hook(lambda module, args: wrapper_calls.append(module))
+        packed = production(**DiTDataCollator()(samples))
+        assert len(wrapper_calls) == 1 and head_calls == [rank, 1 - rank]
+        assert torch.isfinite(packed.loss["mse_image"])
+        if param_dtype == "float32":
+            with torch.no_grad():
+                expected = [reference(**sample).predictions[0] for sample in samples]
+            torch.testing.assert_close(packed.predictions, expected, rtol=2e-5, atol=2e-6)
+        packed.loss["mse_image"].backward()
+        for sample in samples:
+            assert sample["x"].grad is not None and torch.isfinite(sample["x"].grad).all()
         dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -234,7 +268,8 @@ def test_minimax_h3_image_forward_through_fsdp2(tmp_path, checkpointing, param_d
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
+@pytest.mark.parametrize("cond_rows", [0, 2], ids=["t2i", "edit"])
+def test_minimax_h3_image_training_updates_backbone_through_frozen_head(cond_rows):
     torch.manual_seed(0)
     config = tiny_minimax_h3_config(
         audio_enabled=False, num_pdd_heads=6, condition_model_type="MiniMaxH3ImageConditionModel"
@@ -244,7 +279,11 @@ def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
     assert all(param.requires_grad for param in model.dit.final_layer.pdd_out.parameters())
     model.freeze_model()
     inputs = {**_image_inputs(), "pdd_step_index": 2}
-    target = torch.randn_like(inputs["x"])
+    if cond_rows:
+        inputs["unique_timesteps"] = torch.tensor([0.999, 0.35])
+        inputs["timestep_indices"].fill_(1)
+        inputs["timestep_indices"][inputs["image_indices"][:cond_rows]] = 0
+    target = torch.randn_like(inputs["x"][cond_rows:])
     weight = torch.tensor(0.7)
     backbone_before = model.dit.video_patch_proj.weight.detach().clone()
     frozen_before = {
@@ -252,7 +291,7 @@ def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
     }
 
     with torch.no_grad():
-        raw_prediction = model(**inputs)
+        raw_prediction = model(**inputs)[cond_rows:]
         expected = (raw_prediction + target).square().mean() * weight
     optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=1e-3)
     training_inputs = {
@@ -266,6 +305,7 @@ def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
         "img_pos_for_infer_output_info": {"position_ids": inputs["image_indices"]},
         "text_pos_info": {"position_ids": inputs["text_indices"]},
         "pdd_step_index": inputs["pdd_step_index"],
+        "cond_rows": cond_rows,
         "training_target": target,
         "image_loss_weight": weight,
     }

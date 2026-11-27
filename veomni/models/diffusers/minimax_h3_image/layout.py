@@ -6,6 +6,7 @@ import math
 
 import torch
 
+from ..minimax_h3.minimax_h3_core.batch_packing import _validate_fp32_metadata
 from ..minimax_h3.minimax_h3_core.minimax_h3_dit import patchify_video, unpatchify_video
 from ..minimax_h3.minimax_h3_core.packed_sequence import build_packed_fl2va, build_packed_ref2va
 
@@ -78,3 +79,39 @@ def build_image_packed_sequence(
         token_tags[image_indices] = image_tag
 
     return packed["img_position_ids"].squeeze(0), token_tags, image_indices, text_indices, packed["cond_rows"]
+
+
+def pack_image_samples(samples: list[dict]) -> tuple[dict, list[int]]:
+    """Concatenate compact visual inputs without mixing sample positions or heads."""
+    chunks = {
+        key: []
+        for key in ("x", "prompt_embeds", "unique_timesteps", "inverse_indices", "token_tags", "img_position_ids")
+    }
+    placements = {key: [] for key in ("img_pos_info", "text_pos_info", "img_pos_for_infer_output_info")}
+    cu, refiner_cu, row_counts, heads = [0], [0], [], []
+    time_offset = 0
+    for sample in samples:
+        _validate_fp32_metadata(sample["unique_timesteps"], sample["img_position_ids"])
+        if sample.get("update_mask") is not None and not sample.get("skip_mask_out_condition", False):
+            raise ValueError("H3-Image packing requires explicit condition-row output cropping.")
+        length = sample["img_position_ids"].shape[1]
+        for key in chunks:
+            chunks[key].append(sample[key] + time_offset if key == "inverse_indices" else sample[key])
+        for key in placements:
+            placements[key].append(sample[key]["position_ids"] + cu[-1])
+        cu.append(cu[-1] + length)
+        refiner_cu.append(refiner_cu[-1] + sample["prompt_embeds"].shape[0])
+        time_offset += sample["unique_timesteps"].numel()
+        row_counts.append(sample["img_pos_for_infer_output_info"]["position_ids"].numel())
+        heads.append((sample["pdd_step_index"], length))
+    result = {key: torch.cat(values, dim=1 if key == "img_position_ids" else 0) for key, values in chunks.items()}
+    result.update({key: {"position_ids": torch.cat(values)} for key, values in placements.items()})
+    device = result["x"].device
+    for key, bounds in (("packed_seq_params", cu), ("refiner_packed_seq_params", refiner_cu)):
+        result[key] = {
+            "cu_seqlens_q": torch.tensor(bounds, dtype=torch.int32, device="cpu").to(device, non_blocking=True),
+            "cu_seqlens_host": tuple(bounds),
+            "max_seqlen_q": max(stop - start for start, stop in zip(bounds, bounds[1:])),
+        }
+    result.update(pdd_step_index=heads, skip_mask_out_condition=True)
+    return result, row_counts

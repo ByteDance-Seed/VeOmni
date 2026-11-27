@@ -169,6 +169,16 @@ class MiniMaxH3PDDHeads(nn.Sequential):
     """Gather all FP32 heads in one FSDP2 unit before rank-local selection."""
 
     def forward(self, hidden_states, step_index):
+        if not isinstance(step_index, list):
+            return self._project(hidden_states, step_index)
+        lengths = [length for _, length in step_index]
+        return torch.cat(
+            [self._project(rows, index) for (index, _), rows in zip(step_index, hidden_states.split(lengths))]
+        )
+
+    def _project(self, hidden_states, step_index):
+        if not 0 <= step_index < len(self):
+            raise IndexError(f"pdd_step_index {step_index} is outside [0, {len(self)}).")
         return self[step_index](hidden_states)
 
 
@@ -567,8 +577,6 @@ class MiniMaxH3FinalLayer(nn.Module):
         if pdd_step_index is not None:
             if self.pdd_out is None:
                 raise ValueError("pdd_step_index was provided but this model has no PDD output heads.")
-            if not 0 <= pdd_step_index < len(self.pdd_out):
-                raise IndexError(f"pdd_step_index {pdd_step_index} is outside [0, {len(self.pdd_out)}).")
             video = self.pdd_out(h, pdd_step_index)
         else:
             video = self.video_out(h)
