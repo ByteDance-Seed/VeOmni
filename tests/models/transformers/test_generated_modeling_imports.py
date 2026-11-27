@@ -35,7 +35,7 @@ import veomni  # noqa: F401  installs the ops/attention patches the modeling fil
 
 _VEOMNI_ROOT = pathlib.Path(veomni.__file__).parent
 _NON_HF_DIRS = {"flux", "movqgan", "wan"}
-_EXPECTED_HF_MODEL_COUNT = 20
+_EXPECTED_HF_MODEL_COUNT = 21
 
 
 def _hf_modeling_modules() -> list[str]:

@@ -213,7 +213,7 @@ def prepare_exec_cmd(
             )
             if model_name == "wan_t2v":
                 cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
-            elif model_name == "deepseek_v4":
+            elif model_name in ("deepseek_v4", "minimax_m3_vl"):
                 # fused_triton MoE needs bf16/fp16 activations; the toy
                 # checkpoint is materialized in float32.
                 cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)

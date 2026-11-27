@@ -24,6 +24,7 @@ If a field is not in this table, it is not an op-selection knob.
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| MiniMax sparse attention | `minimax_sparse_attention_implementation` | `eager`, `torch_npu` | NPU: `torch_npu`; otherwise: `eager` | Sparse layers bind `minimax_sparse_indexer/standard` for block selection and `minimax_sparse_attention/standard` for attention. Explicit `eager` uses PyTorch on every device. |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Gated MLP | `gated_mlp_implementation` | `eager`, `liger_kernel`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`), `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only on the `standard` variant and is skipped for anything else (the `geglu` variant is not selectable here; Gemma3 binds it in code, and there `liger_kernel` computes GELU-tanh) |
@@ -951,6 +952,15 @@ row matches the device. All three of its rows support EP through the same
 GEMMs). Every `moe_experts_lora` row hard-codes SwiGLU regardless of `hidden_act`. See
 [MoE-LoRA](../key_features/lora.md#5-moe-lora) for the per-row table and for how the
 two adapter layouts shard under EP.
+
+MiniMax M3 experts use the `swiglu_oai` variant, which registers `eager`,
+`fused_triton` and `fused_npu` only. It shares the standard merged-fc1 Triton
+and NPU paths (including EP) with `swiglu_alpha` and `swiglu_limit` arguments
+that replace SiLU with MiniMax's clamped activation: `gate` is clamped to
+`max=swiglu_limit` and `up` to `[-swiglu_limit, swiglu_limit]`, then the output
+is `(up + 1) * gate * sigmoid(swiglu_alpha * gate)` on the clamped values.
+Selecting an implementation without a row, such as `fused_quack`, fails at
+model build.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
