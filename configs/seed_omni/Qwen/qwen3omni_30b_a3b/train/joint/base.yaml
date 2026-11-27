@@ -9,10 +9,11 @@
 # what *this* thinker says. In the talker-only round the thinker is frozen, so
 # its traces come from a snapshot that stops improving while the talker trains.
 #
-# Prerequisite — the same split checkpoint the two rounds use, including the
-# Mimi encoder half:
+# Prerequisite — download and split the upstream checkpoint (same split
+# checkpoint the two rounds use, including the Mimi encoder half):
+#   hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir Qwen3-Omni-30B-A3B-Instruct
 #   python scripts/seed_omni/convert_model.py \
-#     --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+#     --model_path Qwen3-Omni-30B-A3B-Instruct \
 #     --output_dir Qwen3-Omni-30B-A3B-Instruct-split \
 #     --extra mimi_path=kyutai/mimi
 #

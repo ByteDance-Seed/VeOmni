@@ -4,11 +4,13 @@
 # is frozen and runs to produce the talker's prefill; the codec turns the
 # assistant's waveform into the RVQ codes the talker is scored against.
 #
-# Prerequisite — split the upstream checkpoint, exactly as for thinker training.
-# Qwen3-Omni ships no audio tokenizer, so the codec's encoder half comes from a
-# second checkpoint, and this round *requires* it (the thinker round does not):
+# Prerequisite — download and split the upstream checkpoint, exactly as for
+# thinker training. Qwen3-Omni ships no audio tokenizer, so the codec's encoder
+# half comes from a second checkpoint, and this round *requires* it (the
+# thinker round does not):
+#   hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir Qwen3-Omni-30B-A3B-Instruct
 #   python scripts/seed_omni/convert_model.py \
-#     --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+#     --model_path Qwen3-Omni-30B-A3B-Instruct \
 #     --output_dir Qwen3-Omni-30B-A3B-Instruct-split \
 #     --extra mimi_path=kyutai/mimi
 #

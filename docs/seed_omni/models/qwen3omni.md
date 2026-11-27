@@ -123,8 +123,10 @@ needs both:
   (`hf download kyutai/mimi --local-dir <dir>` to fetch it explicitly).
 
 ```bash
+hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir Qwen3-Omni-30B-A3B-Instruct
+
 python scripts/seed_omni/convert_model.py \
-  --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --model_path Qwen3-Omni-30B-A3B-Instruct \
   --output_dir Qwen3-Omni-30B-A3B-Instruct-split \
   --extra mimi_path=kyutai/mimi
 ```
