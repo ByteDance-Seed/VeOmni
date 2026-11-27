@@ -497,13 +497,31 @@ class OmniTrainer:
             self.LOG_SAMPLE = False
         return micro_batch
 
-    def forward_backward_step(self, micro_batch: Dict[str, Any], *, num_micro_steps: int = 1):
+    @staticmethod
+    def _to_int64_scalar(raw_tokens: Any, device: torch.device) -> torch.Tensor:
+        if isinstance(raw_tokens, torch.Tensor):
+            return raw_tokens.detach().to(device=device, dtype=torch.int64)
+        return torch.tensor(raw_tokens, device=device, dtype=torch.int64)
+
+    def forward_backward_step(
+        self,
+        micro_batch: Dict[str, Any],
+        *,
+        num_micro_steps: int = 1,
+        window_loss_tokens: Mapping[str, torch.Tensor] | None = None,
+    ):
         """One gradient-accumulation micro-batch over the training DAG.
 
         ``OmniModelRuntime.forward`` returns ``{"loss", "losses", "loss_tokens", "conversation_list"}``.
-        Under ``sample_mean``, backward scales by ``1 / num_micro_steps``; under ``token_mean``,
-        backward scales by the single loss node's group-reduced ``_loss_tokens`` so :meth:`train_step`
-        can divide accumulated gradients by the window's total tokens before ``clip_grad_norm()``.
+        Under ``sample_mean``, backward scales by ``1 / num_micro_steps``. Under ``token_mean``:
+
+        * Single-loss graphs scale backward by ``_loss_tokens`` and :meth:`train_step` divides
+          accumulated gradients once by the window's total tokens before ``clip_grad_norm()``.
+        * Multi-loss graphs require every loss key to report its matching ``_loss_tokens``; when
+          ``num_micro_steps == 1`` each already-reduced loss keeps weight ``1`` (``0`` if its
+          token count is zero), and when ``num_micro_steps > 1`` each loss ``k`` is weighted by
+          ``_loss_tokens[k] / window_loss_tokens[k]`` so every loss is independently token-averaged
+          across the accumulation window without distorting relative loss scales.
         """
         micro_batch = self.preforward(micro_batch)
 
@@ -518,21 +536,40 @@ class OmniTrainer:
         micro_batch.clear()
 
         if getattr(self.args.train, "loss_reduction", "sample_mean") == "token_mean":
-            if len(loss_dict) != 1 or loss_dict.keys() != loss_tokens.keys():
+            if not loss_dict or loss_dict.keys() != loss_tokens.keys():
                 raise ValueError(
-                    "train.loss_reduction='token_mean' requires a single loss node reporting '_loss_tokens'; "
+                    "train.loss_reduction='token_mean' requires every loss to report a matching '_loss_tokens'; "
                     f"got losses={list(loss_dict.keys())} and loss_tokens={list(loss_tokens.keys())}. "
                     "Use train.loss_reduction='sample_mean' instead."
                 )
-            raw_tokens = next(iter(loss_tokens.values()))
-            token_count = (
-                raw_tokens.detach().to(device=total_loss.device, dtype=torch.int64)
-                if isinstance(raw_tokens, torch.Tensor)
-                else torch.tensor(raw_tokens, device=total_loss.device, dtype=torch.int64)
-            )
-            scaled_loss = total_loss * token_count.float()
+            token_counts = {k: self._to_int64_scalar(v, total_loss.device) for k, v in loss_tokens.items()}
+            if len(loss_dict) == 1:
+                token_count = next(iter(token_counts.values()))
+                scaled_loss = total_loss * token_count.float()
+            elif num_micro_steps == 1:
+                scaled_loss = None
+                for k, v in loss_dict.items():
+                    term = v * (token_counts[k] > 0).float()
+                    scaled_loss = term if scaled_loss is None else (scaled_loss + term)
+            else:
+                if window_loss_tokens is None or not (loss_dict.keys() <= window_loss_tokens.keys()):
+                    missing = sorted(set(loss_dict.keys()) - set((window_loss_tokens or {}).keys()))
+                    raise ValueError(
+                        "train.loss_reduction='token_mean' with multiple losses and gradient accumulation "
+                        f"(num_micro_steps={num_micro_steps}) requires count_loss_tokens() for every loss key; "
+                        f"missing={missing}. Implement count_loss_tokens() on the loss modules or use "
+                        "train.loss_reduction='sample_mean'."
+                    )
+                scaled_loss = None
+                for k, v in loss_dict.items():
+                    win_k = self._to_int64_scalar(window_loss_tokens[k], v.device)
+                    tok_k = token_counts[k].to(device=v.device)
+                    zero = torch.zeros((), device=v.device, dtype=torch.float32)
+                    weight_k = torch.where(win_k > 0, tok_k.float() / win_k.clamp_min(1).float(), zero)
+                    term = v * weight_k
+                    scaled_loss = term if scaled_loss is None else (scaled_loss + term)
         else:
-            token_count = None
+            token_counts = None
             scaled_loss = total_loss / num_micro_steps
 
         # Backward: separate offload hook stack (may differ from forward when GC is on).
@@ -540,7 +577,7 @@ class OmniTrainer:
             scaled_loss.backward()
 
         del micro_batch
-        return total_loss, loss_dict, token_count
+        return total_loss, loss_dict, token_counts
 
     def _scale_optimizer_grads(self, scale: float) -> None:
         """Rescale all live gradients across every module optimizer in-place."""
@@ -581,40 +618,65 @@ class OmniTrainer:
         loss_reduction = getattr(self.args.train, "loss_reduction", "sample_mean")
         total_loss_tensor: torch.Tensor | None = None
         total_loss_dict_tensors: Dict[str, torch.Tensor] = {}
-        total_tokens_tensor: torch.Tensor | None = None
+        total_tokens_dict: Dict[str, torch.Tensor] = {}
         num_micro_steps = len(micro_batches)
+        window_loss_tokens: Dict[str, torch.Tensor] | None = None
+        if loss_reduction == "token_mean" and num_micro_steps > 1:
+            count_fn = getattr(self.model, "count_loss_tokens", None)
+            if callable(count_fn):
+                window_loss_tokens = count_fn(micro_batches)
+        single_loss_scaled_in_post = False
 
         for micro_step, micro_batch in enumerate(micro_batches):
             self.model_reshard(micro_step, num_micro_steps)
-            loss, loss_dict, token_count = self.forward_backward_step(micro_batch, num_micro_steps=num_micro_steps)
+            loss, loss_dict, token_counts = self.forward_backward_step(
+                micro_batch,
+                num_micro_steps=num_micro_steps,
+                window_loss_tokens=window_loss_tokens,
+            )
             if loss_reduction == "token_mean":
-                weight = token_count.float()
-                total_tokens_tensor = (
-                    token_count if total_tokens_tensor is None else (total_tokens_tensor + token_count)
-                )
+                assert token_counts is not None
+                if len(loss_dict) == 1:
+                    single_loss_scaled_in_post = True
+                for k, v in loss_dict.items():
+                    tok_k = token_counts[k]
+                    v_w = v.detach().float() * tok_k.float()
+                    total_loss_dict_tensors[k] = (
+                        v_w if k not in total_loss_dict_tensors else (total_loss_dict_tensors[k] + v_w)
+                    )
+                    total_tokens_dict[k] = tok_k if k not in total_tokens_dict else (total_tokens_dict[k] + tok_k)
             else:
-                weight = 1.0
-            loss_w = loss.detach().float() * weight
-            total_loss_tensor = loss_w if total_loss_tensor is None else (total_loss_tensor + loss_w)
-            for k, v in loss_dict.items():
-                v_w = v.detach().float() * weight
-                total_loss_dict_tensors[k] = (
-                    v_w if k not in total_loss_dict_tensors else (total_loss_dict_tensors[k] + v_w)
-                )
+                loss_w = loss.detach().float()
+                total_loss_tensor = loss_w if total_loss_tensor is None else (total_loss_tensor + loss_w)
+                for k, v in loss_dict.items():
+                    v_w = v.detach().float()
+                    total_loss_dict_tensors[k] = (
+                        v_w if k not in total_loss_dict_tensors else (total_loss_dict_tensors[k] + v_w)
+                    )
 
         if loss_reduction == "token_mean":
-            denom = float(total_tokens_tensor.item()) if total_tokens_tensor is not None else 0.0
-            if denom > 0.0:
-                self._scale_optimizer_grads(1.0 / denom)
+            if single_loss_scaled_in_post and len(total_tokens_dict) > 1:
+                raise ValueError(
+                    "train.loss_reduction='token_mean' observed inconsistent loss keys across micro-batches "
+                    f"in the same step: {list(total_tokens_dict.keys())}."
+                )
+            if single_loss_scaled_in_post and len(total_tokens_dict) == 1:
+                denom = float(next(iter(total_tokens_dict.values())).item())
+                if denom > 0.0:
+                    self._scale_optimizer_grads(1.0 / denom)
+            total_loss_dict = {}
+            for k, v in total_loss_dict_tensors.items():
+                denom_k = float(total_tokens_dict[k].item()) if k in total_tokens_dict else 0.0
+                total_loss_dict[k] = float(v.item()) / denom_k if denom_k > 0.0 else 0.0
+            total_loss = sum(total_loss_dict.values())
         else:
             denom = float(num_micro_steps)
-
-        total_loss = (
-            float(total_loss_tensor.item()) / denom if (total_loss_tensor is not None and denom > 0.0) else 0.0
-        )
-        total_loss_dict = {
-            k: float(v.item()) / denom if denom > 0.0 else 0.0 for k, v in total_loss_dict_tensors.items()
-        }
+            total_loss = (
+                float(total_loss_tensor.item()) / denom if (total_loss_tensor is not None and denom > 0.0) else 0.0
+            )
+            total_loss_dict = {
+                k: float(v.item()) / denom if denom > 0.0 else 0.0 for k, v in total_loss_dict_tensors.items()
+            }
 
         grad_norm = self.model.clip_grad_norm()
         if math.isfinite(float(grad_norm)):

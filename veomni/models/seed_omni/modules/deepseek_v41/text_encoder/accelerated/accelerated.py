@@ -24,9 +24,10 @@ main head -- with the Markov residual of ``x[j]`` added to the shared LM head's
 logits.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import torch
+import torch.distributed as dist
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.loss_utils import ForCausalLMLoss
@@ -223,10 +224,18 @@ class TrainingMixin(BaseTrainingMixin):
                 "DSpark hidden states reached decode without dspark_markov_bias / mtp_labels; "
                 "the draft CE is only defined with the Markov residual on the draft-slot labels."
             )
-        outputs["mtp_loss"] = self._dspark_loss(
+        mtp_loss, mtp_loss_tokens = self._dspark_loss(
             dspark_hidden_states, dspark_markov_bias, mtp_labels, dspark_markov_head_weight
         )
+        outputs["mtp_loss"] = mtp_loss
+        outputs["mtp_loss_tokens"] = mtp_loss_tokens
         return outputs
+
+    @staticmethod
+    def _loss_reduce_group(ps: Any) -> Any:
+        if ps.fsdp_group is not None:
+            return ps.fsdp_group
+        return getattr(ps, "sp_group", None) if getattr(ps, "sp_enabled", False) else None
 
     def _dspark_loss(
         self,
@@ -234,7 +243,7 @@ class TrainingMixin(BaseTrainingMixin):
         markov_bias: torch.Tensor,
         labels: torch.LongTensor,
         markov_head_weight: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """``CE(lm_head(h) + markov(x), labels)``, token-mean over the ``dp_sp`` mesh like the main head.
 
         A bias-free untied head goes through ``chunk_loss`` with the Markov
@@ -242,6 +251,8 @@ class TrainingMixin(BaseTrainingMixin):
         rows and keeps one chunk of their fp32 logits live. Any other head
         materializes the supervised rows' logits.
         """
+        ps = get_parallel_state()
+        fsdp_group = ps.fsdp_group
         num_supervised_tokens = (labels != IGNORE_INDEX).sum()
         if (
             num_supervised_tokens > 0
@@ -258,42 +269,93 @@ class TrainingMixin(BaseTrainingMixin):
                 weights=self.lm_head.weight,
                 chunk_size=_DSPARK_CHUNK_SIZE,
                 ignore_index=IGNORE_INDEX,
-                loss_reduction_group=get_parallel_state().fsdp_group,
+                loss_reduction_group=fsdp_group,
                 logits_bias=markov_bias,
                 logits_bias_weight=markov_head_weight,
                 op=self.veomni_dspark_ce,
             )
-            return loss
-        if num_supervised_tokens > 0:
-            supervised = labels != IGNORE_INDEX
-            hidden_states, markov_bias, labels = hidden_states[supervised], markov_bias[supervised], labels[supervised]
         else:
-            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))[:1]
-            markov_bias = markov_bias.reshape(-1, markov_bias.size(-1))[:1]
-            labels = labels.reshape(-1)[:1]
-        if markov_head_weight is not None:
-            markov_bias = torch.nn.functional.linear(markov_bias, markov_head_weight)
-        loss, _, _ = ForCausalLMLoss(
-            logits=self._project(hidden_states) + markov_bias,
-            labels=None,
-            shift_labels=labels,
-            vocab_size=self.config.vocab_size,
-            num_items_in_batch=num_supervised_tokens.clamp(min=1),
-            loss_reduction_group=get_parallel_state().fsdp_group,
-        )
-        return loss
+            if num_supervised_tokens > 0:
+                supervised = labels != IGNORE_INDEX
+                hidden_states, markov_bias, labels = (
+                    hidden_states[supervised],
+                    markov_bias[supervised],
+                    labels[supervised],
+                )
+            else:
+                hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))[:1]
+                markov_bias = markov_bias.reshape(-1, markov_bias.size(-1))[:1]
+                labels = labels.reshape(-1)[:1]
+            if markov_head_weight is not None:
+                markov_bias = torch.nn.functional.linear(markov_bias, markov_head_weight)
+            loss, _, _ = ForCausalLMLoss(
+                logits=self._project(hidden_states) + markov_bias,
+                labels=None,
+                shift_labels=labels,
+                vocab_size=self.config.vocab_size,
+                num_items_in_batch=num_supervised_tokens.clamp(min=1),
+                loss_reduction_group=fsdp_group,
+            )
+        loss_tokens = num_supervised_tokens.detach().to(dtype=torch.int64)
+        reduce_group = self._loss_reduce_group(ps)
+        if reduce_group is not None and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_tokens, op=dist.ReduceOp.SUM, group=reduce_group)
+        return loss, loss_tokens
+
+    def count_loss_tokens(
+        self,
+        method: str,
+        micro_batches: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, torch.Tensor]:
+        """Pre-count window ``ce_loss`` and ``mtp_loss`` tokens across ``micro_batches``."""
+        if method != "decode":
+            return {}
+        ps = get_parallel_state()
+        sp_sharded = ps.sp_size > 1 and ps.skip_sp_gather_between_modules
+        ce_local = 0
+        mtp_local = 0
+        for mb in micro_batches:
+            conv = mb.get("conversation_list")
+            shift_labels = self._build_decode_shift_labels(conv, ps if sp_sharded else None)
+            if shift_labels.numel() == 0:
+                continue
+            ce_local += int((shift_labels != IGNORE_INDEX).sum().item())
+            mtp_labels = (
+                self._mask_sharded_dspark_labels(shift_labels, conv, ps)
+                if sp_sharded
+                else self._mask_dspark_labels(shift_labels, conv)
+            )
+            mtp_local += int((mtp_labels != IGNORE_INDEX).sum().item())
+        counts = torch.tensor([ce_local, mtp_local], device=self.device, dtype=torch.int64)
+        reduce_group = self._loss_reduce_group(ps)
+        if reduce_group is not None and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=reduce_group)
+        return {"ce_loss": counts[0], "mtp_loss": counts[1]}
 
     @post_forward("decode")
-    def decode_post(self, mtp_loss: Optional[torch.Tensor] = None, **outputs: Any) -> Dict[str, Any]:
+    def decode_post(
+        self,
+        mtp_loss: Optional[torch.Tensor] = None,
+        mtp_loss_tokens: Optional[torch.Tensor] = None,
+        **outputs: Any,
+    ) -> Dict[str, Any]:
         forwarded = super().decode_post(**outputs)
         ce_loss = forwarded.get("_loss")
+        ce_loss_tokens = forwarded.pop("_loss_tokens", None)
+        loss_dict: Dict[str, torch.Tensor] = {}
+        token_dict: Dict[str, torch.Tensor] = {}
         if ce_loss is not None:
-            loss_dict = {"ce_loss": ce_loss}
-            if mtp_loss is not None:
-                loss_dict["mtp_loss"] = mtp_loss
+            loss_dict["ce_loss"] = ce_loss
+            if ce_loss_tokens is not None:
+                token_dict["ce_loss"] = ce_loss_tokens
+        if mtp_loss is not None:
+            loss_dict["mtp_loss"] = mtp_loss
+            if mtp_loss_tokens is not None:
+                token_dict["mtp_loss"] = mtp_loss_tokens
+        if loss_dict:
             forwarded["_loss"] = loss_dict
-        elif mtp_loss is not None:
-            forwarded["_loss"] = {"mtp_loss": mtp_loss}
+            if token_dict:
+                forwarded["_loss_tokens"] = token_dict
         return forwarded
 
 

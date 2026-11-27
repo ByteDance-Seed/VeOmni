@@ -161,6 +161,51 @@ class TrainingMixin(TrainingModuleMixin):
         input_ids = input_ids.to(self.device, non_blocking=True)
         return input_ids
 
+    @staticmethod
+    def _build_decode_shift_labels(
+        conversation_list: Optional[list[list[ConversationItem]]],
+        ps: Any = None,
+    ) -> torch.Tensor:
+        """Build CPU causal ``shift_labels`` from ``conversation_list`` matching :meth:`_prepare_decode_inputs`."""
+        sharded = ps is not None
+        label_chunks: list[torch.Tensor] = []
+        sample_starts: list[int] = []
+        decode_len = 0
+
+        for sample in conversation_list or []:
+            sample_start = decode_len
+            for part in sample:
+                if part.is_dummy:
+                    continue
+                if part.type == "text":
+                    labels = part.meta["labels"].cpu()
+                    label_chunks.append(labels)
+                    decode_len += int(labels.shape[0])
+                elif sharded:
+                    seg_len = item_token_len(part)
+                    label_chunks.append(torch.full((seg_len,), IGNORE_INDEX, dtype=torch.long))
+                    decode_len += seg_len
+                else:
+                    label_chunks.append(torch.full((1,), IGNORE_INDEX, dtype=torch.long))
+                    decode_len += 1
+            if decode_len > sample_start:
+                sample_starts.append(sample_start)
+
+        if not label_chunks:
+            return torch.empty((0,), dtype=torch.long)
+
+        labels = torch.cat(label_chunks, dim=0)
+        for start in sample_starts[1:]:
+            labels[start] = IGNORE_INDEX
+        labels = labels[..., 1:].contiguous()
+        if not sharded:
+            return F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
+        rows = sp_valid_in_window(decode_len, ps.sp_rank, ps.sp_size)
+        local_len = sp_local_len(decode_len, ps.sp_size)
+        shift_labels = F.pad(labels, (0, 1 + (local_len * ps.sp_size - decode_len)), "constant", IGNORE_INDEX)
+        shard_start = ps.sp_rank * local_len
+        return shift_labels[shard_start : shard_start + rows].contiguous()
+
     def _prepare_decode_inputs(
         self,
         conversation_list: Optional[list[list[ConversationItem]]],

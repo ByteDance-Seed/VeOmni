@@ -38,13 +38,15 @@ and the attention gathers its one KV head instead of scattering query heads
 (see :mod:`..sequence_shard`).
 """
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 from torch.distributed._tensor import Shard
 
 from .......distributed.parallel_plan import ParallelPlan
 from .......distributed.parallel_state import get_parallel_state
+from .......distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
 from .......utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 from .......utils.tensor_utils import unflatten
 from .....mixins.base_mixin import BaseMixin
@@ -52,6 +54,7 @@ from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
 from ....base.llm_packing import (
+    item_token_len,
     pack_llm_conversations_for_forward,
     scatter_llm_hidden_states,
 )
@@ -59,6 +62,7 @@ from ....base.sp_shard import (
     gather_sp_sharded_groups,
     modality_groups,
     pack_sp_sharded_conversations_for_forward,
+    sp_valid_in_window,
     split_sp_sharded_tensor,
 )
 from ...quant_scheme import quantized_storage_dtype
@@ -420,14 +424,78 @@ class TrainingMixin(TrainingModuleMixin):
         if outputs.get("draft_hiddens") is not None and dspark_handoff is not None:
             dspark_handoff["draft_hiddens"] = outputs["draft_hiddens"]
             forwarded["dspark_inputs"] = dspark_handoff
-        # OmniModel only collects ``_loss``. Leaving the KL tensors on the batch
-        # would hand them to ``text_encoder.decode`` as unexpected kwargs; folding
-        # here is how the indexer gets a gradient at all -- top-k does not
-        # backprop into the scores it ranked.
-        kl_loss = fold_indexer_kl_loss(outputs, self.config.dsa_indexer_loss_coef)
+        # OmniModel collects ``_loss`` and ``_loss_tokens``. Leaving the KL
+        # tensors on the batch would hand them to ``text_encoder.decode`` as
+        # unexpected kwargs; folding here is how the indexer gets a gradient at
+        # all -- top-k does not backprop into the scores it ranked.
+        kl_loss, kl_tokens = self._fold_and_reduce_indexer_kl(outputs, shard, ps)
         if kl_loss is not None:
             forwarded["_loss"] = {"indexer_kl_loss": kl_loss}
+            if kl_tokens is not None:
+                forwarded["_loss_tokens"] = {"indexer_kl_loss": kl_tokens}
         return forwarded
+
+    @staticmethod
+    def _indexer_loss_reduce_group(ps: Any, shard: Optional[SequenceShard] = None) -> Any:
+        if ps.fsdp_group is not None:
+            return ps.fsdp_group
+        if shard is not None:
+            return shard.group
+        if getattr(ps, "cp_size", 1) > 1 and getattr(ps, "cp_group", None) is not None:
+            return ps.cp_group
+        return getattr(ps, "sp_group", None) if getattr(ps, "sp_enabled", False) else None
+
+    def _fold_and_reduce_indexer_kl(
+        self,
+        outputs: Dict[str, Any],
+        shard: Optional[SequenceShard],
+        ps: Any,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        total = outputs.get("indexer_kl_total")
+        coef = self.config.dsa_indexer_loss_coef
+        if total is None or coef <= 0:
+            return None, None
+        query_tokens = int(outputs.get("indexer_query_tokens") or 0)
+        if shard is not None:
+            batch = max(query_tokens // shard.valid_len, 1) if shard.valid_len > 0 else 1
+            local_kl = total / shard.size
+            local_tokens = batch * max(0, min(shard.end, shard.valid_len) - shard.start)
+        else:
+            local_kl = total
+            local_tokens = query_tokens
+
+        reduce_group = self._indexer_loss_reduce_group(ps, shard)
+        local_tokens_t = torch.tensor(local_tokens, device=local_kl.device, dtype=torch.int64)
+        if reduce_group is not None and dist.is_available() and dist.is_initialized():
+            local_mean = coef * (local_kl / local_tokens_t.clamp_min(1))
+            kl_loss = reduce_sequence_parallel_loss(local_mean, local_tokens_t, group=reduce_group)
+            return kl_loss, local_tokens_t.detach().clone()
+
+        kl_loss = fold_indexer_kl_loss(outputs, coef)
+        return kl_loss, local_tokens_t
+
+    def count_loss_tokens(
+        self,
+        method: str,
+        micro_batches: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, torch.Tensor]:
+        """Pre-count window ``indexer_kl_loss`` query tokens across ``micro_batches``."""
+        if method != "forward" or not self.config.dsa_indexer_loss or self.config.dsa_indexer_loss_coef <= 0:
+            return {}
+        ps = get_parallel_state()
+        local_total = 0
+        for mb in micro_batches:
+            conv = mb.get("conversation_list")
+            valid_len = sum(item_token_len(part) for sample in (conv or []) for part in sample if not part.is_dummy)
+            if ps.cp_size > 1:
+                local_total += sp_valid_in_window(valid_len, ps.cp_rank, ps.cp_size)
+            else:
+                local_total += valid_len
+        tokens = torch.tensor(local_total, device=self.device, dtype=torch.int64)
+        reduce_group = self._indexer_loss_reduce_group(ps)
+        if reduce_group is not None and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(tokens, op=dist.ReduceOp.SUM, group=reduce_group)
+        return {"indexer_kl_loss": tokens}
 
 
 class MeterMixin(MetricMeterMixin):

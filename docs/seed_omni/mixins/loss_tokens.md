@@ -11,7 +11,9 @@ a base class.
 - Reference implementations:
   [`TextEncoder`](../../../veomni/models/seed_omni/modules/text_encoder/accelerated/accelerated.py),
   [`JanusVqvae`](../../../veomni/models/seed_omni/modules/janus/vqvae/accelerated/accelerated.py),
-  [`BagelFlowConnector`](../../../veomni/models/seed_omni/modules/bagel/flow_connector/accelerated/accelerated.py)
+  [`BagelFlowConnector`](../../../veomni/models/seed_omni/modules/bagel/flow_connector/accelerated/accelerated.py),
+  [`DeepseekV41TextEncoder`](../../../veomni/models/seed_omni/modules/deepseek_v41/text_encoder/accelerated/accelerated.py),
+  [`DeepseekV41Llm`](../../../veomni/models/seed_omni/modules/deepseek_v41/llm/accelerated/accelerated.py)
 
 ## Why modules report it
 
@@ -57,11 +59,26 @@ model-specific shifting rules.
    zero gradient without dividing by zero; if every micro-batch in the
    accumulation window sums to zero tokens, `OmniTrainer` skips gradient
    rescaling and logs `0.0`.
-5. **Single-loss scope**: `train.loss_reduction="token_mean"` currently
-   requires a single loss-producing node whose key matches
-   `result["loss_tokens"]`. Multi-loss graphs (e.g. text + image or MoE router
-   auxiliary loss) or losses without `_loss_tokens` raise `ValueError` before
-   backward; use `train.loss_reduction="sample_mean"` for those graphs.
+5. **Single-loss and multi-loss scope**:
+   - Every active loss key in `result["losses"]` must have a matching key in
+     `result["loss_tokens"]` (when a node emits a `{loss_name: tensor}` dict
+     for `_loss`, it must emit a matching `{loss_name: tokens}` dict for
+     `_loss_tokens`, which `OmniModel.forward` flattens under
+     `{node.name}.{loss_name}`). Any loss missing `_loss_tokens` raises
+     `ValueError` before backward.
+   - **Single-loss graphs** scale backward by `_loss_tokens` and divide
+     accumulated gradients once by the window's total tokens at step end — no
+     pre-count hook is required.
+   - **Multi-loss graphs** (e.g. DeepSeek-V4.1's `ce_loss` + `mtp_loss` +
+     `indexer_kl_loss`, where each loss has its own token denominator):
+     - With `num_micro_steps == 1`, each loss is already reduced over its own
+       group tokens and keeps weight `1` (`0` if its token count is zero).
+     - With `num_micro_steps > 1`, each loss module must implement
+       `count_loss_tokens(method=..., micro_batches=...)` returning the
+       group-reduced window total for each of its loss keys so `OmniTrainer`
+       can weight each loss `k` independently by
+       `micro_tokens[k] / window_tokens[k]` without distorting relative loss
+       scales across losses with different token counts.
 
 ## Minimal example
 

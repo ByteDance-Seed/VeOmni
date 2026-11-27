@@ -336,6 +336,8 @@ class TestEndToEndTrainGraph:
         assert {f"{TEXT}.decode.ce_loss", f"{TEXT}.decode.mtp_loss", f"{LLM}.forward.indexer_kl_loss"} <= set(
             out["losses"]
         )
+        assert set(out["loss_tokens"]) == set(out["losses"])
+        assert all(int(v.item()) > 0 for v in out["loss_tokens"].values())
         torch.testing.assert_close(loss, sum(out["losses"].values()))
 
         opt.zero_grad(set_to_none=True)
@@ -355,8 +357,122 @@ class TestEndToEndTrainGraph:
         out = model({"conversation_list": toy_conversation()})
         assert torch.isfinite(out["loss"])
         assert set(out["losses"]) == {f"{TEXT}.decode.ce_loss", f"{LLM}.forward.indexer_kl_loss"}
+        assert set(out["loss_tokens"]) == set(out["losses"])
         out["loss"].backward()
         assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in modules[LLM].parameters())
+
+    def test_five_module_graph_token_mean_count_and_grad_accum_step(self, monkeypatch):
+        """DeepSeek-V4.1 multi-loss (ce + mtp + indexer_kl) runs OmniTrainer token_mean across 2 unequal micro-batches."""
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+
+        from veomni.trainer.omni.omni_trainer import OmniTrainer
+
+        _patch_cpu_attention(monkeypatch)
+        modules = build_toy_modules(with_ngram=True, dspark=True)
+        model = build_toy_omni(modules)
+        model.train()
+
+        # Micro-batch 0: short text + dummy image.
+        mb0 = {"conversation_list": toy_conversation()}
+        # Micro-batch 1: longer text + real non-dummy image with stamped _OMNI_TOKEN_LEN.
+        user_ids = torch.tensor([5, 6, 7, 8, 9, 10], dtype=torch.long)
+        asst_ids = torch.tensor([11, 12, 13, 14, 15, 16, 17, 18], dtype=torch.long)
+        img_types = image_token_types(1, 1)
+        mb1 = {
+            "conversation_list": [
+                [
+                    ConversationItem(
+                        type="text",
+                        value=user_ids,
+                        role="user",
+                        meta={"input_ids": user_ids.clone(), "labels": torch.full_like(user_ids, -100)},
+                    ),
+                    ConversationItem(
+                        type="image",
+                        value=torch.randn(1, 3, 4, 4),
+                        role="user",
+                        meta={
+                            "_omni_vit_grid": [1, 1],
+                            "_omni_token_types": img_types,
+                            _OMNI_TOKEN_LEN: int(img_types.numel()),
+                        },
+                    ),
+                    ConversationItem(
+                        type="text",
+                        value=asst_ids,
+                        role="assistant",
+                        meta={"input_ids": asst_ids.clone(), "labels": asst_ids.clone()},
+                    ),
+                ]
+            ]
+        }
+
+        # Verify pre-counted window tokens match forward-reported _loss_tokens identically for all 3 losses.
+        window_counts = model.count_loss_tokens([mb0, mb1])
+        expected_keys = {f"{TEXT}.decode.ce_loss", f"{TEXT}.decode.mtp_loss", f"{LLM}.forward.indexer_kl_loss"}
+        assert expected_keys <= set(window_counts)
+
+        # Clone conversations for independent forward verification before trainer clears micro_batches.
+        def _clone_mb(mb):
+            return {
+                "conversation_list": [
+                    [
+                        ConversationItem(
+                            type=p.type,
+                            value=p.value.clone() if isinstance(p.value, torch.Tensor) else p.value,
+                            role=p.role,
+                            is_dummy=p.is_dummy,
+                            meta={k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in p.meta.items()},
+                        )
+                        for p in sample
+                    ]
+                    for sample in mb["conversation_list"]
+                ]
+            }
+
+        with torch.no_grad():
+            out0 = model(_clone_mb(mb0))
+            out1 = model(_clone_mb(mb1))
+        for k in expected_keys:
+            assert int(window_counts[k].item()) == int(out0["loss_tokens"][k].item() + out1["loss_tokens"][k].item())
+
+        # Now execute a full OmniTrainer.train_step under loss_reduction="token_mean" with num_micro_steps=2.
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(trainable, lr=1e-3)
+        sched = SimpleNamespace(step=lambda: None)
+        runtime_stub = SimpleNamespace(
+            forward=model.forward,
+            count_loss_tokens=model.count_loss_tokens,
+            clip_grad_norm=lambda: torch.tensor(1.0),
+            optimizer=opt,
+            lr_scheduler=sched,
+        )
+        trainer = OmniTrainer.__new__(OmniTrainer)
+        trainer.device = torch.device("cpu")
+        trainer.state = SimpleNamespace(global_step=0)
+        trainer.args = SimpleNamespace(
+            train=SimpleNamespace(
+                loss_reduction="token_mean",
+                sync_each_train_step=False,
+                enable_batch_invariant_mode=False,
+            )
+        )
+        trainer.model = runtime_stub
+        trainer.model_fwd_context = nullcontext()
+        trainer.model_bwd_context = nullcontext()
+        trainer._reset_async_activation_offload_if_enabled = lambda: None
+        trainer.on_step_begin = lambda **kwargs: None
+        trainer.sync_before_train_step = lambda: None
+        trainer.model_reshard = lambda *a, **k: None
+        trainer.preforward = lambda mb: mb
+        captured = {}
+        trainer.on_step_end = lambda **kwargs: captured.update(kwargs)
+
+        trainer.train_step(iter([[mb0, mb1]]))
+        assert set(captured["loss_dict"]) == expected_keys
+        assert all(math.isfinite(v) and v > 0 for v in captured["loss_dict"].values())
+        assert captured["loss"] == pytest.approx(sum(captured["loss_dict"].values()), rel=1e-6)
 
     def test_freeze_n_trainable_layers_and_frozen_mtp_skip(self, monkeypatch):
         _patch_cpu_attention(monkeypatch)

@@ -31,7 +31,8 @@ walk.  Stop when ``is_done()`` or ``max_new_tokens`` is reached.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -583,6 +584,48 @@ class OmniModel(PreTrainedModel):
             "loss_tokens": dict(self._loss_tokens),
             "conversation_list": batch.get("conversation_list"),
         }
+
+    def count_loss_tokens(
+        self,
+        micro_batches: Sequence[Mapping[str, Any]],
+        *,
+        scope_fn: Callable[[str], Any] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Optional window-level loss-token pre-count across every training node.
+
+        Used by :class:`OmniTrainer` under ``train.loss_reduction="token_mean"``
+        when a multi-loss graph accumulates across ``num_micro_steps > 1``: each
+        loss term has its own token denominator, so knowing each key's window
+        total before backward lets a single backward pass weight every loss ``k``
+        by ``micro_tokens[k] / window_tokens[k]`` without cross-loss distortion.
+
+        Modules opt in by implementing
+        ``count_loss_tokens(method=node.method, micro_batches=micro_batches)``
+        returning either a scalar tensor (stored as ``node.name``) or a
+        ``{loss_name: tensor}`` mapping (stored as ``{node.name}.{loss_name}``),
+        reduced over the exact same process group as ``_loss_tokens``.
+        """
+        if self.training_graph is None:
+            return {}
+        counts: dict[str, torch.Tensor] = {}
+        self.training_graph.reset()
+        for node in self.training_graph.iter_nodes():
+            module = self.get_module(node.module)
+            counter = getattr(module, "count_loss_tokens", None)
+            if counter is None:
+                continue
+            ctx = scope_fn(node.module) if scope_fn is not None else nullcontext()
+            with ctx:
+                node_counts = counter(method=node.method, micro_batches=micro_batches)
+            if node_counts is None:
+                continue
+            if isinstance(node_counts, Mapping):
+                for loss_name, value in node_counts.items():
+                    if value is not None:
+                        counts[f"{node.name}.{loss_name}"] = value
+            else:
+                counts[node.name] = node_counts
+        return counts
 
     def reset(self) -> None:
         """Clear per-request inference runtime state."""

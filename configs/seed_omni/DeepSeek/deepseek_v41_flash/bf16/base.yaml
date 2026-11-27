@@ -78,6 +78,7 @@ train:
   num_train_epochs: 1
   global_batch_size: 16
   micro_batch_size: 1
+  loss_reduction: token_mean
   dyn_bsz: true
   dyn_bsz_runtime: worker
   bsz_warmup_ratio: 0.0
