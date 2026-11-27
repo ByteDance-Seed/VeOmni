@@ -54,7 +54,7 @@ when the selected implementation runs.
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `token_logprobs` | `standard` | `eager`, `flash_attn` (GPU Triton cross-entropy), `torch_npu` (Ascend NPU cross-entropy) |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
-| `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
+| `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu`, `fla_npu_reuse` as supported by the family |
 | `chunk_kda` | `kimi_k3` | `eager` (the `chunk_kda_naive` reference), `ascendc` (fused AscendC NPU, guarded routing), `fla` (CUDA, version-asserted against the K3 gating contract) |
 | `situ_and_mul` | `kimi_k3` | `eager` (fp32 core, shared by the MoE expert loops), `triton` (Triton-Ascend NPU) |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
@@ -69,6 +69,11 @@ The MLU `liger_kernel` rows reuse the CUDA adapters and use
 liger build keeps the upstream `liger_kernel.ops.*` API, and the registry
 checks its `__mlu_version__` marker so upstream GPU liger on an MLU host is
 never selected.
+
+For `chunk_gated_delta_rule`, the optional AscendC `fla_npu_reuse` row retains
+forward W, H, and new-value tensors for backward instead of recomputing them.
+It uses additional activation memory; the existing `fla_npu` row continues to
+recompute these tensors. Both require `fla_npu` and Triton-Ascend.
 
 DeepSeek-V4 `dsa_attention` takes the full-resolution and compressed KV
 separately, plus `position_ids` and the compressor's `CompressedCandidates`,
