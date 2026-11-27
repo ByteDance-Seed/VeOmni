@@ -73,6 +73,39 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
 _SDPA_ATTN_IMPLS = frozenset({"eager", "sdpa", "veomni_sdpa"})
 
 
+def _is_flash_attn_impl(impl: str) -> bool:
+    """FlashAttention rows accept varlen ``cu_seq_lens`` kwargs, so keep-masks can be packed for them."""
+    return "flash_attention" in impl
+
+
+def _as_joint_keep_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Accept boolean or binary-integer keep masks, never additive attention bias."""
+    if mask.dtype == torch.bool:
+        return mask
+    integer_dtypes = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+    if mask.dtype not in integer_dtypes or bool(((mask != 0) & (mask != 1)).any()):
+        raise ValueError(
+            "Qwen-Image requires a boolean or binary-integer keep-mask; additive and soft masks are unsupported."
+        )
+    return mask.bool()
+
+
+def _joint_varlen_metadata(keep_mask: torch.Tensor) -> dict[str, Any]:
+    """Varlen metadata for the tokens a boolean ``[B, S]`` joint keep-mask retains.
+
+    Same derivation as Transformers' ``_get_unpad_data`` (positions from
+    ``nonzero``, not prefix lengths), but run once per forward and reused by
+    every block, so its host reads are not repeated per layer.
+    """
+    keep_mask = _as_joint_keep_mask(keep_mask)
+    seqlens = keep_mask.sum(dim=-1, dtype=torch.int32)
+    return {
+        "indices": keep_mask.flatten().nonzero().flatten(),
+        "cu_seqlens": F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0)),
+        "max_seqlen": int(seqlens.max()),
+    }
+
+
 class QwenImageAttentionKernelModule:
     """HF attention-interface view for joint Qwen-Image Q/K/V."""
 
@@ -114,8 +147,9 @@ def _joint_keep_mask(
 ) -> torch.Tensor | None:
     """Build a joint ``[text, image]`` keep-mask, or None when every token is valid.
 
-    A dense all-true mask still selects the SDPA fallback, so omit it unless SP
-    padding or the text mask actually drops tokens.
+    A dense all-true mask would still take the masked path (varlen packing for
+    flash, SDPA for other non-SDPA impls), so omit it unless SP padding or the
+    text mask actually drops tokens.
     """
     if encoder_hidden_states_mask is None:
         text_mask = torch.ones((batch_size, txt_seq_len), dtype=torch.bool, device=device)
@@ -153,13 +187,21 @@ class QwenImageSPAttnProcessor:
     all-to-all on the outputs. Because each stream is gathered independently and
     concatenated in the original ``[text, image]`` order, the full joint
     attention mask stays valid without any reordering.
+
+    A joint keep-mask stays on the configured FlashAttention row: the tokens it
+    keeps are packed into one varlen call and scattered back, so text padding in
+    the middle of the joint sequence is never attended. Other non-SDPA rows
+    cannot consume this mask and run masked calls through SDPA, with a warning.
     """
 
     def __init__(self, config=None):
         impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
         self.veomni_attn = VeomniOp("attention", "standard", impl)
+        self.flash_varlen = _is_flash_attn_impl(impl)
         self.veomni_attn_masked = (
-            self.veomni_attn if impl in _SDPA_ATTN_IMPLS else VeomniOp("attention", "standard", "veomni_sdpa")
+            self.veomni_attn
+            if impl in _SDPA_ATTN_IMPLS or self.flash_varlen
+            else VeomniOp("attention", "standard", "veomni_sdpa")
         )
         self.config = SimpleNamespace(_attn_implementation=impl)
 
@@ -171,6 +213,7 @@ class QwenImageSPAttnProcessor:
         encoder_hidden_states_mask: torch.Tensor = None,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
+        joint_varlen_metadata: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if encoder_hidden_states is None:
             raise ValueError("QwenImageSPAttnProcessor requires encoder_hidden_states (text stream)")
@@ -228,17 +271,28 @@ class QwenImageSPAttnProcessor:
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        handle = self.veomni_attn_masked if attention_mask is not None else self.veomni_attn
-        joint_hidden_states = handle(
-            QwenImageAttentionKernelModule(self.config._attn_implementation, attn),
-            joint_query.transpose(1, 2),
-            joint_key.transpose(1, 2),
-            joint_value.transpose(1, 2),
-            _hf_key_padding_mask(attention_mask),
-            dropout=0.0,
-            is_causal=False,
-            skip_ulysses=True,
-        )[0]
+        kernel_module = QwenImageAttentionKernelModule(self.config._attn_implementation, attn)
+        if attention_mask is not None and self.flash_varlen:
+            joint_hidden_states = self._packed_flash_attention(
+                kernel_module, joint_query, joint_key, joint_value, attention_mask, joint_varlen_metadata
+            )
+        else:
+            if attention_mask is not None and self.veomni_attn_masked is not self.veomni_attn:
+                logger.warning_once(
+                    f"Qwen-Image attn_implementation={self.config._attn_implementation!r} cannot consume the "
+                    "joint padding mask; masked joint attention runs through SDPA."
+                )
+            handle = self.veomni_attn_masked if attention_mask is not None else self.veomni_attn
+            joint_hidden_states = handle(
+                kernel_module,
+                joint_query.transpose(1, 2),
+                joint_key.transpose(1, 2),
+                joint_value.transpose(1, 2),
+                _hf_key_padding_mask(attention_mask),
+                dropout=0.0,
+                is_causal=False,
+                skip_ulysses=True,
+            )[0]
 
         # joint_hidden_states: (B, joint_seq, heads_local, head_dim)
         txt_attn_output = joint_hidden_states[:, :seq_txt]
@@ -258,6 +312,50 @@ class QwenImageSPAttnProcessor:
         txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
 
         return img_attn_output, txt_attn_output
+
+    def _packed_flash_attention(
+        self,
+        kernel_module: QwenImageAttentionKernelModule,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        joint_varlen_metadata: dict[str, Any] | None,
+    ) -> torch.Tensor:
+        """Run the configured flash row on the tokens ``attention_mask`` keeps; ``(B, S, H, D)`` in and out."""
+        batch_size, joint_len = query.shape[:2]
+        if attention_mask.shape != (batch_size, joint_len):
+            raise ValueError(
+                f"Qwen-Image flash joint mask shape must be {(batch_size, joint_len)}, "
+                f"got {tuple(attention_mask.shape)}. Broadcast masks are not supported."
+            )
+        if joint_varlen_metadata is None:
+            joint_varlen_metadata = _joint_varlen_metadata(attention_mask)
+        indices = joint_varlen_metadata["indices"]
+        cu_seqlens = joint_varlen_metadata["cu_seqlens"]
+        max_seqlen = joint_varlen_metadata["max_seqlen"]
+        # [B, S, H, D] -> kept tokens of all samples as one [1, H, T, D] sequence.
+        packed_q, packed_k, packed_v = (
+            x.flatten(0, 1).index_select(0, indices).unsqueeze(0).transpose(1, 2) for x in (query, key, value)
+        )
+        packed = self.veomni_attn(
+            kernel_module,
+            packed_q,
+            packed_k,
+            packed_v,
+            None,
+            dropout=0.0,
+            is_causal=False,
+            skip_ulysses=True,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+        )[0][0]
+        # Removed rows get zero raw attention output; they are never attended to.
+        out = packed.new_zeros(batch_size * joint_len, *packed.shape[1:])
+        out.index_copy_(0, indices, packed)
+        return out.unflatten(0, (batch_size, joint_len))
 
 
 @apply_lora_scale("attention_kwargs")
@@ -284,6 +382,8 @@ def QwenImageTransformer2DModel_forward(
     :class:`QwenImageSPAttnProcessor`, and the image stream is gathered back
     before the output head so that the prediction is identical across SP ranks.
     """
+    if encoder_hidden_states_mask is not None:
+        encoder_hidden_states_mask = _as_joint_keep_mask(encoder_hidden_states_mask)
     sp_enabled = get_parallel_state().sp_enabled
 
     hidden_states = self.img_in(hidden_states)
@@ -378,7 +478,12 @@ def QwenImageTransformer2DModel_forward(
         if joint_mask is not None:
             block_attention_kwargs["attention_mask"] = joint_mask
 
-    if "attention_mask" in block_attention_kwargs:
+    # This forward is also patched onto the diffusers class, so consult the installed processor.
+    if getattr(self.transformer_blocks[0].attn.processor, "flash_varlen", False):
+        effective_mask = block_attention_kwargs.get("attention_mask")
+        if effective_mask is not None:
+            block_attention_kwargs["joint_varlen_metadata"] = _joint_varlen_metadata(effective_mask)
+    elif "attention_mask" in block_attention_kwargs:
         joint_sequence_length = hidden_states.shape[1] + encoder_hidden_states.shape[1]
         if sp_enabled:
             joint_sequence_length *= sp_size
