@@ -54,15 +54,22 @@ def test_state_offload_device_memory_fraction_is_coerced_and_ranged():
         OptimizerConfig(state_offload="cpu", state_offload_device_memory_fraction=1.5)
 
 
-def test_state_offload_rejects_non_adamw_types_and_unknown_values():
+def test_state_offload_rejects_unsupported_types_and_unknown_values():
     # The literal is not enforced for YAML values, so the constructor validates
     # it; otherwise a typo would silently fall back to the stock AdamW path.
     with pytest.raises(ValueError, match="must be 'none' or 'cpu'"):
         OptimizerConfig(state_offload="gpu")
-    with pytest.raises(ValueError, match="only supported for type='adamw'"):
-        OptimizerConfig(type="muon", state_offload="cpu")
-    with pytest.raises(ValueError, match="only supported for type='adamw'"):
+    assert OptimizerConfig(type="muon", state_offload="cpu").state_offload == "cpu"
+    assert (
+        OptimizerConfig(
+            type="muon", state_offload="cpu", state_offload_device_memory_fraction="8e-1"
+        ).state_offload_device_memory_fraction
+        == 0.8
+    )
+    with pytest.raises(ValueError, match="only supported for type='adamw' or 'muon'"):
         OptimizerConfig(type="anyprecision_adamw", state_offload="cpu")
+    with pytest.raises(ValueError, match="only supported for type='adamw' or 'muon'"):
+        OptimizerConfig(type="hyper_muon", state_offload="cpu")
 
 
 def test_state_offload_rejects_fsdp_cpu_offload():
