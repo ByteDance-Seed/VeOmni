@@ -505,7 +505,7 @@ compile, the difference between the two trainers, and the measured payoff.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw", "muon", "hyper_muon"]` | `"adamw"` | Optimizer type. `muon` and `hyper_muon` build Muon and AdamW parameter groups using VeOmni and HyperParallel respectively. Hyper FSDP does not support `anyprecision_adamw`. |
+| type | `Literal["adamw", "anyprecision_adamw", "muon", "hyper_muon", "master_fp32_adamw", "full_fp32_adamw", "cpu_offload_adamw", "qwen38_muon"]` | `"adamw"` | Optimizer type. The FP32 variants use FP32 master weights; `cpu_offload_adamw` supports selective CPU state offload. `muon` and [`qwen38_muon`](qwen38_muon.md) combine Muon with AdamW. `hyper_muon` uses HyperParallel Muon and AdamW. Hyper FSDP does not support `anyprecision_adamw`. |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |
@@ -532,7 +532,7 @@ compile, the difference between the two trainers, and the measured payoff.
 | muon_expert_ns_max_experts | `int` | `-1` | Chunked Newton–Schulz for a local-expert stack on device (the `muon_expert_zero_comm` path). `-1` (default) **disables** chunking: the whole stack is orthogonalized in one call, which is fastest and needs the most NS workspace. A positive value bounds the workspace at `max_experts × min(M, K)²` instead of `local_experts × min(M, K)²`, using balanced slices of at most that many experts. Costs a few percent of step time; enable it only when the unchunked workspace would OOM. This is a constructor-level switch, not resumable state: it is not written to the optimizer checkpoint, so a resume always uses the value the current run configured. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
-| state_offload | `Literal["none", "cpu"]` | `"none"` | Optimizer-managed state offload. `none` disables it (training state may still be offloaded by `model.accelerator.fsdp_config.offload`); `cpu` keeps the moment states in host buffers and streams them to the device in batches, lowering peak device memory (only with `type="adamw"`). |
+| state_offload | `Literal["none", "cpu"]` | `"none"` | Optimizer-managed state offload. `none` disables it (training state may still be offloaded by `model.accelerator.fsdp_config.offload`); `cpu` keeps the moment states in host buffers and streams them to the device in batches, lowering peak device memory (only with `type="adamw"`). It cannot be combined with selective ExtraParallel parameter CPU offload. |
 | state_offload_device_memory_fraction | `float` | `0.8` | With `state_offload="cpu"`, fraction of currently free device memory used to size one streamed batch of optimizer states. It is recomputed every step; a single parameter whose states exceed it cannot be swapped in and `step()` raises. |
 | state_offload_pin_memory | `bool` | `True` | With `state_offload="cpu"`, pin the host-side optimizer state buffers. Disable if page-locked memory is scarce. A failed pinned allocation degrades to pageable buffers (rank-0 warning) instead of failing the run. |
 
@@ -961,6 +961,7 @@ and is not intended to be captured by `torch.compile`.
 | hf_save_steps | `int` | `0` | Steps between HuggingFace weight saves. `0` to disable. |
 | hf_save_epochs | `int` | `0` | Epochs between HuggingFace weight saves. `0` to disable. |
 | save_hf_weights | `bool` | `True` | Save HuggingFace-format weights to the last checkpoint directory. |
+| extra_parallel_canonical_layout | `bool` | `False` | Opt in to versioned canonical EP/PLE model checkpoint layout. See [layout compatibility and migration restrictions](checkpoint.md#versioned-extraparallel-layout). |
 
 ### InferArguments
 
