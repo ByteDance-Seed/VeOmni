@@ -44,6 +44,7 @@ _FIELD_TO_OP = {
     "mhc_implementation": "mhc",
     "moe_implementation": "moe_experts",
     "qsa_attention_implementation": "qsa_attention",
+    "qsa_indexer_implementation": "qsa_indexer",
     "rms_norm_gated_implementation": "rms_norm_gated",
     "rms_norm_implementation": "rms_norm",
     "rotary_pos_emb_implementation": "rope",

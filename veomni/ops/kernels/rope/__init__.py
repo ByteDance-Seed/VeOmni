@@ -18,8 +18,9 @@ Variants: ``full`` (rotate every channel for text or rank-3 vision layouts),
 ``partial`` (rotate a prefix), ``interleave`` (interleaved pairs in, rotate-half
 out), ``mrope`` (remix 3-axis multimodal tables, then rotate-half),
 ``deepseek_v4`` (trailing interleaved slice), and ``wan`` (complex
-multiply by freqs). Each variant registers an eager row plus optional CUDA /
-NPU adapters. ``full`` and ``partial`` also expose ``liger_kernel``.
+multiply by freqs, also accepting a diffusers real pair). Each variant
+registers an eager row plus optional CUDA / NPU adapters. ``full`` and
+``partial`` also expose ``liger_kernel``.
 """
 
 from ...platform import GpuKernelRequirement, MluKernelRequirement, NpuKernelRequirement

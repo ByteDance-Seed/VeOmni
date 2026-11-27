@@ -73,7 +73,6 @@ from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
 
 
@@ -716,11 +715,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             local_num_v_heads = self.num_v_heads
             local_key_dim = self.key_dim
             local_value_dim = self.value_dim
-
-        # Host-gated NPU kernels must follow the activation device. Unconditional
-        # `.npu()` breaks CPU unit tests on Ascend hosts.
-        if cu_seq_lens_q is not None and mixed_qkv.device.type == "npu":
-            cu_seq_lens_q = cu_seq_lens_q.to(mixed_qkv.device)
 
         if use_precomputed_states:
             # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
@@ -1701,9 +1695,6 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
                 kwargs["vision_max_seqlen"] = max(max_frame_len, pad_seq_len)
         # --- Patch.5 ---
 
-        if IS_NPU_AVAILABLE:
-            cu_seqlens = cu_seqlens.to("cpu")
-
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
@@ -1869,25 +1860,6 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             if "linear_attention" in self.config.layer_types:
                 causal_mask_mapping["linear_attention"] = create_recurrent_attention_mask(**mask_kwargs)
             # --- Patch.1 ---
-
-        if IS_NPU_AVAILABLE:
-            linear_cu_seq_lens_q = kwargs.get("linear_attn_cu_seq_lens_q", kwargs.get("cu_seq_lens_q", None))
-            if linear_cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
-                from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu import (
-                    precompute_varlen_metadata,
-                )
-
-                num_v_heads = self.config.linear_num_value_heads
-                if get_parallel_state().sp_enabled:
-                    num_v_heads //= get_parallel_state().sp_size
-                cu_seqlens_list, chunk_indices, chunk_indices_list = precompute_varlen_metadata(
-                    cu_seqlens=linear_cu_seq_lens_q,
-                    num_heads=num_v_heads,
-                    chunk_size=64,
-                )
-                kwargs["cu_seqlens_list_q"] = cu_seqlens_list
-                kwargs["chunk_indices_q"] = chunk_indices
-                kwargs["chunk_indices_list_q"] = chunk_indices_list
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

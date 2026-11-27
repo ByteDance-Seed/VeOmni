@@ -227,6 +227,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         fc2_weight,
         swiglu_limit=None,
         activation="silu",
+        swiglu_alpha=None,
     ):
         """Merged fc1 GEMM, SwiGLU, and fc2. No routing scale."""
         from .group_gemm import group_gemm_same_nk, same_nk_tile_schedule
@@ -250,7 +251,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             fc1_1_output, fc1_2_output, swiglu_limit
         )
         if is_silu(activation):
-            fc1_result = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
+            fc1_result = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output, swiglu_alpha)
         else:
             fc1_result = _expert_activation(fc1_1_output, activation) * fc1_2_output
         fc2_output = group_gemm_same_nk(
@@ -266,6 +267,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
 
         ctx.swiglu_limit = swiglu_limit
         ctx.activation = activation
+        ctx.swiglu_alpha = swiglu_alpha
         ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             permute_tokens,
@@ -316,6 +318,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
                 grad_fc1_result,
                 mask_fc1_1 if swiglu_limit is not None else None,
                 mask_fc1_2 if swiglu_limit is not None else None,
+                ctx.swiglu_alpha,
             )
         else:
             gate_grad = activation_backward(grad_fc1_result * fc1_2_output, fc1_1_output, ctx.activation)
@@ -374,4 +377,5 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             grad_fc2_weight,
             None,
             None,  # activation
+            None,  # swiglu_alpha
         )

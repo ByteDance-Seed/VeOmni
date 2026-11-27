@@ -45,6 +45,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.distributed import parallel_state as parallel_state_module
+from veomni.distributed.context_parallel import support as cp_support
 from veomni.models import auto as auto_module
 from veomni.models.auto import build_config, check_context_parallel_supported
 
@@ -53,11 +54,11 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _enable_npu_cp(monkeypatch):
-    # The DSA-vs-parallel-state check now runs in the builder gate, so only
-    # ``auto``'s copies of these three names matter.
+    # The platform check lives next to the collectives, so only that module's
+    # ``IS_NPU_AVAILABLE`` matters. ``auto`` still owns the parallel-state gate.
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto_module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, global_rank=0))
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", True)
 
 
 def _npu_ops_for_cp() -> dict:
@@ -151,7 +152,7 @@ def test_gate_rejects_context_parallel_on_npu(monkeypatch, model_type):
         "get_parallel_state",
         lambda: SimpleNamespace(cp_enabled=True),
     )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", True)
 
     with pytest.raises(NotImplementedError, match="Ascend/NPU.*Qwen4-Exp and deepseek_v4 only"):
         check_context_parallel_supported(SimpleNamespace(model_type=model_type))
@@ -165,7 +166,7 @@ def test_gate_allows_npu_dsv4_cp_with_eager_dsa_ops(monkeypatch):
 
 def test_gate_rejects_npu_dsv4_cp_without_resolved_ops(monkeypatch):
     _enable_npu_cp(monkeypatch)
-    with pytest.raises(NotImplementedError, match="dsa_indexer_implementation.*cann or eager"):
+    with pytest.raises(NotImplementedError, match="ops_config is missing"):
         check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
 
 
@@ -236,7 +237,7 @@ def test_gate_allows_qwen4_exp_context_parallel_on_npu(monkeypatch):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto_module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True))
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", True)
 
     check_context_parallel_supported(SimpleNamespace(model_type="qwen4_exp"))
 
@@ -250,7 +251,7 @@ def test_gate_allows_context_parallel_models_on_gpu(monkeypatch, model_type):
         "get_parallel_state",
         lambda: SimpleNamespace(cp_enabled=True),
     )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", False)
 
     check_context_parallel_supported(SimpleNamespace(model_type=model_type))
 
@@ -266,7 +267,7 @@ def test_gate_allows_seed_omni_module_config_under_cp(monkeypatch):
         "get_parallel_state",
         lambda: SimpleNamespace(cp_enabled=True),
     )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", False)
 
     # TextEncoderConfig explicitly opts in via _supports_context_parallel = True.
     check_context_parallel_supported(TextEncoderConfig(vocab_size=64, hidden_size=16))
@@ -299,7 +300,7 @@ def test_seed_omni_cp_opt_in_does_not_bypass_device_or_hybrid_gate(monkeypatch, 
         "get_parallel_state",
         lambda: SimpleNamespace(cp_enabled=True, ulysses_size=ulysses_size),
     )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", is_npu)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", is_npu)
     message = "Ascend/NPU.*Qwen4-Exp and deepseek_v4 only" if is_npu else "Combined Ulysses/CP.*Qwen4-Exp only"
     with pytest.raises(NotImplementedError, match=message):
         check_context_parallel_supported(TextEncoderConfig(vocab_size=64, hidden_size=16))
