@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import gather_outputs
+from veomni.distributed.sequence_parallel import gather_outputs, sp_pad_and_slice
 
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
@@ -26,7 +26,7 @@ class TrainingMixin(TrainingModuleMixin):
 
     Dummy items exist for the same reason as in the vision tower: on a
     micro-batch with no real audio, the worker appends one zero-feature
-    ``role="dummy"`` clip per sample so this FSDP unit still runs exactly one
+    ``is_dummy=True`` clip per sample so this FSDP unit still runs exactly one
     forward per step and produces a gradient anchor.
     """
 
@@ -53,9 +53,13 @@ class TrainingMixin(TrainingModuleMixin):
         # failing the call.
         del kwargs
         self._conversation_carrier = conversation_list
-        # Dummy anchors carry ``is_dummy`` and keep the ``role="user"`` tag of the
-        # items they stand in for, so one filter selects both.
+        # When real user clips are present, encode only those; fall back to the
+        # worker-injected ``is_dummy=True`` anchors only on all-dummy batches so
+        # the encoder's ordering matches SP producer regathering.
         items = list(iter_desired_items(conversation_list, types=["audio"], roles=["user"]))
+        real_items = [item for item in items if not item.is_dummy]
+        if real_items:
+            items = real_items
         self._audio_items = items
         if not items:
             return {}
@@ -71,6 +75,11 @@ class TrainingMixin(TrainingModuleMixin):
         # The tower slices its own hidden states to this rank's Ulysses shard and
         # returns the shard, so remember the full row count for the gather.
         self._sp_own_len = int(sum(audio_output_lengths(feature_lens.cpu(), self.config.audio_config.n_window)))
+        if get_parallel_state().sp_size > 1:
+            # ``Qwen3OmniMoeAudioEncoder.forward`` all-gathers ``input_features``
+            # across the SP group before splitting into conv chunks, assuming each
+            # rank holds its own SP slice.
+            input_features = sp_pad_and_slice(input_features, dim=0, pad_value=0)
         return {"input_features": input_features, "feature_lens": feature_lens}
 
     @post_forward("forward")
@@ -112,17 +121,6 @@ class TrainingMixin(TrainingModuleMixin):
         carrier = self._conversation_carrier
         self._conversation_carrier = None
         return {"conversation_list": carrier}
-
-    def dummy_inputs(self, *, batch_size: int, device: torch.device, dtype: torch.dtype) -> Dict[str, Any]:
-        """One full CNN block per sample — the shortest clip that exercises the
-        conv stack at the only window size the tower supports."""
-        frames = self.config.audio_config.n_window * 2
-        return {
-            "input_features": torch.zeros(
-                batch_size * frames, self.config.audio_config.num_mel_bins, device=device, dtype=dtype
-            ),
-            "feature_lens": torch.full((batch_size,), frames, dtype=torch.long, device=device),
-        }
 
 
 def _scatter_audio_window(

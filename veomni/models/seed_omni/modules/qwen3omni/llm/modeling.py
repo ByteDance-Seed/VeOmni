@@ -270,6 +270,11 @@ class InferenceMixin:
         it has no step of its own — matching upstream, where ``thinker_embed`` is
         one shorter than ``sequences``).
         """
+        if not self._thinker_embed_cache or not self._accept_hidden_cache:
+            raise RuntimeError(
+                "qwen3omni_llm: flush_thinker_states called with an empty cache. "
+                "Set collect_thinker_states=True and run thinker generation before flushing."
+            )
         states = {
             "thinker_embed": torch.cat(self._thinker_embed_cache, dim=1),
             "thinker_hidden": torch.cat(self._accept_hidden_cache, dim=1),
@@ -390,13 +395,10 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
     supports_sp_sharded_handoff = True
     _no_split_modules = ["Qwen3OmniMoeThinkerTextDecoderLayer"]
     supports_gradient_checkpointing = True
-    # This wrapper owns no attention — ``self.language_model`` does, and the
-    # patched thinker accepts both eager and SDPA. Without this the base
-    # ``_supports_sdpa = False`` rejects ``sdpa`` / ``veomni_sdpa`` at
-    # construction, and Ulysses refuses a plain ``eager`` (it performs no
-    # exchange of its own) — so sequence-parallel training had no backend it
-    # could be configured with.
-    _supports_sdpa = True
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention-free container: let ``self.language_model`` validate the backend.
+        return attn_implementation
 
     def __init__(self, config: Qwen3OmniLlmConfig):
         super().__init__(config)

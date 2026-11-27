@@ -75,6 +75,9 @@ class Qwen3OmniAudioEncoder(InferenceMixin, PretrainedOmniModule):
     _no_split_modules = ["Qwen3OmniMoeAudioEncoderLayer"]
     supports_gradient_checkpointing = True
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        return attn_implementation
+
     def __init__(self, config: Qwen3OmniAudioEncoderConfig):
         super().__init__(config)
         self.config = config
@@ -120,8 +123,9 @@ class Qwen3OmniAudioEncoder(InferenceMixin, PretrainedOmniModule):
         **kwargs,
     ) -> Dict[str, Any]:
         del kwargs
-        if input_features is not None:
-            input_features = input_features.to(dtype=self.compute_dtype)
+        if input_features is None:
+            return {"audio_embeds": None}
+        input_features = input_features.to(dtype=self.compute_dtype)
         outputs = self.audio_tower(input_features, feature_lens=feature_lens)
         return {"audio_embeds": outputs.last_hidden_state}
 

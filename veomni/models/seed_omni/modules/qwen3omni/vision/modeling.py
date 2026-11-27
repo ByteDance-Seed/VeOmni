@@ -205,6 +205,9 @@ class Qwen3OmniVisionEncoder(InferenceMixin, PretrainedOmniModule):
     _no_split_modules = ["Qwen3OmniMoeVisionBlock"]
     supports_gradient_checkpointing = True
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        return attn_implementation
+
     def __init__(self, config: Qwen3OmniVisionEncoderConfig):
         super().__init__(config)
         self.config = config

@@ -60,7 +60,10 @@ class TrainingMixin(TrainingModuleMixin):
         self._conversation_carrier = conversation_list
         image_items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
         video_items = list(iter_desired_items(conversation_list, types=["video"], roles=["user"]))
-        dummy = not (any(it for it in image_items if not it.is_dummy) or video_items)
+        real_image_items = [it for it in image_items if not it.is_dummy]
+        dummy = not (real_image_items or video_items)
+        if not dummy:
+            image_items = real_image_items
         # No real visual input: the worker appended one dummy placeholder per
         # sample, carrying patches + ``_OMNI_GRID`` like a real image. They are
         # already in ``image_items`` (same ``type`` / ``role`` tags), so the path
@@ -89,13 +92,13 @@ class TrainingMixin(TrainingModuleMixin):
             # sin internally and runs the sp-pad tail segment. ``is_dummy`` is
             # dropped: the SP path always runs the ViT (the FSDP grad anchor).
             merge_area = merge**2
-            # The patchgen ViT hardcodes its internal SP pad_scale to 4 (pos-embed
-            # / cos / sin slicing). Keep the two in lockstep so a future variant
-            # with a different merge size fails loudly instead of mis-slicing.
+            # ``Qwen3OmniMoeVisionEncoder`` hardcodes its internal SP pad_scale to 4
+            # (pos-embed / cos / sin slicing). Keep the two in lockstep so a future
+            # variant with a different merge size fails loudly instead of mis-slicing.
             if merge_area != 4:
                 raise AssertionError(
-                    "qwen3omni_vision SP requires spatial_merge_size**2 == 4 to match the patchgen ViT pad_scale, "
-                    f"got {merge_area}."
+                    "qwen3omni_vision SP requires spatial_merge_size**2 == 4 to match "
+                    f"Qwen3OmniMoeVisionEncoder pad_scale, got {merge_area}."
                 )
             self._sp_own_len = int(grid_thw.prod(dim=1).sum().item()) // merge_area
             pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=merge_area)
@@ -153,6 +156,7 @@ class TrainingMixin(TrainingModuleMixin):
 
             image_embeds = _gather(image_embeds)
             deepstack_features = [_gather(layer) for layer in deepstack_features]
+            self._sp_own_len = None
 
         carrier = self._conversation_carrier
         output_slots = self._visual_output_slots
@@ -160,16 +164,6 @@ class TrainingMixin(TrainingModuleMixin):
         self._visual_output_slots = None
         scatter_qwen3omni_visual_embeds(output_slots, image_embeds, deepstack_features)
         return {"conversation_list": carrier}
-
-    def dummy_inputs(self) -> Dict[str, Any]:
-        cfg = self.config.vision_config
-        merge = cfg.spatial_merge_size
-        t, h, w = 1, 2 * merge, 2 * merge
-        pixel_row = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
-        pixel_values = torch.zeros(t * h * w, pixel_row, device=self.device, dtype=self.dtype)
-        image_grid_thw = torch.tensor([[t, h, w]], dtype=torch.long, device=self.device)
-        vit_metadata = build_qwen3omni_vit_metadata([[t, h, w]], merge)
-        return {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw, "vit_metadata": vit_metadata}
 
 
 class VeOmniMixin(BaseMixin, TrainingMixin):

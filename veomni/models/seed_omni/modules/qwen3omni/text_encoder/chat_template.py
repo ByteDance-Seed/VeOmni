@@ -25,6 +25,7 @@ from typing import Any
 import torch
 
 from ....utils.conversation import ConversationItem
+from ...base.llm_packing import item_token_len
 from ...text_encoder.chat_template import TextEncoderChatTemplate
 from ..carrier import is_thinker_input
 
@@ -139,7 +140,7 @@ class Qwen3OmniChatTemplate(TextEncoderChatTemplate):
                     f"qwen3omni: cannot rebuild talker input ids for item type {item.type!r} — "
                     f"known media types are {sorted(self.media_pad_token_ids)}."
                 )
-            ids.append(torch.full((item.value.size(0),), pad_token_id, dtype=torch.long))
+            ids.append(torch.full((item_token_len(item),), pad_token_id, dtype=torch.long))
         if not ids:
             return torch.zeros(0, dtype=torch.long)
         return torch.cat(ids, dim=0)

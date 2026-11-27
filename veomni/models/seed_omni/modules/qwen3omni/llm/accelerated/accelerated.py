@@ -17,13 +17,11 @@ from veomni.utils.tensor_utils import unflatten
 from .......distributed.parallel_plan import ParallelPlan
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem
-from ....base.llm_packing import item_token_len
+from .....utils.conversation import ConversationItem, iter_desired_items
+from ....base.llm_packing import item_token_len, item_value_2d
 from ....base.sp_shard import (
     gather_sp_sharded_groups,
-    modality_groups,
     pad_sp_shard,
-    single_modality_shard_batch,
     split_sp_sharded_tensor,
 )
 from ...carrier import is_thinker_input, scatter_hidden_states
@@ -68,16 +66,15 @@ class TrainingMixin(TrainingModuleMixin):
     ) -> Dict[str, Any]:
         ps = get_parallel_state()
         sharded = ps.sp_size > 1 and ps.skip_sp_gather_between_modules
-        if sharded and not single_modality_shard_batch(conversation_list):
+        if sharded and not _qwen3omni_single_modality_shard_batch(conversation_list):
             # Mixed producers: each one sliced only the subsequence *it* wrote
-            # (text in carrier order, then images, then videos), so concatenating
-            # their windows does not reconstruct this rank's window over the packed
-            # row — the producers' window widths differ from the packed one. Gather
-            # each producer back to full length and let the ordinary packer slice
-            # the reassembled row below. `single_modality_shard_batch` is the case
-            # where the windows already concatenate exactly, and is untouched.
+            # (text in carrier order, images+videos in ViT order, user audio in
+            # audio-tower order), so concatenating their windows does not
+            # reconstruct this rank's window over the packed row. Gather each
+            # producer back to full length and let the ordinary packer slice the
+            # reassembled row below.
             gather_sp_sharded_groups(
-                modality_groups(conversation_list),
+                _qwen3omni_modality_groups(conversation_list),
                 ps.sp_group,
                 meta_list_keys=("deepstack",),
             )
@@ -175,7 +172,7 @@ class TrainingMixin(TrainingModuleMixin):
                 embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
             pids = slice_input_tensor(pids, dim=2, padding=False, group=group)
             mask = slice_input_tensor(mask, dim=1, padding=False, group=group)
-            if deepstack_visual_embeds is not None:
+            if deepstack_visual_embeds is not None and not sharded:
                 k_local = int(mask.sum().item())
                 deepstack_visual_embeds = deepstack_visual_embeds[:, n_before : n_before + k_local, :]
 
@@ -286,7 +283,7 @@ class TrainingMixin(TrainingModuleMixin):
                 split_sp_sharded_tensor(hidden_states, window_lengths, ps.sp_rank, ps.sp_size),
             )
             if traces:
-                embed_trace, hidden_trace = (_unbatch(t).squeeze(0) for t in traces[:2])
+                embed_trace, hidden_trace = (_unbatch(t) for t in traces[:2])
                 _scatter_thinker_trace_slices(
                     conversation,
                     split_sp_sharded_tensor(embed_trace, window_lengths, ps.sp_rank, ps.sp_size),
@@ -309,6 +306,7 @@ class TrainingMixin(TrainingModuleMixin):
                 gather_outputs(t, gather_dim=1, group=get_parallel_state().sp_group).narrow(1, 0, self._sp_own_len)
                 for t in traces
             )
+            self._sp_own_len = None
 
         conversation = self._conversation_carrier
         pack_shape = self._pack_inputs_embeds_shape
@@ -351,8 +349,7 @@ class TrainingMixin(TrainingModuleMixin):
                 # ``router_aux_loss_coef`` is applied here rather than inside the
                 # loss so a zero coefficient still reports the raw term.
                 coefficient = getattr(cfg, "router_aux_loss_coef", 0.0)
-                device = conversation[0][0].value.device
-                result["_loss"] = aux_loss.to(device=device) * coefficient
+                result["_loss"] = aux_loss.to(device=self.device) * coefficient
         return result
 
     def _full_sequence_router_logits(self, router_logits: Any) -> Any:
@@ -451,6 +448,41 @@ class VeOmniMixin(BaseMixin, TrainingMixin):
             "language_model.layers.*.mlp.experts.down_proj": Shard(0),
         }
         return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
+
+
+def _qwen3omni_single_modality_shard_batch(conversations: Optional[list[list[ConversationItem]]]) -> bool:
+    """Whether all thinker-input items share one modality, already sharded in carrier order."""
+    ps = get_parallel_state()
+    if ps.sp_size <= 1 or not ps.skip_sp_gather_between_modules or not conversations:
+        return False
+    items = [item for sample in conversations for item in sample if is_thinker_input(item)]
+    if not items or len({item.type for item in items}) != 1:
+        return False
+    return all(isinstance(value := item_value_2d(item), torch.Tensor) and value.dim() >= 2 for item in items)
+
+
+def _qwen3omni_modality_groups(
+    conversations: Optional[list[list[ConversationItem]]],
+) -> list[list[ConversationItem]]:
+    """Producer groups for Qwen3-Omni SP regathering: text, vision (images+videos), and user audio."""
+    if not conversations:
+        return []
+    groups: list[list[ConversationItem]] = []
+    text = [item for sample in conversations for item in sample if item.type == "text"]
+    if text:
+        groups.append(text)
+    image_items = list(iter_desired_items(conversations, types=["image"], roles=["user"]))
+    video_items = list(iter_desired_items(conversations, types=["video"], roles=["user"]))
+    real_images = [item for item in image_items if not item.is_dummy]
+    media = (real_images + video_items) if (real_images or video_items) else image_items
+    if media:
+        groups.append(media)
+    audio_items = list(iter_desired_items(conversations, types=["audio"], roles=["user"]))
+    real_audio = [item for item in audio_items if not item.is_dummy]
+    audio = real_audio or audio_items
+    if audio:
+        groups.append(audio)
+    return groups
 
 
 def _unbatch(trace: torch.Tensor) -> torch.Tensor:

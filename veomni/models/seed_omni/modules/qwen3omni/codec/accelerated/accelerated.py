@@ -106,11 +106,15 @@ class TrainingMixin(TrainingModuleMixin):
         from torch.distributed.fsdp import FSDPModule
 
         if self._unsharded_mimi_units is None:
-            # Cached including the empty result: under DDP, eager inference and
-            # `fsdp_scope: model` there is no unit here to find, and re-walking
-            # the tree per encode to rediscover that is waste.
+            # Cached including the empty result: under DDP and eager inference
+            # there is no FSDPModule under self.mimi to find.
             self._unsharded_mimi_units = tuple(m for m in self.mimi.modules() if isinstance(m, FSDPModule))
         for unit in self._unsharded_mimi_units:
+            # Keep every unit unsharded across the whole per-clip encode loop:
+            # MimiTransformerLayer is invoked via __call__ once per clip, so with
+            # reshard_after_forward=True clip 2 would trigger a new all-gather and
+            # deadlock when ranks hold different numbers of assistant clips.
+            unit.set_reshard_after_forward(False)
             unit.unshard()
 
         sharded = next((name for name, param in self.mimi.named_parameters() if isinstance(param, DTensor)), None)
@@ -128,6 +132,7 @@ class TrainingMixin(TrainingModuleMixin):
         ``finally`` path is safe even when ``encode`` raises on one rank only."""
         for unit in self._unsharded_mimi_units or ():
             unit.reshard()
+            unit.set_reshard_after_forward(True)
 
     @post_forward("encode")
     def encode_post(self, **outputs: Any) -> Dict[str, Any]:

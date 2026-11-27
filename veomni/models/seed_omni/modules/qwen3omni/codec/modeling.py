@@ -35,10 +35,10 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-# The patchgen-generated modeling deliberately excludes the talker and vocoder
-# classes: VeOmni's training path forwards through the thinker only, and
-# instantiating them would drag their layers into the FSDP _no_split_modules
-# aggregation. They are inference-only here, so take them from upstream.
+# VeOmni's standalone ``modeling_qwen3_omni_moe.py`` covers the thinker only
+# (instantiating the vocoder there would drag its layers into the thinker's
+# FSDP ``_no_split_modules`` aggregation), so import ``Qwen3OmniMoeCode2Wav``
+# from upstream.
 from transformers import MimiModel
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeCode2Wav
 
@@ -173,6 +173,9 @@ class Qwen3OmniCodec(InferenceMixin, PretrainedOmniModule):
         "MimiResidualVectorQuantizer",
     ]
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        return attn_implementation
+
     def __init__(self, config: Qwen3OmniCodecConfig):
         super().__init__(config)
         if not getattr(config, "encoder_from_checkpoint", True):
@@ -246,7 +249,7 @@ class Qwen3OmniCodec(InferenceMixin, PretrainedOmniModule):
             # targets, so it is worth saying out loud rather than absorbing.
             logger.warning(
                 f"qwen3omni_codec: encoding targets with a {self.mimi.dtype} encoder. Against fp32 this changes "
-                f"~32%% of code indices. Keep the codec in fp32 when generating talker targets."
+                f"~32% of code indices. Keep the codec in fp32 when generating talker targets."
             )
             self._warned_encoder_dtype = True
         waveform = _as_mono_batch(waveform).to(device=self.device, dtype=self.mimi.dtype)

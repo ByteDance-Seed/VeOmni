@@ -23,17 +23,20 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
-# The patchgen-generated modeling deliberately excludes the talker (the thinker
-# training path forwards through the thinker only, and instantiating the talker
-# would drag its layers into the FSDP _no_split_modules aggregation), so take it
-# from upstream. Talker training drives this class directly rather than through
-# patchgen: what it needs is a teacher-forced pass, and upstream ships only the
-# decode loop, so there is no upstream forward to patch.
+# VeOmni's standalone ``modeling_qwen3_omni_moe.py`` covers the thinker only
+# (instantiating the talker there would drag its layers into the thinker's FSDP
+# ``_no_split_modules`` aggregation), so import the talker from upstream. Talker
+# training drives this class directly via a teacher-forced pass; upstream ships
+# only the decode loop.
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeTalkerForConditionalGeneration
 
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ......utils.constants import IGNORE_INDEX
+from .....transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
+    Qwen3OmniMoeCheckpointTensorConverter,
+    convert_qwen3_omni_moe_fqn_to_index_mapping,
+)
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
@@ -231,6 +234,9 @@ class Qwen3OmniTalker(InferenceMixin, PretrainedOmniModule):
     # module it was called on before it ever recurses.
     supports_gradient_checkpointing = True
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        return attn_implementation
+
     def __init__(self, config: Qwen3OmniTalkerConfig):
         super().__init__(config)
         self.config = config
@@ -402,6 +408,10 @@ class Qwen3OmniTalker(InferenceMixin, PretrainedOmniModule):
         if span_mask.any():
             span[span_mask] = talker.hidden_projection(thinker_hidden[:, start:end][span_mask])
         span[~span_mask] = talker.text_projection(thinker_embed[:, start:end][~span_mask])
+        if self.training and not span_mask.any():
+            # Keep ``hidden_projection`` in the autograd graph on text-only batches
+            # so DDP (``find_unused_parameters=False``) sees gradients for all params.
+            span = span + talker.hidden_projection(thinker_hidden[:, start : start + 1]).sum().to(span.dtype) * 0.0
         return span
 
     def _build_speech_span(
@@ -522,30 +532,39 @@ class Qwen3OmniTalker(InferenceMixin, PretrainedOmniModule):
             for key, value in (media_metadata or {}).items()
         }
 
-        result = self.talker.generate(
-            inputs_embeds=prompt["inputs_embeds"],
-            talker_input_ids=prompt["talker_input_ids"],
-            trailing_text_hidden=prompt["trailing_text_hidden"],
-            tts_pad_embed=prompt["tts_pad_embed"],
-            # Explicit rather than left to generate's default: the talker's
-            # forward reads it directly (``delta0 = (1 - attention_mask).sum()``)
-            # to offset the RoPE deltas, so a silently-inferred mask would make
-            # position ids depend on generate internals.
-            attention_mask=torch.ones(
-                prompt["inputs_embeds"].shape[:2], dtype=torch.long, device=prompt["inputs_embeds"].device
-            ),
-            **media_metadata,
-            max_new_tokens=generation_kwargs.get("talker_max_new_tokens", self.config.max_new_tokens),
-            do_sample=generation_kwargs.get("talker_do_sample", True),
-            top_k=generation_kwargs.get("talker_top_k", 50),
-            top_p=generation_kwargs.get("talker_top_p", 1.0),
-            temperature=generation_kwargs.get("talker_temperature", 0.9),
-            repetition_penalty=generation_kwargs.get("talker_repetition_penalty", 1.05),
-            eos_token_id=config.codec_eos_token_id,
-            suppress_tokens=suppress_tokens,
-            output_hidden_states=True,
-            return_dict_in_generate=True,
-        )
+        had_instance_rope = "get_rope_index" in self.talker.__dict__
+        orig_get_rope_index = self.talker.__dict__.get("get_rope_index")
+        self.talker.get_rope_index = self._rope_index_fn()
+        try:
+            result = self.talker.generate(
+                inputs_embeds=prompt["inputs_embeds"],
+                talker_input_ids=prompt["talker_input_ids"],
+                trailing_text_hidden=prompt["trailing_text_hidden"],
+                tts_pad_embed=prompt["tts_pad_embed"],
+                # Explicit rather than left to generate's default: the talker's
+                # forward reads it directly (``delta0 = (1 - attention_mask).sum()``)
+                # to offset the RoPE deltas, so a silently-inferred mask would make
+                # position ids depend on generate internals.
+                attention_mask=torch.ones(
+                    prompt["inputs_embeds"].shape[:2], dtype=torch.long, device=prompt["inputs_embeds"].device
+                ),
+                **media_metadata,
+                max_new_tokens=generation_kwargs.get("talker_max_new_tokens", self.config.max_new_tokens),
+                do_sample=generation_kwargs.get("talker_do_sample", True),
+                top_k=generation_kwargs.get("talker_top_k", 50),
+                top_p=generation_kwargs.get("talker_top_p", 1.0),
+                temperature=generation_kwargs.get("talker_temperature", 0.9),
+                repetition_penalty=generation_kwargs.get("talker_repetition_penalty", 1.05),
+                eos_token_id=config.codec_eos_token_id,
+                suppress_tokens=suppress_tokens,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+            )
+        finally:
+            if had_instance_rope:
+                self.talker.get_rope_index = orig_get_rope_index
+            else:
+                self.talker.__dict__.pop("get_rope_index", None)
         residual_codes = [step[-1] for step in result.hidden_states if step[-1] is not None]
         if not residual_codes:
             raise RuntimeError(
@@ -1028,6 +1047,17 @@ def _check_prompt_alignment(
             f"qwen3omni_talker: the supervised mask covers {supervised.numel()} rows but the segments sum to "
             f"{sequence_length}. It is read positionally against the same sequence, so the two must agree."
         )
+
+
+def _create_qwen3omni_talker_checkpoint_tensor_converter(model: "Qwen3OmniTalker"):
+    """Per-expert -> fused experts converter for direct HF-root loading of the talker."""
+    return Qwen3OmniMoeCheckpointTensorConverter(num_experts=model.config.talker_config.text_config.num_experts)
+
+
+Qwen3OmniTalker._create_checkpoint_tensor_converter = staticmethod(
+    _create_qwen3omni_talker_checkpoint_tensor_converter
+)
+Qwen3OmniTalker._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_omni_moe_fqn_to_index_mapping)
 
 
 __all__ = ["Qwen3OmniTalker", "SIGNAL_CODES_DONE", "collect_media_metadata"]

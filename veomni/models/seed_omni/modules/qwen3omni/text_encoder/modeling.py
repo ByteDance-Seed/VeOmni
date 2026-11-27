@@ -7,6 +7,7 @@ import torch
 from ......utils.constants import IGNORE_INDEX
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
+from ...base.llm_packing import item_token_len
 from ...text_encoder.modeling import TextEncoder
 from ..carrier import PromptSegment as PromptSegment
 from ..carrier import is_thinker_input
@@ -37,7 +38,7 @@ def talker_prompt_segments(conversation: List[ConversationItem]) -> List[PromptS
     ``i`` is the same row as trace slice ``i``.
     """
     return [
-        PromptSegment(item.role, item.type, int(item.value.size(0))) for item in conversation if is_thinker_input(item)
+        PromptSegment(item.role, item.type, item_token_len(item)) for item in conversation if is_thinker_input(item)
     ]
 
 
@@ -65,7 +66,7 @@ def talker_supervised_mask(conversation: List[ConversationItem]) -> torch.Tensor
     for item in conversation:
         if not is_thinker_input(item):
             continue
-        rows = int(item.value.size(0))
+        rows = item_token_len(item)
         labels = item.meta.get("labels")
         if labels is None:
             spans.append(torch.zeros(rows, dtype=torch.bool))
@@ -232,7 +233,7 @@ class Qwen3OmniTextEncoder(TextEncoder):
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
-        generation_kwargs: Dict[str, Any] = dict,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
