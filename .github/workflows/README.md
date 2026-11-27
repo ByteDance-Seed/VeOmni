@@ -78,3 +78,15 @@ jobs:
 
 ### Model and Dataset
 To avoid CI relies on network, we pre-download dataset on a NFS on the CI machine. The path for models are \${HOME}/models and the path for dataset is \${HOME}/models/hf_data.
+
+### Ascend workspace runtime gate
+
+Both NPU workflows run `tests/tools/npu_preflight.py --expected-devices 8`
+after the final workspace dependency and Triton installation, before starting
+the shared accelerator case scheduler. The check imports `torch_npu`, requires exactly eight
+visible NPUs, and allocates, computes, synchronizes and reads back a tensor on
+each device. Missing packages, unavailable devices and execution failures abort
+the job instead of being treated as skipped hardware tests. This is a runtime
+availability check, not GDN/QSA numerical qualification. Chip-specific optional
+tests, such as the 910B4 padding regression on generic 910B runners, retain their
+existing skip policy.
