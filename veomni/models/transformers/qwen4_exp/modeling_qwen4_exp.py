@@ -858,7 +858,9 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1 and not (
-            self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS and not use_precomputed_states
+            self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS
+            and not use_precomputed_states
+            and (self.veomni_chunk_gated_delta_rule.impl != "fla_npu" or self.num_v_heads // self.num_k_heads <= 4)
         ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)

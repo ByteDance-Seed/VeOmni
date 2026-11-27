@@ -66,6 +66,11 @@ when the selected implementation runs.
 | `minimax_sparse_indexer` | `standard` | `eager` |
 | `minimax_sparse_attention` | `standard` | `eager`, `torch_npu` (Ascend default) |
 
+The Triton-Ascend causal convolution caches CPU packed-boundary uploads in a
+bounded per-stream cache. Its backward tail handling uses each packed sample's
+length; masked GDN matrix loads zero-fill partial tiles. These paths do not
+depend on the `fla_npu` library build.
+
 The MLU `liger_kernel` rows reuse the CUDA adapters and use
 `MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
 liger build keeps the upstream `liger_kernel.ops.*` API, and the registry

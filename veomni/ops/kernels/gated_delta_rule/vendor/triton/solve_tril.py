@@ -11,7 +11,7 @@ import triton.language as tl
 from .utils import prepare_chunk_indices, make_tensor_descriptor, input_guard, is_amd
 
 
-FLA_TRIL_PRECISION = os.environ.get('FLA_TRIL_PRECISION', 'ieee')
+FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -27,7 +27,7 @@ def solve_tril_16x16_kernel(
     TPP: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr
+    DOT_PRECISION: tl.constexpr,
 ):
     pid_t, pid_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = pid_bh // H, pid_bh % H
@@ -58,10 +58,8 @@ def solve_tril_16x16_kernel(
         offset = (tile_t * 16) % BT
 
         if not USE_TMA:
-            p_A = tl.make_block_ptr(
-                A, (T_eff, BT), (H * BT, 1), (tile_row, offset), (16, 16), (1, 0)
-            )
-            b_A_raw = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+            p_A = tl.make_block_ptr(A, (T_eff, BT), (H * BT, 1), (tile_row, offset), (16, 16), (1, 0))
+            b_A_raw = tl.load(p_A, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
         else:
             desc = make_tensor_descriptor(A, [T_eff, BT], [H * BT, 1], [16, 16])
             desc_o = make_tensor_descriptor(Ai, [T_eff, 16], [H * 16, 1], [16, 16])
@@ -78,17 +76,13 @@ def solve_tril_16x16_kernel(
         b_A += m_I
 
         if not USE_TMA:
-            p_Ai = tl.make_block_ptr(
-                Ai, (T_eff, 16), (H * 16, 1), (tile_row, 0), (16, 16), (1, 0)
-            )
+            p_Ai = tl.make_block_ptr(Ai, (T_eff, 16), (H * 16, 1), (tile_row, 0), (16, 16), (1, 0))
             tl.store(p_Ai, b_A.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
         else:
             desc_o.store([tile_row, 0], b_A.to(desc_o.dtype, fp_downcast_rounding="rtne"))
 
 
-@triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
-})
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.jit(do_not_specialize=["T", "TPP"])
 def merge_16x16_to_32x32_inverse_kernel(
     A,
@@ -101,7 +95,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     TPP: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr
+    DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -121,8 +115,8 @@ def merge_16x16_to_32x32_inverse_kernel(
     if not USE_TMA:
         p_A_11 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0))
         p_A_22 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0))
-        b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+        b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
         desc_o = make_tensor_descriptor(Ai, [T, BT], [H * BT, 1], [16, 16])
@@ -146,7 +140,7 @@ def merge_16x16_to_32x32_inverse_kernel(
 
     if not USE_TMA:
         p_A_21 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0))
-        b_A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
+        b_A_21 = tl.load(p_A_21, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     else:
         b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
 
@@ -166,7 +160,7 @@ def merge_16x16_to_32x32_inverse_kernel(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def solve_tril_64x64_kernel(
     A,
     Ai,
@@ -177,7 +171,7 @@ def solve_tril_64x64_kernel(
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr
+    DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -196,7 +190,7 @@ def solve_tril_64x64_kernel(
     offset = (i_t * 64) % BT
     if not USE_TMA:
         p_A = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_t * 64, offset), (64, 64), (1, 0))
-        b_A = -tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+        b_A = -tl.load(p_A, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [64, 64])
         desc_o = make_tensor_descriptor(Ai, [T, 64], [H * 64, 1], [64, 64])
@@ -216,9 +210,7 @@ def solve_tril_64x64_kernel(
 
 @input_guard
 def solve_tril(
-    A: torch.Tensor,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    output_dtype: torch.dtype = torch.float
+    A: torch.Tensor, cu_seqlens: Optional[torch.Tensor] = None, output_dtype: torch.dtype = torch.float
 ) -> torch.Tensor:
     """
     Compute the inverse of the matrix I + A
@@ -237,9 +229,7 @@ def solve_tril(
         (I + A)^-1 with the same shape as A
     """
     if A.shape[-1] not in [16, 32, 64]:
-        raise ValueError(
-            f"A shape BT should in [16,32, 64], but current is {A.shape[-1]}"
-        )
+        raise ValueError(f"A shape BT should in [16,32, 64], but current is {A.shape[-1]}")
     output_dtype = A.dtype if output_dtype is None else output_dtype
 
     B, T, H, BT = A.shape
