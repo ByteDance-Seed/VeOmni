@@ -82,6 +82,52 @@ def get_glm5_next_position_ids(
     return {"position_ids": position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)}
 
 
+def _reject_packed_multi_sample_batch(kwargs: dict) -> None:
+    """Fail fast when multiple samples share one packed row.
+
+    KDA keeps a recurrent state across the whole row and DSA visibility is only
+    causal+padding, so packed multi-sample batches silently leak across samples.
+    ``cu_seq_lens_q == [0, L]`` (single segment) is fine; reject only when more
+    than one non-empty content segment is present (ignore a known SP/pad tail).
+    """
+    cu = kwargs.get("cu_seq_lens_q")
+    if cu is None:
+        return
+    if not isinstance(cu, torch.Tensor):
+        cu = torch.as_tensor(cu, dtype=torch.long)
+    seg_lens = torch.diff(cu)
+    tail_pads = kwargs.get("tail_padding_length", 0)
+    tail_pads = 0 if tail_pads is None else int(tail_pads)
+    if tail_pads > 0 and seg_lens.numel() > 0 and int(seg_lens[-1]) == tail_pads:
+        seg_lens = seg_lens[:-1]
+    num_samples = int((seg_lens > 0).sum())
+    if num_samples > 1:
+        raise ValueError(
+            f"glm5_next does not support packed multi-sample batches "
+            f"({num_samples} samples share a row): KDA recurrent state and DSA "
+            f"visibility ignore pack boundaries. Set train.dyn_bsz=false and keep "
+            f"one sample per row (micro_batch_size tokens, no PackingCollator merge)."
+        )
+
+
+def _validate_glm5_next_text_layer_tables(config: Glm5NextTextConfig) -> None:
+    """Construct-time checks for layer / MLP / indexer schedule tables."""
+    n = config.num_hidden_layers
+    for name in ("layer_types", "mlp_layer_types", "indexer_types"):
+        table = getattr(config, name)
+        if len(table) != n:
+            raise ValueError(f"config.{name} length {len(table)} != num_hidden_layers={n}")
+    for i, (layer_type, indexer_type) in enumerate(zip(config.layer_types, config.indexer_types, strict=True)):
+        if layer_type != "deepseek_sparse_attention" or indexer_type != "shared":
+            continue
+        if i == 0 or config.layer_types[i - 1] != "deepseek_sparse_attention" or config.indexer_types[i - 1] != "full":
+            raise ValueError(
+                f"indexer_types[{i}]=shared requires the previous layer to be a "
+                f"deepseek_sparse_attention layer with indexer_types[{i - 1}]=full "
+                f"(cross-layer top-k is only forwarded from an adjacent full DSA)."
+            )
+
+
 def collate_multimodal_metadata(batch, sp_pad):
     """Derive ``multimodal_metadata`` for the GLM-5.3-Flash ViT (Qwen-VL-family formula).
 
@@ -368,7 +414,12 @@ class Glm5NextTextHyperConnection(nn.Module):
 
 
 class Glm5NextTextHyperHead(nn.Module):
-    """Final GLM-5.3-Flash HC-stream collapse. Unlike DeepSeek-V4, this is an unweighted mean."""
+    """Final GLM-5.3-Flash HC-stream collapse.
+
+    Unweighted mean over ``hc_mult`` streams — intentionally *not* the learned
+    ``mhc/head`` op used by DeepSeek-V4. ``mhc/pre`` / ``mhc/post`` remain
+    candidates for a follow-up VeomniOp bind; head stays local.
+    """
 
     def forward(self, hidden_streams: torch.Tensor) -> torch.Tensor:
         return hidden_streams.mean(dim=2)
@@ -768,7 +819,16 @@ class Glm5NextTextLinearAttention(nn.Module):
         g = self.forget_gate(hidden_states)
         beta = torch.sigmoid(self.b_proj(hidden_states))
 
-        # KDA
+        # KDA. Gate/beta are applied in modeling (ForgetGate + sigmoid); pass the
+        # fla/hub knobs explicitly so an installed hub kernel cannot silently
+        # re-apply sigmoid/bounds via defaults (env-dependent math fork).
+        _kda_gate_kwargs = {
+            "use_qk_l2norm_in_kernel": True,
+            "use_beta_sigmoid_in_kernel": False,
+            "use_gate_in_kernel": False,
+            "safe_gate": False,
+            "lower_bound": None,
+        }
         if use_precomputed_states and seq_len == 1:
             core_attn_out, last_recurrent_state = recurrent_kimi_delta_attention(
                 query,
@@ -778,7 +838,7 @@ class Glm5NextTextLinearAttention(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
+                **_kda_gate_kwargs,
                 **kwargs,
             )
         else:
@@ -790,7 +850,7 @@ class Glm5NextTextLinearAttention(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state if use_precomputed_states else None,
                 output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
+                **_kda_gate_kwargs,
                 **kwargs,
             )
 
@@ -841,6 +901,10 @@ class Glm5NextTextIndexer(nn.Module):
 
         self.index_kpool_compress_ape = nn.Parameter(torch.zeros(self.index_kpool, self.head_dim))
         self.index_kpool_compress_gate = nn.Parameter(torch.zeros(self.head_dim, self.hidden_size))
+        # Indexer scores are discrete top-k selections with no training objective yet
+        # (no indexer_loss). Freeze so Adam state is not allocated for dead params.
+        for _p in self.parameters():
+            _p.requires_grad_(False)
 
     @torch.no_grad()
     def forward(
@@ -1172,7 +1236,9 @@ class Glm5NextTextAttention(nn.Module):
             else None
         )
         self.q_a_layernorm = (
-            Glm5NextTextRMSNorm(config.q_lora_rank, eps=config.rms_norm_eps) if self.q_lora_rank is not None else None
+            Glm5NextTextRMSNorm(config.q_lora_rank, eps=config.rms_norm_eps, config=config)
+            if self.q_lora_rank is not None
+            else None
         )
         self.q_b_proj = (
             nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
@@ -1185,7 +1251,7 @@ class Glm5NextTextAttention(nn.Module):
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = Glm5NextTextRMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = Glm5NextTextRMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps, config=config)
         self.kv_b_proj = nn.Linear(
             config.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1381,13 +1447,27 @@ class Glm5NextTextDecoderLayer(GradientCheckpointingLayer):
         if ulysses_enabled:
             # Gather the full sequence for non-fused KDA / DSA, then restore the
             # local shard after attention. EP still applies inside the MoE block.
-            hidden_states = gather_outputs(hidden_states, gather_dim=1)  # noqa: F821
+            # attention_mask / position_ids must arrive as *local* shards (see
+            # Glm5NextModel.forward SP slice); gathering a full-sequence mask
+            # would stretch it to sp_size * L and corrupt DSA visibility.
+            local_seq = hidden_states.shape[1]
+            if attention_mask is not None and attention_mask.dim() >= 2 and attention_mask.shape[-1] != local_seq:
+                raise ValueError(
+                    f"Ulysses SP expects a local attention_mask shard "
+                    f"(got last-dim {attention_mask.shape[-1]}, hidden_states {local_seq})."
+                )
+            if position_ids is not None and position_ids.shape[-1] != local_seq:
+                raise ValueError(
+                    f"Ulysses SP expects local position_ids (got last-dim {position_ids.shape[-1]}, "
+                    f"hidden_states {local_seq})."
+                )
+            hidden_states = gather_outputs(hidden_states, gather_dim=1)
             if attention_mask is not None and attention_mask.dim() >= 2:
-                attention_mask = gather_outputs(attention_mask, gather_dim=-1)  # noqa: F821
+                attention_mask = gather_outputs(attention_mask, gather_dim=-1)
             if position_ids is not None:
-                position_ids = gather_outputs(position_ids, gather_dim=-1)  # noqa: F821
+                position_ids = gather_outputs(position_ids, gather_dim=-1)
             if prev_topk_indices is not None:
-                prev_topk_indices = gather_outputs(prev_topk_indices, gather_dim=1)  # noqa: F821
+                prev_topk_indices = gather_outputs(prev_topk_indices, gather_dim=1)
 
         if self.block_type == "linear_attention":
             hidden_states = self.self_attn(
@@ -1409,9 +1489,9 @@ class Glm5NextTextDecoderLayer(GradientCheckpointingLayer):
             )
 
         if ulysses_enabled:
-            hidden_states = slice_input_tensor(hidden_states, dim=1)  # noqa: F821
+            hidden_states = slice_input_tensor(hidden_states, dim=1)
             if topk_indices is not None:
-                topk_indices = slice_input_tensor(topk_indices, dim=1)  # noqa: F821
+                topk_indices = slice_input_tensor(topk_indices, dim=1)
 
         hidden_states = post.to(dtype).unsqueeze(-1) * hidden_states.unsqueeze(-2) + torch.matmul(
             comb.to(dtype).transpose(-1, -2), residual
@@ -1447,7 +1527,8 @@ class Glm5NextPreTrainedModel(PreTrainedModel):
     # 1. assuming the cache name
     # 2. linear attention not being considered atm
     _is_stateful = True
-    _can_compile_fullgraph = True
+    # topk / control-flow / SP collectives / host metadata — not fullgraph-safe
+    _can_compile_fullgraph = False
 
     _can_record_outputs = {
         "attentions": Glm5NextTextAttention,
@@ -1516,15 +1597,19 @@ class Glm5NextTextModel(Glm5NextPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
+        _validate_glm5_next_text_layer_tables(config)
+        # Keep HF `_attn_implementation` in sync with ops_config so YAML
+        # `attn_implementation` actually selects the DSA dense path backend.
+        config._attn_implementation = config.ops_config.attn_implementation
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [Glm5NextTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
+            [Glm5NextTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Glm5NextTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+        self.norm = Glm5NextTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.gradient_checkpointing = False
-        self.hc_head = Glm5NextTextHyperHead()  # noqa: F821
+        self.hc_head = Glm5NextTextHyperHead()
         self.post_init()
 
     @merge_with_config_defaults
@@ -1542,6 +1627,7 @@ class Glm5NextTextModel(Glm5NextPreTrainedModel):
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        _reject_packed_multi_sample_batch(kwargs)
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
@@ -1944,6 +2030,7 @@ class Glm5NextVisionModel(Glm5NextPreTrainedModel):
         """
         # --- Patch.1 ---
         vit_metadata = kwargs.pop("vit_metadata", None) or {}
+        precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
         precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
         precomputed_max_seqlen = vit_metadata.get("max_seqlen")
         # --- Patch.1 ---
@@ -1963,11 +2050,14 @@ class Glm5NextVisionModel(Glm5NextPreTrainedModel):
         else:
             cu_seqlens, max_seqlen = get_vision_attention_seqlens(grid_thw, self.config, kwargs=kwargs)
 
-        # Host-side patch count from the grid actually passed in (image raw or
-        # video flattened). Do not use cu_seqlens[-1]: precomputed cu may already
+        # Prefer collator-precomputed host list to avoid a per-forward
+        # `grid_thw.tolist()` device sync. Fallback covers callers that bypass
+        # MainCollator. Do not use cu_seqlens[-1]: precomputed cu may already
         # include an SP-pad tail that is not content tokens.
-        grid_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
-        total_seq_len = sum(t * h * w for t, h, w in grid_list)
+        grid_list = precomputed_grid_thw_list
+        if grid_list is None:
+            grid_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
+        total_seq_len = sum(int(t) * int(h) * int(w) for t, h, w in grid_list)
 
         hidden_states = self.patch_embed(hidden_states)
         rotary_emb = self.rotary_pos_emb(position_ids)
@@ -2215,12 +2305,6 @@ class Glm5NextModel(Glm5NextPreTrainedModel):
             )
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
-        elif get_parallel_state().fsdp_enabled:
-            # --- Patch.4 ---
-            fake_vision = self.visual.dummy_forward()
-            fake_embeds = fake_vision.pooler_output.mean() * 0.0
-            inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            # --- Patch.4 ---
 
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(
@@ -2235,8 +2319,11 @@ class Glm5NextModel(Glm5NextPreTrainedModel):
             )
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
-        elif get_parallel_state().fsdp_enabled:
+
+        if pixel_values is None and pixel_values_videos is None and get_parallel_state().fsdp_enabled:
             # --- Patch.4 ---
+            # Shared visual tower: one dummy keeps FSDP params in-graph when this
+            # rank has neither image nor video pixels (avoid the old double call).
             fake_vision = self.visual.dummy_forward()
             fake_embeds = fake_vision.pooler_output.mean() * 0.0
             inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -2244,7 +2331,13 @@ class Glm5NextModel(Glm5NextPreTrainedModel):
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
-            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
+            sp_group = get_parallel_state().sp_group
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=sp_group)
+            # Collator keeps attention_mask full-sequence (sp_slice=False). Slice it
+            # with embeds so decoder-layer gather reconstructs the correct mask
+            # instead of stretching a full mask to sp_size * L.
+            if attention_mask is not None and attention_mask.dim() >= 2:
+                attention_mask = slice_input_tensor(attention_mask, dim=-1, group=sp_group)
         # --- Patch.1 ---
 
         # --- Patch.5 ---
@@ -2273,75 +2366,6 @@ class Glm5NextModel(Glm5NextPreTrainedModel):
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
         )
-
-
-def load_balancing_loss_func(
-    gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
-    num_experts: int | None = None,
-    top_k=2,
-    attention_mask: torch.Tensor | None = None,
-) -> torch.Tensor | int:
-    r"""
-    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
-
-    See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
-    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-    experts is too unbalanced.
-
-    Args:
-        gate_logits:
-            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts].
-        num_experts:
-            Number of experts
-        top_k:
-            The number of experts to route per-token, can be also interpreted as the `top-k` routing
-            parameter.
-        attention_mask (`torch.Tensor`, *optional*):
-            The attention_mask used in forward function
-            shape [batch_size X sequence_length] if not None.
-
-    Returns:
-        The auxiliary loss.
-    """
-    if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
-
-    # Accumulate assignment counts and probability sums layer by layer, normalizing at the end,
-    # so peak memory stays O(seq_len * num_experts) regardless of the number of layers.
-    compute_device = gate_logits[0].device
-    tokens_per_expert_sum = torch.zeros(num_experts, dtype=torch.float32, device=compute_device)
-    router_prob_sum = torch.zeros(num_experts, dtype=torch.float32, device=compute_device)
-    total_rows = 0.0
-
-    if attention_mask is not None:
-        # The same flat mask applies to every layer's [batch_size * sequence_length] rows.
-        flat_mask = attention_mask.reshape(-1).to(device=compute_device, dtype=torch.float32)
-
-    for layer_gate in gate_logits:
-        routing_weights = torch.nn.functional.softmax(layer_gate.to(compute_device), dim=-1)
-        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-        if attention_mask is None:
-            # Count of top-k assignments per expert
-            tokens_per_expert_sum = (
-                tokens_per_expert_sum + torch.bincount(selected_experts.reshape(-1), minlength=num_experts).float()
-            )
-            # Sum of routing probabilities per expert
-            router_prob_sum = router_prob_sum + routing_weights.float().sum(dim=0)
-            total_rows = total_rows + routing_weights.shape[0]
-        else:
-            # Same reductions, weighted by the attention mask to exclude padding tokens
-            tokens_per_expert_sum = tokens_per_expert_sum + torch.zeros(
-                num_experts, dtype=torch.float32, device=compute_device
-            ).scatter_add_(0, selected_experts.reshape(-1), flat_mask.repeat_interleave(top_k))
-            router_prob_sum = router_prob_sum + (routing_weights.float() * flat_mask.unsqueeze(-1)).sum(dim=0)
-            total_rows = total_rows + flat_mask.sum()
-
-    tokens_per_expert = tokens_per_expert_sum / total_rows
-    router_prob_per_expert = router_prob_sum / total_rows
-
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-    return overall_loss * num_experts
 
 
 # ======================================================================

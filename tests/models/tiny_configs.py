@@ -172,14 +172,15 @@ def tiny_glm5_next_text_config(architecture: str = "Glm5NextTextModel") -> Pretr
         hc_mult=2,
         hc_sinkhorn_iters=2,
         pad_token_id=0,
+        # Cover full→shared DSA top-k reuse (shared must immediately follow a full DSA).
         layer_types=[
             "linear_attention",
-            "linear_attention",
+            "deepseek_sparse_attention",
             "deepseek_sparse_attention",
             "linear_attention",
         ],
         mlp_layer_types=["dense", "dense", "sparse", "sparse"],
-        indexer_types=["full", "shared", "full", "shared"],
+        indexer_types=["full", "full", "shared", "full"],
         architectures=[architecture],
         attn_implementation="eager",
         experts_implementation="eager",

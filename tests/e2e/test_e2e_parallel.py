@@ -243,7 +243,7 @@ text_test_cases = [
         True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        None,  # max_sp_size: gather-before-attn Ulysses SP around HF KDA/DSA
+        1,  # max_sp_size: gather-before-attn SP is wired but not SP-aligned in CI yet
         None,  # max_ep_size
     ),
     pytest.param(

@@ -80,7 +80,7 @@ Our guiding principles when building VeOmni are:
 | [Qwen3-VL MoE](https://huggingface.co/Qwen)              | 30BA3B/235BA22B               | [qwen3_vl_moe.yaml](configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml)    |
 | [Qwen3-MoE](https://huggingface.co/Qwen)                 | 30BA3B/235BA22B               | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml)                         |
 | [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b)    | 120B                          | [gpt_oss_120b_lora_ep4.yaml](configs/text/gpt_oss_120b_lora_ep4.yaml) |
-| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | Checkpoint-dependent     | [text](configs/text/glm5_next.yaml) / [VLM](configs/multimodal/glm5_next/glm5_next.yaml); eager KDA/DSA + EP/SP |
+| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | Checkpoint-dependent     | [text](configs/text/glm5_next.yaml) / [VLM](configs/multimodal/glm5_next/glm5_next.yaml); eager KDA/DSA + EP; SP gather-before-attn (no fused sparse/NPU ops yet); packing unsupported |
 | [Qwen2-3 Omni](https://huggingface.co/Qwen)              | 7B/30BA3B                     | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml)   |
 | [Kimi K3](docs/examples/kimi_k3.md)                      | Checkpoint-dependent          | [kimi_k3_vl_ascendc.yaml](configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.yaml) |
 | [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |

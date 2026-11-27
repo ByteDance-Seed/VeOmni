@@ -49,6 +49,8 @@ def test_glm5_next_text_eager_matches_hf():
     ours = _build_ours(config)
     assert hasattr(ours.layers[0].mlp, "veomni_gated_mlp")
     assert hasattr(ours.layers[2].mlp.experts, "veomni_moe")
+    assert ours.layers[1].self_attn.next_skip_topk
+    assert ours.layers[2].self_attn.skip_topk
     ours.load_state_dict(hf.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
@@ -117,3 +119,48 @@ def test_glm5_next_vlm_hooks_and_vision_ops():
     ours.get_metadata_collate_func()(batch, {"pixel_values": 0, "pixel_values_videos": 0})
     assert "multimodal_metadata" in batch
     assert batch["multimodal_metadata"]["vit_image_max_seqlen"] == 16
+
+
+def test_glm5_next_shared_dsa_and_attn_ops_sync():
+    config = _tiny_config()
+    ours = _build_ours(config)
+    assert config._attn_implementation == config.ops_config.attn_implementation
+    assert ours.layers[1].block_type == "deepseek_sparse_attention"
+    assert ours.layers[2].block_type == "deepseek_sparse_attention"
+    assert ours.layers[1].self_attn.indexer is not None
+    assert ours.layers[2].self_attn.indexer is None
+    assert ours.layers[1].self_attn.next_skip_topk
+    assert not any(p.requires_grad for p in ours.layers[1].self_attn.indexer.parameters())
+
+
+def test_glm5_next_rejects_packed_multi_sample():
+    config = _tiny_config()
+    ours = _build_ours(config)
+    input_ids = torch.randint(3, config.vocab_size, (1, 8))
+    try:
+        ours(
+            input_ids=input_ids,
+            use_cache=False,
+            cu_seq_lens_q=torch.tensor([0, 3, 8], dtype=torch.long),
+        )
+    except ValueError as exc:
+        assert "packed multi-sample" in str(exc)
+    else:
+        raise AssertionError("expected packed multi-sample rejection")
+
+
+def test_glm5_next_rejects_orphan_shared_indexer():
+    config = _tiny_config()
+    config.layer_types = [
+        "linear_attention",
+        "deepseek_sparse_attention",
+        "linear_attention",
+        "deepseek_sparse_attention",
+    ]
+    config.indexer_types = ["full", "full", "full", "shared"]
+    try:
+        _build_ours(config)
+    except ValueError as exc:
+        assert "shared requires the previous layer" in str(exc)
+    else:
+        raise AssertionError("expected orphan shared indexer rejection")

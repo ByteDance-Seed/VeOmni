@@ -5,14 +5,15 @@
 # multimodal chat_template such as qwen3vl).
 #
 # EP is wired through get_parallel_plan. Ulysses SP all-gathers the collapsed
-# token stream before each KDA/DSA block (correct, non-fused). Prefer
+# token stream before each KDA/DSA block (activation-correct, but every rank
+# recomputes the full sequence — not a compute win). Prefer
 # moe_implementation: eager for the first bring-up; fused_npu / fused_triton
-# remain available once validated.
+# remain available once validated. DSA/KDA/mHC fused VeomniOp rows are not
+# wired on this path yet (dense top-k mask + modeling-local KDA/mHC).
 #
-# Packed multi-sample dyn_bsz is NOT supported yet: KDA keeps a recurrent state
-# across the packed row, and DSA visibility is only causal+padding (no pack
-# boundaries). Keep train.dyn_bsz=false until those paths are isolated or reject
-# multi-sample packs.
+# Packed multi-sample dyn_bsz is NOT supported: KDA recurrent state and DSA
+# visibility ignore pack boundaries. Keep train.dyn_bsz=false and one sample
+# per row; the text tower raises if cu_seq_lens_q encodes >1 content sample.
 
 model:
   model_path: /path/to/GLM-5.3-Flash-bf16

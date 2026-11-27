@@ -6,8 +6,10 @@
 # (qwen3vl) so VeOmni's IMAGE/VIDEO_INPUT_INDEX placeholders are emitted;
 # there is no native GLM multimodal chat template in VeOmni yet.
 #
-# Packed multi-sample dyn_bsz is NOT supported yet (KDA recurrent state + DSA
-# visibility ignore pack boundaries). Keep train.dyn_bsz=false for bring-up.
+# Packed multi-sample dyn_bsz is NOT supported (KDA recurrent state + DSA
+# visibility ignore pack boundaries). Keep train.dyn_bsz=false; the text tower
+# raises if cu_seq_lens_q encodes >1 content sample. SP is gather-before-attn
+# only (saves the local activation shard, not compute).
 
 model:
   # model_path: /path/to/GLM-5.3-Flash-bf16

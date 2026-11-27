@@ -57,7 +57,7 @@
         "router_aux_loss_coef": 0.001,
         "layer_types": [
             "linear_attention",
-            "linear_attention",
+            "deepseek_sparse_attention",
             "deepseek_sparse_attention",
             "linear_attention"
         ],
@@ -69,9 +69,9 @@
         ],
         "indexer_types": [
             "full",
-            "shared",
             "full",
-            "shared"
+            "shared",
+            "full"
         ]
     },
     "vision_config": {
