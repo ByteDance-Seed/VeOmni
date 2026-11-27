@@ -158,9 +158,15 @@ rows execute. After changing `GroupedLinear`, the layout, or a quantizer, run
   model and are applied after the down projection; output and hidden gradients
   are BF16.
 - Uneven loads, empty experts, empty batches and repeated expert ids are
-  supported. The mainline EP dispatcher counts unique token/expert pairs and
-  combines repeated slot weights. `assume_distinct_experts` remains an accepted
-  contract hint; this backend does not require it.
+  supported. When `assume_distinct_experts=False` (the default, used by hash
+  routers that may repeat expert ids per token), EP routes through the mainline
+  `dispatch_to_ep_class` path and consumes its cached host cumsum boundaries
+  without an extra device-to-host sync. When `assume_distinct_experts=True`,
+  EP uses a single-sync distinct-experts dispatch path with `GroupedLayout`
+  reuse, early storage release (`free_input=True`) on private quantized expert
+  intermediates, and the Triton `MoEWeightedCombine` kernel for `top_k` in
+  `{1, 2, 4, 6, 8}` (falling back to FP32 `index_add_` when deterministic
+  algorithms are enabled or for other `top_k` widths).
 - First-order autograd and non-reentrant activation checkpointing are supported.
   Full-graph `torch.compile` and CUDA graph capture are unsupported because
   Hopper's K-grouped launch requires token counts on the host.

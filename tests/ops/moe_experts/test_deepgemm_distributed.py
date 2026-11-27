@@ -20,13 +20,14 @@ from veomni.ops import VeomniOp
 
 
 class _Experts(nn.Module):
-    def __init__(self, w1, w2, experts, use_checkpoint=False):
+    def __init__(self, w1, w2, experts, use_checkpoint=False, assume_distinct_experts=False):
         super().__init__()
         self.fc1 = nn.Parameter(w1.clone())
         self.fc2 = nn.Parameter(w2.clone())
         self.veomni_moe = VeomniOp("moe_experts", "standard", "deepgemm")
         self.experts = experts
         self.use_checkpoint = use_checkpoint
+        self.assume_distinct_experts = assume_distinct_experts
 
     def forward(self, x, routing, indices):
         from torch.utils.checkpoint import checkpoint
@@ -49,7 +50,7 @@ class _Experts(nn.Module):
             self.fc1.to(x.dtype),
             num_experts=self.experts,
             swiglu_limit=10.0,
-            assume_distinct_experts=False,
+            assume_distinct_experts=self.assume_distinct_experts,
         )
 
 
@@ -81,7 +82,13 @@ def _worker(
         w2 = torch.randn(e, h, intermediate, device="cuda") * 0.03
         expert_rank = state.ep_rank if ep_size > 1 else 0
         begin, end = expert_rank * e // ep_size, (expert_rank + 1) * e // ep_size
-        module = _Experts(w1[begin:end], w2[begin:end], e, use_checkpoint)
+        module = _Experts(
+            w1[begin:end],
+            w2[begin:end],
+            e,
+            use_checkpoint,
+            assume_distinct_experts=not repeated,
+        )
         if use_fsdp:
             mesh = (
                 state.extra_parallel_fsdp_device_mesh["ep"]["ep_fsdp"]
@@ -194,6 +201,7 @@ def _worker(
             (4, 2, True, True, True, True, False),
             (4, 2, True, True, False, True, True),
             (4, 2, True, True, True, True, True),
+            (4, 2, True, False, True, True, True),
         )
     ],
 )

@@ -93,6 +93,7 @@ DEFAULT_SELECTIVE_TOKENS: tuple[str, ...] = (
     "flash_attn",  # FlashAttention 2/3/4 operator names (no "attention" in them)
     "flashattn",  # written without the underscore
     "mla",  # FlashMLA / sparse MLA kernels
+    "sparse_mqa",  # TileLang DSA sparse MQA attention (compact [B, S, H, D] output + LSE)
     "indexer",  # DSA / lightning indexer (torch_npu and cuDNN FE)
     "sageattn",  # SageAttention entry point
 )
@@ -106,6 +107,7 @@ _SELECTIVE_VETO_TOKENS: tuple[str, ...] = (
     "_efficient_attention_backward",
     "qkv",  # npu_fused_attention_qkv_grad / _layernorm_qkv_fwd: output is qkv or its grad
     "mla_prolog",  # npu_mla_prolog*: output is q + the compressed KV
+    "lighting_indexer_fwd",  # returns full [B, S, S_kv] FP32 dense score matrix
 )
 
 #: Candidate operator namespaces probed for custom attention kernels. Only the

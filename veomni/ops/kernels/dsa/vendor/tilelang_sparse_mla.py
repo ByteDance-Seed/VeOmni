@@ -17,15 +17,15 @@
 import torch
 
 from . import tilelang_sparse_mla_bwd as sparse_mla_bwd
-from . import tilelang_sparse_mla_fwd as sparse_mla_fwd
+from . import tilelang_sparse_mla_fwd as sparse_mla_fwd  # noqa: F401
 
 
 class DeepSeekV4SparseAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, kv, attn_sink, topk_idxs, sm_scale=None, return_lse=False):
-        o, lse = sparse_mla_fwd.sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)
+        o, lse = torch.ops.DSA.sparse_mqa_fwd(q, kv, attn_sink, topk_idxs, sm_scale)
 
-        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, o.clone(), lse)
+        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, o, lse)
         ctx.sm_scale = sm_scale
         ctx.return_lse = return_lse
 

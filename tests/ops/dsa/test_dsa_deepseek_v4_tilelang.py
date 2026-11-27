@@ -19,6 +19,7 @@ import inspect
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.utils import cosine_similarity, require_nvidia_cuda
 from veomni.utils.device import get_device_type
 
@@ -358,3 +359,65 @@ def test_tilelang_sparse_attention_backward_handles_unaligned_query_lengths():
         for actual_grad, reference_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
             assert actual_grad is not None and torch.isfinite(actual_grad).all(), seqlen
             assert cosine_similarity(actual_grad, reference_grad) > 0.95, seqlen
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_sparse_mla_bwd_buckets_are_coarse_enough_to_avoid_recompiles():
+    """The backward kernel specializes on S_kv and topk, so both must be bucketed.
+
+    A run that lets either drift recompiles mid-training. This pins the property
+    rather than the exact numbers: within one training phase the compressor moves
+    S_kv by a few tokens per step and packs compressed_len a little under
+    index_topk, and neither may produce more than one kernel variant.
+    """
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.dsa.vendor.tilelang_sparse_mla_bwd import _bucket_s_kv, _bucket_topk
+
+    # 256k CP16 sits in the 163840 bucket; drifting within it must not change the key.
+    assert {_bucket_s_kv(v) for v in range(65537, 163841, 997)} == {163840}
+    assert {_bucket_s_kv(v) for v in range(32769, 65537, 509)} == {65536}
+    assert {_bucket_s_kv(v) for v in range(1, 32769, 173)} == {32768}
+    # Past the last fixed bucket it still rounds to a 64k multiple, not to the raw length.
+    assert _bucket_s_kv(200_000) == 262144
+    assert _bucket_s_kv(163_841) == 196608
+
+    # A packed sample whose compressed_len lands anywhere in 460..512 asks for
+    # sliding_window + compressed_len candidates; that whole range is one bucket.
+    assert {_bucket_topk(128 + c) for c in range(460, 513)} == {640}
+    # Below the pinned range topk still has to be a multiple of the tile width,
+    # and fixed sliding_window + 1 (129, e.g. DSpark MTP) must not inflate to 640.
+    assert _bucket_topk(129) == 160
+    for topk in (32, 64, 96, 100, 128, 129, 192):
+        assert _bucket_topk(topk) % 32 == 0
+        assert _bucket_topk(topk) >= topk
+
+    # The bucket must never shrink a length the kernel would then read past.
+    for S_kv in (1, 1024, 32768, 40000, 65536, 100000, 163840, 163841, 500000):
+        assert _bucket_s_kv(S_kv) >= S_kv
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dsa_tilelang_custom_ops_registered_with_fake_kernels():
+    """Importing the TileLang entrypoints registers both DSA custom ops and fakes."""
+    pytest.importorskip("tilelang")
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from veomni.ops.kernels.dsa.vendor import tilelang_indexer, tilelang_sparse_mla  # noqa: F401
+
+    with FakeTensorMode():
+        index_q = torch.empty((16, 2, 8, 128), dtype=torch.bfloat16)
+        index_k = torch.empty((4, 2, 128), dtype=torch.bfloat16)
+        weights = torch.empty((16, 2, 8), dtype=torch.float32)
+        ks = torch.zeros(16, dtype=torch.int32)
+        ke = torch.ones(16, dtype=torch.int32)
+        logits = torch.ops.DSA.lighting_indexer_fwd(index_q, index_k, weights, ks, ke)
+        assert logits.shape == (2, 16, 4)
+        assert logits.dtype == torch.float32
+
+        q = torch.empty((2, 16, 8, 512), dtype=torch.bfloat16)
+        kv = torch.empty((2, 32, 512), dtype=torch.bfloat16)
+        sink = torch.empty((8,), dtype=torch.float32)
+        topk = torch.zeros((2, 16, 64), dtype=torch.int32)
+        out, lse = torch.ops.DSA.sparse_mqa_fwd(q, kv, sink, topk, None)
+        assert out.shape == q.shape and out.dtype == q.dtype
+        assert lse.shape == (2, 16, 8) and lse.dtype == torch.float32

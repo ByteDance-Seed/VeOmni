@@ -207,7 +207,10 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None, block_
         raise RuntimeError(f"lse must be [B, S, H], got {tuple(lse.shape)}")
     topk = topk_idxs.shape[-1]
 
-    padded_topk = (topk + block_I - 1) // block_I * block_I
+    if 128 < topk <= 512 and block_I == 64:
+        padded_topk = 512
+    else:
+        padded_topk = (topk + block_I - 1) // block_I * block_I
     if padded_topk != topk:
         pad = torch.full((batch, seq_len, padded_topk - topk), -1, device=topk_idxs.device, dtype=topk_idxs.dtype)
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()

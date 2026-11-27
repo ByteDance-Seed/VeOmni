@@ -842,3 +842,83 @@ def test_gated_mlp_row_matches_the_quantized_reference():
         u = (qx @ _quantized_weight(mlp.up_proj.weight).T).clamp(min=-limit, max=limit)
         reference = _quantized_rows(torch.nn.functional.silu(g) * u) @ _quantized_weight(mlp.down_proj.weight).T
         assert calc_diff(out, reference.bfloat16()) < 0.001, n_rows
+
+
+@pytest.mark.parametrize("top_k", [1, 2, 4, 6, 8])
+def test_moe_weighted_combine_matches_reference(top_k):
+    """``MoEWeightedCombine`` matches FP32-accumulated PyTorch combine in fwd and bwd."""
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import MoEWeightedCombine
+
+    torch.manual_seed(106 + top_k)
+    num_tokens, hidden_dim = 19, 1536
+    total = num_tokens * top_k
+    order = torch.randperm(total, device="cuda")
+    inv_order = torch.empty(total, dtype=torch.int32, device="cuda")
+    inv_order.scatter_(0, order, torch.arange(total, dtype=torch.int32, device="cuda"))
+    token_indices = torch.div(order, top_k, rounding_mode="floor")
+
+    returned = torch.randn(total, hidden_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.randn(num_tokens, top_k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    grad_out = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
+
+    actual = MoEWeightedCombine.apply(returned, weights, inv_order)
+    actual_dr, actual_dw = torch.autograd.grad(actual, (returned, weights), grad_out)
+
+    ref_r = returned.detach().clone().requires_grad_(True)
+    ref_w = weights.detach().clone().requires_grad_(True)
+    sorted_w = ref_w.reshape(-1).index_select(0, order).unsqueeze(-1)
+    combined = torch.zeros((num_tokens, hidden_dim), device="cuda", dtype=torch.float32)
+    combined.index_add_(0, token_indices, ref_r.float() * sorted_w.float())
+    expected = combined.to(torch.bfloat16)
+    expected_dr, expected_dw = torch.autograd.grad(expected, (ref_r, ref_w), grad_out)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_dr, expected_dr, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_dw, expected_dw, rtol=2e-2, atol=2e-2)
+
+    # Zero-token boundary returns an empty tensor without launching the kernel.
+    empty_r = torch.empty((0, hidden_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    empty_w = torch.empty((0, top_k), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    empty_inv = torch.empty((0,), device="cuda", dtype=torch.int32)
+    empty_out = MoEWeightedCombine.apply(empty_r, empty_w, empty_inv)
+    assert empty_out.shape == (0, hidden_dim)
+    empty_dr, empty_dw = torch.autograd.grad(empty_out, (empty_r, empty_w), torch.empty_like(empty_out))
+    assert empty_dr.shape == empty_r.shape and empty_dw.shape == empty_w.shape
+
+
+def test_grouped_linear_free_input_releases_storage_when_quantized():
+    """``free_input=True`` frees a private input once quantized and keeps exact gradients."""
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import GroupedLayout, GroupedLinear
+
+    torch.manual_seed(107)
+    counts = torch.tensor([128, 128])
+    layout = GroupedLayout.from_counts(counts, torch.device("cuda"))
+    x_base = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    w_base = (torch.randn(2, 256, 256, device="cuda") * 0.04).bfloat16()
+    grad = torch.randn_like(x_base)
+
+    x_keep = x_base.clone().requires_grad_(True)
+    w_keep = w_base.clone().requires_grad_(True)
+    y_keep = GroupedLinear.apply(x_keep, w_keep, layout, True, False)
+    dx_keep, dw_keep = torch.autograd.grad(y_keep, (x_keep, w_keep), grad)
+    assert x_keep.untyped_storage().size() > 0
+
+    x_free = x_base.clone().requires_grad_(True)
+    w_free = w_base.clone().requires_grad_(True)
+    y_free = GroupedLinear.apply(x_free, w_free, layout, True, True)
+    assert x_free.untyped_storage().size() == 0
+    dx_free, dw_free = torch.autograd.grad(y_free, (x_free, w_free), grad)
+
+    torch.testing.assert_close(y_free, y_keep, rtol=0, atol=0)
+    torch.testing.assert_close(dx_free, dx_keep, rtol=0, atol=0)
+    torch.testing.assert_close(dw_free, dw_keep, rtol=0, atol=0)
+
+    # When sparse padding makes quantized column storage larger than BF16 x,
+    # BF16 x itself is retained for wgrad so free_input must leave its storage intact.
+    sparse_layout = GroupedLayout.from_counts(torch.tensor([1, 1]), torch.device("cuda"))
+    x_sparse = torch.randn(2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w_sparse = w_base.clone().requires_grad_(True)
+    y_sparse = GroupedLinear.apply(x_sparse, w_sparse, sparse_layout, True, True)
+    assert x_sparse.untyped_storage().size() > 0
+    dx_sparse, dw_sparse = torch.autograd.grad(y_sparse, (x_sparse, w_sparse), torch.randn_like(y_sparse))
+    assert torch.isfinite(dx_sparse).all() and torch.isfinite(dw_sparse).all()

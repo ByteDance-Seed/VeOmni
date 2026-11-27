@@ -1596,9 +1596,10 @@ ATTENTION_OPS = (
     "npu::npu_attn_softmax_",
     "npu::npu_attention_update",
     "npu::npu_advance_step_flashattn",
-    # sparse MLA / indexer (cuDNN FE and torch_npu)
+    # sparse MLA / indexer (cuDNN FE, TileLang, and torch_npu)
     "flash_mla::flash_mla_sparse_fwd",
     "DSA::indexer_forward_wrapper",
+    "DSA::sparse_mqa_fwd",
     "npu::npu_lightning_indexer",
     "npu::npu_quant_lightning_indexer",
     # third-party kernels
@@ -1612,6 +1613,7 @@ ATTENTION_OPS = (
 #: attention token matches at all.
 NOT_SAVED_OPS = (
     "aten::_efficient_attention_forward",
+    "DSA::lighting_indexer_fwd",
     "npu::npu_fused_attention_layernorm_qkv_fwd",
     "npu::npu_fused_attention_qkv_grad",
     "npu::npu_mla_prolog_v3",
