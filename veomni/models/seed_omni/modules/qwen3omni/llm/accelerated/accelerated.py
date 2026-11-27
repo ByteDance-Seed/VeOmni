@@ -59,10 +59,6 @@ class TrainingMixin(TrainingModuleMixin):
         # Pre-slice row count for the router-logits gather (see
         # ``_full_sequence_router_logits``).
         self._sp_router_own_len: Optional[int] = None
-        # Whether ``forward_pre`` left the carrier holding this rank's window. Set
-        # there rather than re-derived in ``forward_post``: a mixed batch is
-        # gathered on the way in, so the carrier looks the same in both cases.
-        self._carrier_is_sharded: bool = False
 
     @pre_forward("forward")
     def forward_pre(
@@ -86,10 +82,10 @@ class TrainingMixin(TrainingModuleMixin):
                 meta_list_keys=("deepstack",),
             )
             sharded = False
-        # Remembered for ``forward_post``: it has to split on the same decision,
-        # and re-deriving it there would ask the carrier a question whose answer
-        # this method just changed.
-        self._carrier_is_sharded = sharded
+        # ``sharded`` here means only "the values on the carrier are windows, so
+        # lengths must come from ``meta``". It is deliberately *not* what decides
+        # the output shape: the switch is run-wide, so this module owes the next
+        # one a window whatever path its own input took — see ``forward_post``.
         # ``sharded`` means the producers handed this rank their windows, so the
         # packed embeds are already this rank's row and the lengths/positions come
         # from ``meta``. Everything else is the same packer.
@@ -108,11 +104,19 @@ class TrainingMixin(TrainingModuleMixin):
         self._conversation_carrier = conversation_list
         self._pack_inputs_embeds_shape = packed["inputs_embeds_shape"]
 
+        # The packed row's length, independent of whether the values arrived
+        # already sliced: the mask and the DeepStack schedule below are always
+        # expressed over the full row and narrowed once by the SP slice.
+        full_len = sum(item_token_len(item) for sample in conversation_list for item in sample if not item.is_dummy)
+
         # Normalize the visual side to always-real tensors: the SP input-slice branch
         # below slices ``visual_pos_masks`` and indexes the per-layer DeepStack embeds,
         # so they must be real tensors (not ``None`` / lists) on every rank.
         inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._normalize_visual_inputs(
-            inputs_embeds, packed["visual_pos_masks"], packed["deepstack_visual_embeds"]
+            inputs_embeds,
+            packed["visual_pos_masks"],
+            packed["deepstack_visual_embeds"],
+            full_len=full_len,
         )
 
         if ps.sp_size > 1:
@@ -203,6 +207,8 @@ class TrainingMixin(TrainingModuleMixin):
         inputs_embeds: torch.Tensor,
         visual_pos_masks: Optional[torch.Tensor],
         deepstack_visual_embeds: Optional[List[torch.Tensor]],
+        *,
+        full_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Turn the packed visual side into always-real tensors (see ``forward_pre``).
 
@@ -212,17 +218,25 @@ class TrainingMixin(TrainingModuleMixin):
         ``inputs_embeds`` so the vision mergers that produced it still get (zero)
         gradient. This replaces the modeling's ``visual_pos_masks=None`` anchor path,
         which the SP input-slice cannot use (it needs a real mask on every rank).
+
+        The mask is built over ``full_len``, the length of the **packed row**, not over
+        ``inputs_embeds.size(1)``: under the shard handoff the embeds already hold this
+        rank's window, and the caller pads and narrows the mask by that same full-row
+        schedule. Building it at the window width made the second narrowing halve it
+        again, so the mask described half the rows it was paired with.
         """
         if visual_pos_masks is not None:
             return inputs_embeds, visual_pos_masks, torch.stack(deepstack_visual_embeds, dim=0)
 
-        mask = torch.zeros(1, inputs_embeds.size(1), dtype=torch.bool, device=self.device)
+        mask = torch.zeros(1, full_len, dtype=torch.bool, device=self.device)
         if not deepstack_visual_embeds:
             # No DeepStack layers to anchor (e.g. text/audio-only run without vision).
             return inputs_embeds, mask, None
         num_layers = len(deepstack_visual_embeds)
         hidden_dim = deepstack_visual_embeds[0].size(-1)
-        anchor = sum(layer.float().mean() for layer in deepstack_visual_embeds) * 0.0
+        # ``sum`` for the same reason as ``_fold_fsdp_dummy_anchors``: a zero-row
+        # slice is NaN under ``mean``, and ``NaN * 0`` still poisons the row.
+        anchor = sum(layer.float().sum() for layer in deepstack_visual_embeds) * 0.0
         inputs_embeds = inputs_embeds + anchor.to(inputs_embeds.dtype)
         empty_deepstack = inputs_embeds.new_zeros(num_layers, 0, hidden_dim)
         return inputs_embeds, mask, empty_deepstack
@@ -239,15 +253,17 @@ class TrainingMixin(TrainingModuleMixin):
         traces = self._thinker_traces(outputs)
 
         ps = get_parallel_state()
-        sharded = self._carrier_is_sharded
-        self._carrier_is_sharded = False
-        if sharded:
+        # The switch is run-wide, so the output is a window whenever it is on —
+        # regardless of whether *this* module's inputs needed regathering. The
+        # consumer (`decode_pre`, or the next module's packer) follows the same
+        # switch, and a full-length output here would leave, for instance, full
+        # hidden states scored against a half-length label slice.
+        if ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
             # Shard handoff: this rank keeps its own window and the consumer (the
             # next module's packer, or ``decode``'s label slice) concatenates from
             # the carrier. The traces follow the same split so they stay aligned
             # with the hidden states the talker pairs them against.
             conversation = self._conversation_carrier
-            pack_shape = self._pack_inputs_embeds_shape
             self._conversation_carrier = None
             self._pack_inputs_embeds_shape = None
             self._sp_own_len = None

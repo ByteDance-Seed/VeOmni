@@ -1715,11 +1715,93 @@ def test_a_mixed_batch_regathers_the_producers_before_packing():
             # Only the decision matters here; the packed forward is covered by the
             # alignment test. The fake gather does not repartition the carrier, so
             # packing it for real would fail on these stand-in values.
-            with mock.patch.object(module, "_normalize_visual_inputs", side_effect=lambda e, m, d: (e, m, d)):
+            with mock.patch.object(module, "_normalize_visual_inputs", side_effect=lambda e, m, d, **kw: (e, m, d)):
                 try:
                     module.forward_pre(method="forward", conversation_list=[sample])
                 except Exception:
                     pass
 
     assert gathered["called"], "a mixed batch must regather its producers before packing"
-    assert module._carrier_is_sharded is False, "the carrier holds full spans again"
+
+
+def test_the_output_is_a_window_whenever_the_switch_is_on():
+    """The switch is run-wide, so the exit shape cannot depend on the entry path.
+
+    A mixed batch is regathered on the way in, which leaves this module's
+    *inputs* full-length. The next module still follows the global switch and
+    expects a window, so gathering the output too would hand it full hidden
+    states against a half-length label slice. Pinned here because the entry path
+    and the exit contract are easy to conflate — the code did.
+    """
+    from unittest import mock
+
+    from veomni.models.seed_omni.modules.base.sp_shard import sp_local_len, sp_valid_in_window
+    from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN
+
+    module = _accelerated_llm()
+    hidden = module.config.text_config.hidden_size
+    window_lengths = [4, 3]  # 7 real tokens, odd so SP2 pads to 8
+    full = sum(window_lengths)
+    window = sp_local_len(full, 2)
+
+    # Items carry the *full* length in `meta` and this rank's window in `value`,
+    # which is exactly the state `forward_pre` leaves behind for the exit hook.
+    sample = [
+        ConversationItem(
+            type="text",
+            value=torch.randn(sp_valid_in_window(full, 0, 2) if i == 0 else sp_valid_in_window(full, 1, 2), hidden),
+            role="user",
+            meta={_OMNI_TOKEN_LEN: n, "labels": torch.zeros(n, dtype=torch.long)},
+        )
+        for i, n in enumerate(window_lengths)
+    ]
+    module._pack_inputs_embeds_shape = torch.tensor([[n] for n in window_lengths])
+
+    for rank in range(2):
+        outputs = {
+            "hidden_states": torch.randn(1, window, hidden),
+            "router_logits": None,
+            "router_attention_mask": None,
+        }
+        with mock.patch(
+            "veomni.models.seed_omni.modules.qwen3omni.llm.accelerated.accelerated.get_parallel_state"
+        ) as ps:
+            ps.return_value.sp_size = 2
+            ps.return_value.sp_rank = rank
+            ps.return_value.sp_group = object()
+            ps.return_value.skip_sp_gather_between_modules = True
+            # `_carrier_is_sharded` no longer exists: the flag decides on its own.
+            module._conversation_carrier = [sample]
+            result = module.forward_post(**outputs)
+
+        rows = sum(item.value.size(0) for item in result["conversation_list"][0])
+        # The exit is a window: real rows only, never the full span and never the
+        # pad tail. A full-length exit is the bug this pins.
+        assert rows == sp_valid_in_window(full, rank, 2), (rank, rows, full)
+
+
+def test_a_single_modality_batch_keeps_its_mask_full_width():
+    """The visual mask is built over the packed row, not over the local window.
+
+    Under the shard handoff `inputs_embeds` already holds this rank's window, so
+    sizing the mask from it made the later SP slice halve it a second time: eight
+    text tokens became four hidden rows paired with a two-row mask, and the dummy
+    DeepStack indexing raised.
+    """
+    from unittest import mock
+
+    module = _accelerated_llm()
+    hidden = module.config.text_config.hidden_size
+    full = 8
+    window = 4  # SP2
+
+    window_embeds = torch.randn(1, window, hidden)
+    with mock.patch("veomni.models.seed_omni.modules.qwen3omni.llm.accelerated.accelerated.get_parallel_state") as ps:
+        ps.return_value.sp_size = 2
+        ps.return_value.sp_rank = 0
+        ps.return_value.sp_group = object()
+        ps.return_value.fsdp_enabled = False
+        _, mask, deepstack = module._normalize_visual_inputs(window_embeds, None, [], full_len=full)
+
+    assert mask.size(1) == full, f"mask must span the packed row, got {mask.size(1)} for {full}"
+    assert deepstack is None
