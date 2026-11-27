@@ -46,7 +46,7 @@ Our guiding principles when building VeOmni are:
 - Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
 - Dynamic batching strategy, Omnidata processing
 - [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) for checkpoint.
-- Support for NVIDIA GPU, AMD ROCm, Ascend NPU, and Cambricon MLU training.
+- Support for NVIDIA GPU, AMD ROCm, Ascend NPU, Cambricon MLU, and Intel GPU training.
 - Optional [**HyperParallel**](docs/key_features/hyper_parallel.md) acceleration backend for Ascend SuperPoD training, providing FSDP/HSDP and distributed Muon.
 - Experiment tracking with wandb
 
