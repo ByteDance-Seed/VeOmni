@@ -34,17 +34,27 @@ class _Meta:
     block_size: int
     num_warps: int
     eps: float
+    use_eager: bool = False
+
+
+def _eager_fallback(x: Tensor, weight: Tensor, eps: float) -> tuple[Tensor, SavedState]:
+    """Run the eager pair and keep its saved tensors for backward."""
+    output, saved = _eager.forward(x, weight, eps=eps)
+    eager_meta = saved.metadata
+    assert isinstance(eager_meta, _eager._Meta)
+    return output, SavedState(saved.tensors, _Meta(eager_meta.empty, 0, 0, 0, eps, use_eager=True))
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
     """Liger fused affine RMSNorm (offset 0, llama casting).
 
-    Empty ``x`` falls back to the eager pair. Otherwise saves the fused
-    ``rstd`` plus launch meta for ``rms_norm_backward``.
+    Empty ``x``, and tensors that are not on CUDA or MLU, fall back to the
+    eager pair. The row is chosen from the host, so a CPU activation on a
+    GPU or MLU machine must not enter the Triton kernel. Otherwise saves
+    the fused ``rstd`` plus launch meta for ``rms_norm_backward``.
     """
-    if x.numel() == 0:
-        output, saved = _eager.forward(x, weight, eps=eps)
-        return output, SavedState(saved.tensors, _Meta(True, 0, 0, 0, eps))
+    if x.numel() == 0 or not (x.is_cuda or x.device.type == "mlu"):
+        return _eager_fallback(x, weight, eps)
 
     from liger_kernel.ops.rms_norm import rms_norm_forward
 
@@ -67,8 +77,8 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, weight, *optional_rstd = saved.tensors
-    if meta.empty:
-        return _eager.backward(grad_output, SavedState((x, weight), _eager._Meta(True, meta.eps)))
+    if meta.use_eager:
+        return _eager.backward(grad_output, SavedState(saved.tensors, _eager._Meta(meta.empty, meta.eps)))
 
     from liger_kernel.ops.rms_norm import rms_norm_backward
 

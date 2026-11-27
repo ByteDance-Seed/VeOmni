@@ -281,20 +281,14 @@ def test_indexer_loss_reads_the_bound_handles_not_the_global_config(
                 _indexer_loss_enabled(module)
 
 
-def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it(monkeypatch: pytest.MonkeyPatch):
-    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as npu
+def test_the_cann_indexer_backend_refuses_the_objective_rather_than_dropping_it():
+    from veomni.ops.kernels.dsa.indexer.deepseek_v4 import cann as cann_indexer
 
-    monkeypatch.setattr(npu, "IS_NPU_AVAILABLE", True)
-    with pytest.raises(NotImplementedError, match="dsa_indexer_loss is not implemented on NPU"):
-        npu.DeepseekV4CSACompressor.forward(
-            None,
-            hidden_states=None,
-            q_residual=None,
-            position_ids=None,
-            past_key_values=None,
-            layer_idx=0,
-            build_indexer_loss=True,
-        )
+    q = torch.randn(4, 1, 2, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 1, 8, dtype=torch.bfloat16)
+    weights = torch.randn(4, 1, 2, dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="dsa_indexer_loss is not implemented for the 'cann'"):
+        cann_indexer.wrapper(q, k, weights, compress_ratio=4, topk=1, require_score_grad=True)
 
 
 def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest.MonkeyPatch):

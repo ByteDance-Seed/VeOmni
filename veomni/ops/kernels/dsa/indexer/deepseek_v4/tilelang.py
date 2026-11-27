@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import torch
 from torch import Tensor
 
 
@@ -29,6 +30,8 @@ def wrapper(
     cu_seqlen_ks: Tensor | None = None,
     cu_seqlen_ke: Tensor | None = None,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
+    position_ids: Tensor | None = None,
+    require_score_grad: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Run the TileLang lighting indexer for compressed-KV selection.
 
@@ -37,9 +40,17 @@ def wrapper(
     with shape ``[B, S, K]``. ``K`` is the supplied ``topk_indices`` width when
     present; otherwise it is ``min(topk, S_kv)``. ``cu_seqlen_ks`` /
     ``cu_seqlen_ke`` already encode the packed ranges, so
-    ``packed_sequence_slices`` is unused.
+    ``packed_sequence_slices`` is unused. When ``cu_seqlen_ks`` /
+    ``cu_seqlen_ke`` are omitted and ``position_ids`` is given, per-query
+    causal ranges are built directly without a host sync.
     """
-    del packed_sequence_slices
+    del packed_sequence_slices, require_score_grad
+    if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
+        raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
+    if cu_seqlen_ks is None and position_ids is not None:
+        seq_len = index_q.shape[0]
+        cu_seqlen_ks = torch.zeros(seq_len, device=index_q.device, dtype=torch.int32)
+        cu_seqlen_ke = ((position_ids[0].to(device=index_q.device) + 1) // compress_ratio).to(torch.int32)
     from ...vendor.tilelang_indexer import v4_lighting_indexer
 
     return v4_lighting_indexer(

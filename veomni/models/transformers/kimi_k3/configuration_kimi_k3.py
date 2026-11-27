@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025-2026 The Moonshot AI Team and HuggingFace Inc. team. All rights reserved.
 #
 # Vendored for VeOmni by merging the HuggingFace reference repository
