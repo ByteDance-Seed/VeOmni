@@ -49,6 +49,17 @@
     ]
   },
   {
+    "name": "gpu-selective-expert-cpu-clip-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_fsdp2_clip_grad_norm.py",
+      "tests/utils/test_selective_expert_cpu_offload.py"
+    ]
+  },
+  {
     "name": "04-unit",
     "suite": "unit",
     "conditional": false,
@@ -451,6 +462,16 @@
       "-s",
       "-x",
       "tests/optim/test_muon_unit.py"
+    ]
+  },
+  {
+    "name": "sparse-optimizer-state-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_multi_optimizer_sparse_lr.py"
     ]
   },
   {
