@@ -770,12 +770,12 @@ class KimiMLAAttention(nn.Module):
                     device=hidden_states.device,
                 )
                 attention_mask = torch.triu(attention_mask, diagonal=1)
-        elif sp_ulysses_attn:
-            # The veomni wrapper reassembles the sequence inside its
-            # all-to-all and follows FA-family mask semantics (causal via
-            # is_causal; 2D padding masks are dropped, packing is the
-            # supported varlen form), so a full-length mask would not match
-            # the local shard anyway -- force it to None.
+        elif sp_ulysses_attn and _attn_impl != "veomni_eager":
+            # Flash-family veomni adapters reassemble the sequence inside
+            # their all-to-all and follow FA mask semantics (causal via
+            # is_causal; 2D padding masks are dropped). A full-length mask
+            # would not match the local shard. veomni_eager consumes that
+            # full-sequence 4D mask after its own gather, so it stays.
             attention_mask = None
         batch_size, seq_length = hidden_states.shape[:-1]
         query_shape = (batch_size, seq_length, -1, self.q_head_dim)

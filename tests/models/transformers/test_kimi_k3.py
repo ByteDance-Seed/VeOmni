@@ -63,6 +63,7 @@ from veomni.distributed.parallel_state import get_parallel_state, init_parallel_
 from veomni.distributed.sequence_parallel.data import sp_pad_and_slice
 from veomni.models.auto import build_foundation_model
 from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
+    KimiMLAAttention,
     _shard_dim0_offset_length,
 )
 from veomni.ops.registry import VeomniOp
@@ -860,6 +861,40 @@ def test_chunk_kda_handles_are_instance_local():
         assert attn_2.veomni_chunk_kda is handle
     finally:
         attn_1.veomni_chunk_kda = handle
+
+
+def test_kimi_mla_veomni_eager_keeps_full_sequence_mask_under_sp(monkeypatch):
+    """A full-sequence 4D mask still restricts keys when SP routes through veomni_eager."""
+    from types import SimpleNamespace
+
+    import veomni.models.transformers.kimi_k3.modeling_kimi_k3 as kimi_modeling
+
+    config = _tiny_linear_config()
+    config._attn_implementation = "veomni_eager"
+    attention = KimiMLAAttention(config, 0).eval()
+    attention.veomni_attn = VeomniOp("attention", "standard", "veomni_eager")
+    hidden = torch.randn(1, 4, config.hidden_size)
+    query_idx = torch.arange(4)[:, None]
+    key_idx = torch.arange(4)[None, :]
+    visible = key_idx <= query_idx
+    visible[:, 1] = False
+    mask = torch.zeros(1, 1, 4, 4)
+    mask = mask.masked_fill(~visible, torch.finfo(mask.dtype).min)
+
+    def run(sp_enabled: bool) -> torch.Tensor:
+        monkeypatch.setattr(
+            kimi_modeling,
+            "get_parallel_state",
+            lambda: SimpleNamespace(sp_enabled=sp_enabled, ulysses_size=1),
+        )
+        return attention(hidden, attention_mask=mask)
+
+    with torch.no_grad():
+        reference = run(False)
+        sharded = run(True)
+        cleared = attention(hidden, attention_mask=None)
+    torch.testing.assert_close(sharded, reference)
+    assert not torch.allclose(cleared, reference)
 
 
 # ---------------------------------------------------------------------------

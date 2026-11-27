@@ -646,6 +646,7 @@ def test_minimax_h3_image_canvas_size_uses_minimum_area():
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_text_encoder_inherits_condition_ops(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text_encoder_module
 
     captured = {}

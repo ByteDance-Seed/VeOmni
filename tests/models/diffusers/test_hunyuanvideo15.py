@@ -907,7 +907,7 @@ def test_foundation_loader_preserves_native_weights(tmp_path):
             weights_path=str(tmp_path),
             torch_dtype="float32",
             init_device="cpu",
-            ops_implementation=make_eager_ops_config(),
+            ops_implementation=make_eager_ops_config(attn_implementation="sdpa"),
         ).eval()
     finally:
         torch.distributed.destroy_process_group()
