@@ -289,7 +289,7 @@ The result:
   because `online_process` still runs every step.
 
 The pieces that complete this workflow are in place:
-[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L572)
+[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L632)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that
@@ -374,11 +374,11 @@ A missing module or method still fails before the first request runs.
   [a finalized cache](../../../tests/seed_omni/test_offline_cache_writer.py#L160) or [another dp size](../../../tests/seed_omni/test_offline_cache_writer.py#L173) cannot be resumed into, and
   [a shard only one rank sees fails every rank](../../../tests/seed_omni/test_offline_cache_writer.py#L311).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
-  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L125),
-  [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L137),
-  [a step from the other kind of run is refused before any module loads](../../../tests/seed_omni/trainer/test_omni_trainer.py#L151),
-  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L174), and
-  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L197).
+  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L131),
+  [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L143),
+  [a step from the other kind of run is refused before any module loads](../../../tests/seed_omni/trainer/test_omni_trainer.py#L157),
+  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L180), and
+  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L203).
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
   [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L638).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):

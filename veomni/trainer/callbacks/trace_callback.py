@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
@@ -134,6 +135,38 @@ class MoERouterMonitorCallback(Callback):
             logger.info_rank0("MoE router monitor disabled.")
 
 
+def _trim_wandb_config_keys(obj: Any, max_len: int = 64) -> Any:
+    """Flatten nested config dicts and hash-trim any key exceeding ``max_len`` (W&B limit)."""
+    if not isinstance(obj, dict):
+        return obj
+
+    flat: Dict[str, Any] = {}
+
+    def _flatten(node: Dict[str, Any], prefix: str) -> None:
+        for k, v in node.items():
+            full = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict) and v:
+                _flatten(v, full)
+            else:
+                flat[full] = v
+
+    _flatten(obj, "")
+    out: Dict[str, Any] = {k: v for k, v in flat.items() if len(k) <= max_len}
+    for k, v in flat.items():
+        if len(k) <= max_len:
+            continue
+        digest = hashlib.sha1(k.encode("utf-8")).hexdigest()[:6]
+        head = k[: max(max_len - len(digest) - 1, 0)]
+        trimmed = f"{head}_{digest}" if head else digest[:max_len]
+        suffix = 1
+        while trimmed in out:
+            tag = f"_{digest[:4]}{suffix}"
+            trimmed = f"{k[: max(max_len - len(tag), 0)]}{tag}"[-max_len:]
+            suffix += 1
+        out[trimmed] = v
+    return out
+
+
 class WandbTraceCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
@@ -142,12 +175,13 @@ class WandbTraceCallback(Callback):
 
             import wandb
 
+            raw_config = {**asdict(args.model), **asdict(args.data), **asdict(args.train)}
             wandb.init(
                 project=args.train.wandb.project,
                 name=args.train.wandb.name,
                 id=args.train.wandb.id,
                 resume="allow" if args.train.wandb.id else None,
-                config={**asdict(args.model), **asdict(args.data), **asdict(args.train)},
+                config=_trim_wandb_config_keys(raw_config),
             )
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
@@ -293,6 +327,16 @@ class TqdmCallback(Callback):
         self.data_loader_tqdm.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
+        display_metrics = dict(self.trainer.step_train_metrics)
+        env_metrics = getattr(self.trainer, "step_env_metrics", None) or {}
+        for key in ("mfu(%)", "tflops_per_gpu", "flops_achieved(T)", "step_time(s)"):
+            prefixed_key = f"training/{key}"
+            if key in display_metrics or prefixed_key in display_metrics:
+                continue
+            if prefixed_key in env_metrics:
+                display_metrics[key] = env_metrics[prefixed_key]
+            elif key in env_metrics:
+                display_metrics[key] = env_metrics[key]
+        postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in display_metrics.items())
         self.data_loader_tqdm.set_postfix_str(postfix, refresh=False)
         self.data_loader_tqdm.update()

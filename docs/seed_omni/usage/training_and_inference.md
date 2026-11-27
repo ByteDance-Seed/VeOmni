@@ -134,6 +134,13 @@ Common overrides:
 
 - `--train.global_batch_size` / `--train.micro_batch_size`: global vs per-step
   micro batch.
+- `--train.loss_reduction`: how a gradient-accumulation window is averaged
+  (`sample_mean`, default, averages micro-batches equally; `token_mean` scales
+  each micro-batch's backward by the loss node's group-reduced `_loss_tokens`
+  count and divides the accumulated gradients by the window's total tokens so
+  long samples are not diluted by short ones; supported for single-loss graphs
+  whose loss node emits `_loss_tokens` — see
+  [Loss Token Count Contract](../mixins/loss_tokens.md)).
 - `--data.max_seq_len`: packed sequence length.
 - `--train.checkpoint.output_dir`: run root; DCP checkpoints land in
   `<output_dir>/checkpoints/`.
@@ -141,6 +148,11 @@ Common overrides:
   save cadence.
 - `--train.wandb.enable false`: disable wandb for quick runs.
 - `--model.accelerator.fsdp_config.fsdp_mode`: the global FSDP mode.
+
+When `clip_grad_norm()` produces a non-finite norm (`NaN` or `Inf`),
+`OmniTrainer` logs a rank-0 warning and skips `optimizer.step()` for that step
+to protect model weights while still advancing the LR scheduler and zeroing
+gradients.
 
 ### Parallelism
 

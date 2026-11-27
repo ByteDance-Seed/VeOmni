@@ -71,9 +71,11 @@ def _accumulate_grads(num_micro_steps: int) -> torch.Tensor:
     trainer.model_bwd_context = nullcontext()
     trainer.preforward = lambda micro_batch: micro_batch
 
-    micro_batch = {"x": torch.tensor([3.0, -1.0])}
+    # A fresh batch per micro-step: ``forward_backward_step`` clears the dict it is
+    # handed once the backward has consumed it, so reusing one would feed the
+    # second step an empty dict and raise KeyError('x').
     for _ in range(num_micro_steps):
-        trainer.forward_backward_step(micro_batch, num_micro_steps=num_micro_steps)
+        trainer.forward_backward_step({"x": torch.tensor([3.0, -1.0])}, num_micro_steps=num_micro_steps)
     return weight.grad
 
 

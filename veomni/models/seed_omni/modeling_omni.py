@@ -58,10 +58,12 @@ if TYPE_CHECKING:
 
 logger = helper.create_logger(__name__)
 
-# Must match the ``_loss`` key every OmniModule's ``post_forward`` emits. Its value is
-# either a bare scalar (logged as ``{module}.{method}``) or a ``{loss_name: scalar}``
-# dict (logged as ``{module}.{method}.{loss_name}``). The training loss is the sum of all.
+# Must match the ``_loss`` / ``_loss_tokens`` keys OmniModules' ``post_forward`` emits.
+# Each value is either a bare scalar (logged as ``{module}.{method}``) or a
+# ``{loss_name: scalar}`` dict (logged as ``{module}.{method}.{loss_name}``).
+# The training loss is the sum of all active entries.
 LOSS_KEY = "_loss"
+LOSS_TOKENS_KEY = "_loss_tokens"
 
 # HF hub kwargs forwarded to :meth:`OmniConfig.from_pretrained`.
 _CONFIG_LOAD_KWARG_NAMES = frozenset(
@@ -184,6 +186,7 @@ class OmniModel(PreTrainedModel):
         self._last_printed_state: str | None = None
         self._generated: list[dict[str, Any]] = []
         self._losses: dict[str, Any] = {}
+        self._loss_tokens: dict[str, Any] = {}
 
         self.reset()
 
@@ -553,21 +556,31 @@ class OmniModel(PreTrainedModel):
 
         self.training_graph.reset()
         self._losses.clear()
+        self._loss_tokens.clear()
 
         for node in self.training_graph.iter_nodes():
             run_node(self.get_module(node.module), node, batch)
             loss = batch.pop(LOSS_KEY, None)
+            loss_tokens = batch.pop(LOSS_TOKENS_KEY, None)
             if loss is None:
                 continue
             if isinstance(loss, Mapping):
+                tokens_map = loss_tokens if isinstance(loss_tokens, Mapping) else {}
                 for loss_name, value in loss.items():
                     if value is not None:
-                        self._losses[f"{node.name}.{loss_name}"] = value
+                        flat_key = f"{node.name}.{loss_name}"
+                        self._losses[flat_key] = value
+                        tok = tokens_map.get(loss_name)
+                        if tok is not None:
+                            self._loss_tokens[flat_key] = tok
             else:
                 self._losses[node.name] = loss
+                if loss_tokens is not None:
+                    self._loss_tokens[node.name] = loss_tokens
         return {
             "loss": _sum_losses(self._losses),
             "losses": dict(self._losses),
+            "loss_tokens": dict(self._loss_tokens),
             "conversation_list": batch.get("conversation_list"),
         }
 
@@ -746,4 +759,4 @@ def _sum_losses(losses: dict[str, Any]) -> Any | None:
     return total
 
 
-__all__ = ["LOSS_KEY", "OmniModel"]
+__all__ = ["LOSS_KEY", "LOSS_TOKENS_KEY", "OmniModel"]

@@ -121,6 +121,7 @@ seed_omni/distributed/per_module_parallelism.md
 seed_omni/distributed/sequence_parallel.md
 seed_omni/mixins/module_preprocessor.md
 seed_omni/mixins/metric_meter.md
+seed_omni/mixins/loss_tokens.md
 seed_omni/mixins/offline_encoding.md
 seed_omni/mixins/configure_optimizer.md
 seed_omni/mixins/module_rng_state.md

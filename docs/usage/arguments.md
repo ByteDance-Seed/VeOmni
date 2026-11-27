@@ -462,6 +462,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | dyn_bsz_physical_overflow_ratio | `float` | `1.5` | Physical-token cap multiplier used with `dyn_bsz_count_mode="effective"`: `ceil(micro_batch_size * max_seq_len * ratio)`. Values above `1.0` allow controlled physical overflow so effective-token batching does not degenerate into total-token batching. |
 | micro_batch_size | `int` | `1` | Number of samples per iteration on each device. |
 | global_batch_size | `Optional[int]` | `None` | Global batch size. If `None`, uses `micro_batch_size × dp_size`. |
+| loss_reduction | `Literal["sample_mean", "token_mean"]` | `"sample_mean"` | *SeedOmni (`OmniTrainingArguments`) only.* How a gradient-accumulation window is averaged: `"sample_mean"` weights every micro-batch equally; `"token_mean"` weights each micro-batch by the loss node's reported `_loss_tokens` count and normalizes gradients by the window total. |
 | num_train_epochs | `int` | `1` | Number of training epochs. |
 | pad_to_length | `bool` | `False` | Pad packed sequences to a fixed length (requires `dyn_bsz`). |
 | bsz_warmup_ratio | `float` | `0` | Ratio of batch size warmup steps. |

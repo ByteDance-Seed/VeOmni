@@ -50,8 +50,8 @@ Division of labour
 """
 
 import json
+import math
 import os
-from collections import defaultdict
 from dataclasses import asdict
 from typing import Any, Dict, List, Mapping
 
@@ -500,15 +500,10 @@ class OmniTrainer:
     def forward_backward_step(self, micro_batch: Dict[str, Any], *, num_micro_steps: int = 1):
         """One gradient-accumulation micro-batch over the training DAG.
 
-        ``OmniModelRuntime.forward`` returns ``{"loss", "losses", "conversation_list"}``
-        where ``loss`` is the summed per-node ``_loss``; a single backward then
-        propagates across every FSDP2 unit. The result is dropped before the
-        backward so the item copies a root wrap's input cast made are not held through it.
-
-        Each node's loss is a mean over its own micro-batch, so the backward is
-        scaled by ``1 / num_micro_steps``: accumulated gradients are then the mean
-        over micro-batches, not a sum that grows with the accumulation count. The
-        returned loss stays unscaled for logging.
+        ``OmniModelRuntime.forward`` returns ``{"loss", "losses", "loss_tokens", "conversation_list"}``.
+        Under ``sample_mean``, backward scales by ``1 / num_micro_steps``; under ``token_mean``,
+        backward scales by the single loss node's group-reduced ``_loss_tokens`` so :meth:`train_step`
+        can divide accumulated gradients by the window's total tokens before ``clip_grad_norm()``.
         """
         micro_batch = self.preforward(micro_batch)
 
@@ -518,14 +513,46 @@ class OmniTrainer:
 
         total_loss: torch.Tensor = result["loss"]
         loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
+        loss_tokens: Dict[str, torch.Tensor] = result.get("loss_tokens", {})
         del result
+        micro_batch.clear()
+
+        if getattr(self.args.train, "loss_reduction", "sample_mean") == "token_mean":
+            if len(loss_dict) != 1 or loss_dict.keys() != loss_tokens.keys():
+                raise ValueError(
+                    "train.loss_reduction='token_mean' requires a single loss node reporting '_loss_tokens'; "
+                    f"got losses={list(loss_dict.keys())} and loss_tokens={list(loss_tokens.keys())}. "
+                    "Use train.loss_reduction='sample_mean' instead."
+                )
+            raw_tokens = next(iter(loss_tokens.values()))
+            token_count = (
+                raw_tokens.detach().to(device=total_loss.device, dtype=torch.int64)
+                if isinstance(raw_tokens, torch.Tensor)
+                else torch.tensor(raw_tokens, device=total_loss.device, dtype=torch.int64)
+            )
+            scaled_loss = total_loss * token_count.float()
+        else:
+            token_count = None
+            scaled_loss = total_loss / num_micro_steps
 
         # Backward: separate offload hook stack (may differ from forward when GC is on).
         with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            (total_loss / num_micro_steps).backward()
+            scaled_loss.backward()
 
         del micro_batch
-        return total_loss, loss_dict
+        return total_loss, loss_dict, token_count
+
+    def _scale_optimizer_grads(self, scale: float) -> None:
+        """Rescale all live gradients across every module optimizer in-place."""
+        seen: set[int] = set()
+        with torch.no_grad():
+            for group in self.model.optimizer.param_groups:
+                for param in group["params"]:
+                    pid = id(param)
+                    if pid in seen or param.grad is None:
+                        continue
+                    seen.add(pid)
+                    param.grad.mul_(scale)
 
     def model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
         """Keep every module's params gathered across the grad-accumulation window."""
@@ -551,23 +578,56 @@ class OmniTrainer:
         self.on_step_begin(micro_batches=micro_batches)
         self.sync_before_train_step()
 
-        total_loss = 0.0
-        total_loss_dict: Dict[str, float] = defaultdict(float)
+        loss_reduction = getattr(self.args.train, "loss_reduction", "sample_mean")
+        total_loss_tensor: torch.Tensor | None = None
+        total_loss_dict_tensors: Dict[str, torch.Tensor] = {}
+        total_tokens_tensor: torch.Tensor | None = None
         num_micro_steps = len(micro_batches)
 
         for micro_step, micro_batch in enumerate(micro_batches):
             self.model_reshard(micro_step, num_micro_steps)
-            loss, loss_dict = self.forward_backward_step(micro_batch, num_micro_steps=num_micro_steps)
-            total_loss += loss.item() / num_micro_steps
+            loss, loss_dict, token_count = self.forward_backward_step(micro_batch, num_micro_steps=num_micro_steps)
+            if loss_reduction == "token_mean":
+                weight = token_count.float()
+                total_tokens_tensor = (
+                    token_count if total_tokens_tensor is None else (total_tokens_tensor + token_count)
+                )
+            else:
+                weight = 1.0
+            loss_w = loss.detach().float() * weight
+            total_loss_tensor = loss_w if total_loss_tensor is None else (total_loss_tensor + loss_w)
             for k, v in loss_dict.items():
-                total_loss_dict[k] += v.item() / num_micro_steps
+                v_w = v.detach().float() * weight
+                total_loss_dict_tensors[k] = (
+                    v_w if k not in total_loss_dict_tensors else (total_loss_dict_tensors[k] + v_w)
+                )
+
+        if loss_reduction == "token_mean":
+            denom = float(total_tokens_tensor.item()) if total_tokens_tensor is not None else 0.0
+            if denom > 0.0:
+                self._scale_optimizer_grads(1.0 / denom)
+        else:
+            denom = float(num_micro_steps)
+
+        total_loss = (
+            float(total_loss_tensor.item()) / denom if (total_loss_tensor is not None and denom > 0.0) else 0.0
+        )
+        total_loss_dict = {
+            k: float(v.item()) / denom if denom > 0.0 else 0.0 for k, v in total_loss_dict_tensors.items()
+        }
 
         grad_norm = self.model.clip_grad_norm()
-        self.model.optimizer.step()
+        if math.isfinite(float(grad_norm)):
+            self.model.optimizer.step()
+        else:
+            logger.warning_rank0(
+                f"Step {self.state.global_step}: non-finite grad_norm={grad_norm}, "
+                "skipping optimizer.step() to protect model parameters."
+            )
         self.model.lr_scheduler.step()
         self.model.optimizer.zero_grad()
 
-        self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
+        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def offline_cache_step(self, data_iterator: Any) -> None:
         """One encode-only step: run the training DAG without autograd and cache each conversation."""
