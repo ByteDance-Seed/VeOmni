@@ -139,7 +139,8 @@ Common overrides:
   each micro-batch's backward by the loss node's group-reduced `_loss_tokens`
   count and divides the accumulated gradients by the window's total tokens so
   long samples are not diluted by short ones; supported for single-loss graphs
-  whose loss node emits `_loss_tokens`).
+  whose loss node emits `_loss_tokens` — see
+  [Loss Token Count Contract](../mixins/loss_tokens.md)).
 - `--data.max_seq_len`: packed sequence length.
 - `--train.checkpoint.output_dir`: run root; DCP checkpoints land in
   `<output_dir>/checkpoints/`.

@@ -136,6 +136,67 @@ def test_token_mean_accumulated_gradient_and_logged_loss_match_single_step_refer
     optimizer.zero_grad.assert_called_once()
 
 
+def test_token_mean_scales_grads_through_nested_multi_optimizer():
+    """``_scale_optimizer_grads`` handles ``veomni.optim.optimizer.MultiOptimizer`` (Muon / FSDP2+EP)."""
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+        MultiOptimizer as OmniMultiOptimizer,
+    )
+    from veomni.optim.optimizer import MultiOptimizer as ExtraParallelMultiOptimizer
+
+    p_dense = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    p_expert = torch.nn.Parameter(torch.tensor([-1.5, 0.5]))
+    dummy_root = torch.nn.Module()
+    inner_opt = ExtraParallelMultiOptimizer(
+        dummy_root,
+        {
+            "non_extra_parallel": torch.optim.SGD([p_dense], lr=0.1),
+            "ep": torch.optim.SGD([p_expert], lr=0.1),
+        },
+        key_names=["non_extra_parallel", "ep"],
+    )
+    outer_opt = OmniMultiOptimizer({"llm": inner_opt})
+
+    grad_snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+    orig_step = outer_opt.step
+
+    def capture_step():
+        grad_snapshots.append((p_dense.grad.detach().clone(), p_expert.grad.detach().clone()))
+        orig_step()
+
+    outer_opt.step = capture_step
+    lr_scheduler = SimpleNamespace(step=MagicMock())
+
+    def forward(mb):
+        loss = (p_dense * mb["a"]).sum() + (p_expert * mb["b"]).sum()
+        return {
+            "loss": loss,
+            "losses": {"text_enc.decode": loss},
+            "loss_tokens": {"text_enc.decode": torch.tensor(mb["tokens"], dtype=torch.int64)},
+        }
+
+    model = SimpleNamespace(
+        forward=forward,
+        clip_grad_norm=lambda: torch.tensor(1.0),
+        optimizer=outer_opt,
+        lr_scheduler=lr_scheduler,
+    )
+    trainer = _build_trainer(loss_reduction="token_mean", model=model)
+    trainer.on_step_end = lambda **kwargs: None
+
+    # Micro-batch 0 (tokens=3): grad_dense=[3, 0], grad_expert=[0, 3].
+    # Micro-batch 1 (tokens=1): grad_dense=[0, 1], grad_expert=[1, 0].
+    # Total tokens=4 -> expected token-mean grads: dense=[0.75, 0.25], expert=[0.25, 0.75].
+    micro_batches = [
+        {"a": torch.tensor([1.0, 0.0]), "b": torch.tensor([0.0, 1.0]), "tokens": 3},
+        {"a": torch.tensor([0.0, 1.0]), "b": torch.tensor([1.0, 0.0]), "tokens": 1},
+    ]
+    trainer.train_step(iter([micro_batches]))
+
+    assert len(grad_snapshots) == 1
+    assert torch.allclose(grad_snapshots[0][0], torch.tensor([0.75, 0.25]))
+    assert torch.allclose(grad_snapshots[0][1], torch.tensor([0.25, 0.75]))
+
+
 def test_sample_mean_stays_equal_weighted():
     param = torch.nn.Parameter(torch.tensor([1.0]))
     optimizer = SimpleNamespace(param_groups=[{"params": [param]}], step=MagicMock(), zero_grad=MagicMock())
