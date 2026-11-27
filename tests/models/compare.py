@@ -34,11 +34,14 @@ def eager_ops_config() -> SimpleNamespace:
         gated_mlp_implementation="eager",
         load_balancing_loss_implementation="eager",
         moe_implementation="eager",
+        chunk_kda_implementation="eager",
+        situ_and_mul_implementation="eager",
         rms_norm_gated_implementation="eager",
         causal_conv1d_implementation="eager",
         chunk_gated_delta_rule_implementation="eager",
         dsa_indexer_implementation="eager",
         dsa_attention_implementation="eager",
+        minimax_sparse_attention_implementation="eager",
         mhc_implementation="eager",
     )
 

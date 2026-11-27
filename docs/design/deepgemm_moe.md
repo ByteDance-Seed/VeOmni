@@ -1,13 +1,58 @@
-# FP8 MoE training with DeepGEMM on Hopper and Blackwell
+# FP8 training with DeepGEMM on Hopper and Blackwell
 
-`moe_implementation: deepgemm` selects native FP8 grouped GEMMs for
-routed SwiGLU experts' forward, activation gradients (dgrad), and weight
-gradients (wgrad). It implements the existing `moe_experts/standard` contract
-and is opt-in. It does not require Transformer Engine.
+`deepgemm` is one implementation name that three GEMM families each register on
+their own field:
+
+| Field | What it covers | Contract |
+| --- | --- | --- |
+| `moe_implementation` | routed SwiGLU experts: forward, dgrad, wgrad | `moe_experts/standard` |
+| `linear_implementation` | dense (`standard`) and block-diagonal (`grouped`) projections | `linear/standard`, `linear/grouped` |
+| `gated_mlp_implementation` | a dense gated MLP's gate/up/down projections | `gated_mlp/standard` |
+
+All three run native FP8 GEMMs on the tensor cores and implement the existing
+contracts, so they are opt-in and a model's `VeomniOp` handles resolve them
+without a modeling change. They do not require Transformer Engine.
+
+Where `deepgemm` sits among the low-precision rows:
+
+| Row | Arithmetic |
+| --- | --- |
+| `qat` | fake-quantizes the operands, multiplies in the model dtype — emulation |
+| `torchao` `dtype=fp8` | native `aten::_scaled_mm` by default (`emulated=False`); `emulated=True` falls back to fake quantization for hosts below SM89 |
+| `torchao` `dtype=nvfp4` / `mxfp4` | fake quantization (`emulated=True`; native FP4 is not implemented) |
+| `deepgemm` | DeepGEMM's blockwise FP8 **grouped** GEMM, covering forward, dgrad and wgrad |
+
+So `torchao`'s FP8 mode is *not* emulation, and calling it one would misrepresent a
+genuine native path. What distinguishes `deepgemm` is the recipe and the shape it
+covers: 128-wide blockwise tiles driven through DeepGEMM's grouped-GEMM API, with
+dgrad and wgrad on FP8 as well, and one row that serves routed experts, dense
+projections and dense gated MLPs alike.
+
+On each field these are different values, so a single GEMM is never rounded twice;
+across fields nothing links them, and a mixed selection is a valid recipe.
+
+## One restriction: the gated MLP is SiLU-family only
+
+`gated_mlp_implementation: deepgemm` cannot serve a model whose `hidden_act` is
+outside `{silu, swish}`. Its Triton kernel fuses `aten.silu` and
+`aten.silu_backward` into the grouped GEMM's forward and backward, and `swish` is the
+same function under its other name, so both are served. Anything else — `gelu`,
+`gelu_new`, `relu` — has no fused row to run. `render` refuses the selection and
+names `eager` as the way to keep the fallback, so such a model selects
+`gated_mlp_implementation: eager` and trains that family in the model dtype. Teaching
+the kernel another activation is tracked in #1430.
+
+The routed experts have the same restriction for the same reason. `moe_experts`
+rows take `activation=` too, and `deepgemm` refuses anything `is_silu` rejects
+(`silu` / `swish`), because its grouped GEMM also fuses the activation — the error
+names the activation and says the FP8 GEMM would have to be dropped to substitute
+another.
+
+`linear` is the one row among the three with no such limit: it takes no activation.
 
 ## Configuration
 
-For a model using the standard SwiGLU expert contract:
+For a model using the standard gated-expert contract:
 
 ```yaml
 model:
@@ -15,8 +60,23 @@ model:
     moe_implementation: deepgemm
 ```
 
-For checkpoints whose config sets `expert_dtype: "fp4"` (such as DeepSeek-V4 Flash),
-pass the explicit FP8 override so the row accepts the call instead of rejecting `dtype="fp4"`:
+Every GEMM family on real FP8 tensor cores. For a checkpoint whose config sets
+`expert_dtype: "fp4"` (such as DeepSeek-V4 Flash), name `dtype: fp8` explicitly on the
+MoE field so the row accepts the call instead of rejecting `dtype="fp4"` — the rows
+validate the format rather than ignoring it, and DeepGEMM ships FP8 kernels only:
+
+```yaml
+model:
+  ops_implementation:
+    linear_implementation: deepgemm
+    gated_mlp_implementation: deepgemm
+    moe_implementation: deepgemm
+    # Stored KV / indexer rounding is a separate decision.
+    kv_round_implementation: triton
+```
+
+On an `expert_dtype: "fp4"` checkpoint the MoE field carries the format explicitly,
+because that config would otherwise resolve `dtype="fp4"` and be refused:
 
 ```yaml
 model:
@@ -32,23 +92,51 @@ is unchanged. Use trainable BF16 expert parameters, or FSDP2 BF16 parameter
 mixed precision with FP32 master weights. A packed inference checkpoint must
 first pass through its model's existing dequantization/weight-loading path.
 
-`deepgemm` and `qat` are two values of the same `moe_implementation` field,
-so the routed experts can never be quantized twice. The other families are
-independent: selecting `qat` for `linear_implementation` or
-`gated_mlp_implementation` alongside `deepgemm` is valid and covers a case
-DeepGEMM does not -- the attention projections and the **shared expert**, which is
-a dense SwiGLU FFN rather than one of the routed experts. Combine them freely;
-this is independent of rollout/export quantization.
+`deepgemm` and `qat` are two values of the same `*_implementation` field, so one
+GEMM cannot be quantized twice. The other families are independent: selecting
+`qat` for `linear_implementation` or `gated_mlp_implementation` alongside
+`deepgemm` experts is valid, because the routed-expert kernel takes the experts'
+merged slab and the dense families are separate GEMMs with their own fields.
+Combine them freely; this is independent of rollout/export quantization.
 
-MoE-LoRA on routed expert weights is unsupported with `deepgemm`. Both
-shared and independent LoRA wrappers raise before moving the base parameters,
-instead of silently switching to BF16 eager execution. Select a supported
-MoE-LoRA backend such as `fused_triton` on GPU, or exclude expert weights from
-the LoRA targets. This restriction does not apply to LoRA on dense modules.
+The dense rows take the argument contract of their families rather than a
+call-shape of their own: `linear` rows take the projection **module** (so
+`resolve_projection` can refuse a wrapped projection or an `nn.Linear` subclass
+such as the `FSDPLinear` that `basic_modules` produces), and `gated_mlp` rows take
+the MLP **block** plus `activation=`. `deepgemm` validates `dtype` and
+`block_size` instead of ignoring them, because it has exactly one recipe (FP8,
+128-wide tiles); accepting another value would let one field mean two formats
+depending on which row the config selected.
+
+LoRA is unsupported on every `deepgemm` row, for one reason: it quantizes the
+weight it multiplies, so it reads `module.weight` instead of calling the module, and
+a wrapped projection keeps the real weight at `base_layer`. The expert path says so
+through the LoRA wrappers, which raise before moving the base parameters; the dense
+families say so through `resolve_projection` / `render`, which refuse a wrapped
+projection. Either way it is a refusal rather than a silent switch to BF16 eager
+execution. For MoE-LoRA select a supported backend such as `fused_triton` on GPU;
+for a dense adapter set `linear_implementation` / `gated_mlp_implementation` to
+`eager`.
 
 The mainline DeepSeek V4 expert module is covered by a real forward/backward
 integration test, using its existing merged weights and FP32 router scores.
-This is operator integration, not full-model convergence validation.
+
+The dense `linear` rows are covered in two places, and the two compare against
+different things: **forward** against an independently re-quantized reference (the
+values a deployment FP8 GEMM would produce), and **dgrad / wgrad** against a BF16
+reference GEMM (the operands are quantized, so a straight FP8 reference would only
+reproduce the same rounding). Row counts include one divisible and one not divisible
+by the 128-column alignment.
+
+The `gated_mlp` row splits the same way for a different reason: its clamp means the
+plain BF16 reference does not reproduce the forward, so forward is checked against
+the quantized reference and dgrad / wgrad against a BF16 autocast reference.
+
+All of these tests need SM90/SM100 hardware and `deep_gemm`, so they skip on the
+CPU-only hosts that run part of CI — a green CI run does not by itself prove the
+rows execute. After changing `GroupedLinear`, the layout, or a quantizer, run
+`tests/ops/moe_experts/test_deepgemm.py` (expert and dense rows) and
+`tests/ops/linear/test_linear.py` on a Hopper or Blackwell host.
 
 ## Requirements and tensor contract
 

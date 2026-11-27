@@ -37,6 +37,7 @@ from ..utils.device import (
     create_stream,
     get_current_stream,
     get_device_type,
+    is_caching_allocator_active,
     switch_to_specified_stream,
 )
 
@@ -109,9 +110,16 @@ class PinnedBufferPool:
         return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
 
     def acquire(self, tensor):
+        """Return a host buffer matching ``tensor``'s layout, waiting for its last transfer.
+
+        ``release`` does not block, so a pooled buffer may still be a D2H
+        destination or an H2D source. The wait belongs here and runs outside the
+        lock, so one manager's slow transfer cannot serialize another's acquire.
+        """
         key = self._key(tensor)
         with self._lock:
             free_buffers = self._free_buffers.get(key)
+            buffer = None
             if free_buffers:
                 buffer = free_buffers.pop()
                 self._cached_bytes -= buffer.numel() * buffer.element_size()
@@ -120,7 +128,9 @@ class PinnedBufferPool:
                 else:
                     del self._free_buffers[key]
                 self.reuses += 1
-                return buffer, key
+        if buffer is not None:
+            self._wait_for_last_swap(buffer)
+            return buffer, key
 
         pin_memory = _is_active_accelerator_tensor(tensor)
         try:
@@ -149,27 +159,50 @@ class PinnedBufferPool:
         return buffer, key
 
     def release(self, buffer, key):
+        """Return a host buffer to the pool without waiting, except on drop/eviction.
+
+        Reuse is covered by :meth:`acquire`. A dropped or evicted buffer leaves the
+        pool for good, so its wait happens here. Both waits run outside the lock;
+        the counters stay inside it, since ``release`` can run on any thread.
+        """
         if buffer is None:
             return
 
         buffer_nbytes = buffer.numel() * buffer.element_size()
+        evicted = []
         with self._lock:
             if self.max_cached_bytes == 0 or buffer_nbytes > self.max_cached_bytes:
                 self.drops += 1
-                return
+                dropped = True
+            else:
+                dropped = False
+                while self._cached_bytes + buffer_nbytes > self.max_cached_bytes:
+                    oldest_key, oldest_buffers = next(iter(self._free_buffers.items()))
+                    oldest = oldest_buffers.popleft()
+                    self._cached_bytes -= oldest.numel() * oldest.element_size()
+                    self.evictions += 1
+                    evicted.append(oldest)
+                    if not oldest_buffers:
+                        del self._free_buffers[oldest_key]
 
-            while self._cached_bytes + buffer_nbytes > self.max_cached_bytes:
-                oldest_key, oldest_buffers = next(iter(self._free_buffers.items()))
-                evicted = oldest_buffers.popleft()
-                self._cached_bytes -= evicted.numel() * evicted.element_size()
-                self.evictions += 1
-                if not oldest_buffers:
-                    del self._free_buffers[oldest_key]
+                free_buffers = self._free_buffers.setdefault(key, deque())
+                free_buffers.append(buffer)
+                self._free_buffers.move_to_end(key)
+                self._cached_bytes += buffer_nbytes
+        if dropped:
+            self._wait_for_last_swap(buffer)
+        for oldest in evicted:
+            self._wait_for_last_swap(oldest)
 
-            free_buffers = self._free_buffers.setdefault(key, deque())
-            free_buffers.append(buffer)
-            self._free_buffers.move_to_end(key)
-            self._cached_bytes += buffer_nbytes
+    @staticmethod
+    def _wait_for_last_swap(buffer) -> None:
+        """Wait for the transfer that last touched ``buffer``, then forget its event.
+
+        Popped rather than kept so an idle buffer does not pin a completed event.
+        """
+        event = buffer.__dict__.pop("_last_swap_event", None)
+        if event is not None:
+            event.synchronize()
 
 
 class GetCnt:
@@ -215,6 +248,27 @@ class GetCnt:
         return self._block_tensor_nums[block_idx]
 
 
+_is_cow_tensor = getattr(torch._C, "_is_cow_tensor", None)
+
+
+def _deferred_free_supported(tensor=None) -> bool:
+    """Whether ``record_stream`` can keep ``tensor``'s storage alive, as this path assumes.
+
+    Besides the allocator check, the storage must belong to that allocator:
+    foreign storage (``from_numpy`` / ``from_dlpack`` / ``frombuffer``) and
+    copy-on-write storage (``torch._lazy_clone``) carry deleters ``record_stream``
+    ignores, so detaching would free memory an in-flight copy is reading.
+    """
+    if not is_caching_allocator_active():
+        return False
+    if tensor is not None:
+        if not tensor.untyped_storage().resizable():
+            return False
+        if _is_cow_tensor is not None and _is_cow_tensor(tensor):
+            return False
+    return True
+
+
 class SwapTensor:
     def __init__(self, tensor, key, pool):
         if not _has_private_dense_storage(tensor):
@@ -229,22 +283,29 @@ class SwapTensor:
 
         self.stat = "device"
         self.key = key
+        self._deferred_free = False
 
         self.d2h_event = create_event()
         self.h2d_event = create_event()
 
     def release_host_buffer(self):
+        """Hand the host buffer back to the pool, ordering any unguarded D2H source.
+
+        On the deferred path the pool's event tag covers reuse. When
+        ``launch_d2h`` skipped ``record_stream`` and the wrapper is torn down
+        mid-D2H, nothing else keeps the source alive, so it is synchronized here.
+        """
         if self._host_buffer_released or self.tensor_cpu is None:
             return
-        if self.stat == "d2h":
+        if self.stat == "d2h" and not self._deferred_free:
             self.d2h_event.synchronize()
-        elif self.stat == "host":
-            self.d2h_event.synchronize()
-        elif self.stat == "h2d":
-            self.h2d_event.synchronize()
-        self.pool.release(self.tensor_cpu, self._host_buffer_key)
+            self.tensor_cpu.__dict__.pop("_last_swap_event", None)
+        buffer, key = self.tensor_cpu, self._host_buffer_key
         self.tensor_cpu = None
         self._host_buffer_released = True
+        if self.stat == "h2d":
+            buffer._last_swap_event = self.h2d_event
+        self.pool.release(buffer, key)
 
     def __del__(self):
         try:
@@ -253,33 +314,57 @@ class SwapTensor:
             pass
 
     def launch_d2h(self, stream):
+        """Queue the GPU-to-host copy of ``self.tensor`` on ``stream``.
+
+        ``record_stream`` is issued only where the allocator can defer the free;
+        other backends (e.g. ``cudaMallocAsync`` over foreign memory) reject it and
+        rely on the host synchronize in :meth:`wait_d2h_finished`.
+        """
         if self.stat != "device":
             return
 
+        self._deferred_free = _deferred_free_supported(self.tensor)
         forward_event = create_event()
         forward_event.record()
         with torch.no_grad():
             with switch_to_specified_stream(stream):
                 stream.wait_event(forward_event)
+                if self._deferred_free:
+                    self.tensor.record_stream(stream)
                 self.tensor_cpu.copy_(self.tensor, non_blocking=True)
                 self.d2h_event.record()
+                self.tensor_cpu._last_swap_event = self.d2h_event
                 self.stat = "d2h"
 
     def wait_d2h_finished(self):
+        """Detach the offloaded GPU storage once the D2H copy is ordered or complete.
+
+        The host wait is skipped only where :meth:`launch_d2h` recorded the swap
+        stream on storage whose allocator defers the free.
+        """
         if self.stat != "d2h":
             return
-        get_current_stream().wait_event(self.d2h_event)
-        # Stream wait only orders later GPU work. Detaching storage is a host
-        # operation, so the D2H copy must be host-complete first.
-        self.d2h_event.synchronize()
+        if not self._deferred_free:
+            # Nothing keeps the source alive, so the copy must be host-complete
+            # before the storage is detached.
+            self.d2h_event.synchronize()
         # Point this tensor at a fresh empty storage instead of resize_(0).
         # resize_ would free a StorageImpl that a Tensor.set_() alias can still
-        # hold even when _base is None and storage_offset is 0.
+        # hold even when _base is None and storage_offset is 0. On CUDA,
+        # record_stream(d2h_stream) in launch_d2h keeps the old StorageImpl
+        # alive in the caching allocator until the D2H copy finishes, avoiding
+        # a per-layer host cudaEventSynchronize stall; the host buffer's own
+        # event orders its reuse instead.
         placeholder = torch.empty(0, dtype=self.tensor.dtype, device=self.tensor.device)
         self.tensor.set_(placeholder.untyped_storage())
         self.stat = "host"
 
     def launch_h2d(self, h2d_stream):
+        """Queue the host-to-GPU restore of ``self.tensor`` on ``h2d_stream``.
+
+        Tags the host buffer with the copy's event, so the pool knows the buffer is
+        still being read until that event fires.
+        """
         if self.stat == "h2d":
             return
         if self.stat != "host":
@@ -299,6 +384,7 @@ class SwapTensor:
                 restored.copy_(self.tensor_cpu, non_blocking=True)
                 self.tensor.set_(restored.untyped_storage(), 0, self.size, self.stride)
                 self.h2d_event.record()
+                self.tensor_cpu._last_swap_event = self.h2d_event
                 self.stat = "h2d"
 
 
@@ -522,12 +608,15 @@ def get_offload_modules(model, plan: List[str]):
     return matched_submodules
 
 
-def _get_no_split_offload_modules(model):
-    target_classes = set(getattr(model, "_no_split_modules", None) or [])
+def _get_auto_offload_modules(model):
+    target_classes = getattr(model, "_activation_offload_target_classes", None)
+    if target_classes is None:
+        target_classes = getattr(model, "_no_split_modules", None)
+    target_classes = set(target_classes or [])
     if not target_classes:
         raise ValueError(
-            "Async activation offload auto-discovery requires model._no_split_modules when "
-            "activation_offload_modules is empty."
+            "Async activation offload auto-discovery requires model._no_split_modules or "
+            "model._activation_offload_target_classes when activation_offload_modules is empty."
         )
 
     matched_submodules = [
@@ -538,7 +627,7 @@ def _get_no_split_offload_modules(model):
     ]
     if not matched_submodules:
         raise ValueError(
-            "Async activation offload did not match any modules listed in model._no_split_modules: "
+            "Async activation offload did not match any modules in the selected target classes: "
             f"{sorted(target_classes)!r}"
         )
 
@@ -718,5 +807,5 @@ def apply_async_activation_offload(
                 f"activation_offload_modules did not match any model modules: {activation_offload_modules!r}"
             )
     else:
-        matched_modules = _get_no_split_offload_modules(model)
+        matched_modules = _get_auto_offload_modules(model)
     async_offload_modules(matched_modules, host_buffer_pool=host_buffer_pool)

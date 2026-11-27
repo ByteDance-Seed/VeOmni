@@ -133,6 +133,7 @@ _MOE_IMPL_BY_CASE: dict[str, str] = {
     "qwen3_5_moe-text-fa2-fused": "fused_triton",
     "qwen3_vl_moe-fa2-fused": "fused_triton",
     "qwen3_omni_moe-fa2-fused": "fused_triton",
+    "minimax_m3_vl-fa2-fused": "fused_triton",
 }
 
 
@@ -321,6 +322,9 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # on-device (no sync) and the omni `get_rope_index` is VeOmni-patched and
     # host-side, so no syncs remain on the production path.
     "qwen2_5_omni-fa2": {},
+    # MiniMax's collator hook supplies image/video grid lists, so the patched
+    # 3D RoPE path does not call ``grid_thw.tolist()`` on the accelerator.
+    "minimax_m3_vl-fa2-fused": {},
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they
@@ -346,6 +350,7 @@ _MM_METADATA_WIRED_CASES: set[str] = {
     "qwen2_vl-fa2",
     "qwen2_5_vl-fa2",
     "qwen2_5_omni-fa2",
+    "minimax_m3_vl-fa2-fused",
 }
 
 
@@ -688,6 +693,28 @@ def test_no_implicit_sync_in_generated_forward(case):
         raise AssertionError(f"[{case.case_id}]\n" + "\n\n".join(problems))
 
 
+def test_minimax_m3_vl_vision_rope_grid_list_has_no_implicit_sync():
+    """Host grid metadata must not cause a GPU readback or blocking coordinate upload."""
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+    from veomni.models.transformers.minimax_m3_vl import modeling_minimax_m3_vl as modeling
+
+    device = get_device_type()
+    grid_list = [[1, 4, 6], [3, 6, 4]]
+    grid = torch.tensor(grid_list, device=device)
+    rope = modeling.MiniMaxM3VL3DRotaryEmbedding(80, spatial_merge_size=2)
+    expected = rope(grid, device, torch.float32)
+    synchronize()
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        actual = rope(grid, device, torch.float32, grid_thw_list=grid_list)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+    for result, ref in zip(actual, expected):
+        torch.testing.assert_close(result, ref, rtol=0, atol=0)
+
+
 # Cases the equivalence test below covers: every multimodal-metadata-wired
 # case. Built once so the parametrize id list and the body agree.
 _MM_EQUIV_CASES = [c for c in CASES if c.case_id in _MM_METADATA_WIRED_CASES]
@@ -902,6 +929,7 @@ _H3_ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
             "which varlen kernels read on device; the DiT itself slices with the host copies."
         ),
     },
+    "image": {},
 }
 
 
@@ -916,7 +944,33 @@ def _to_device_recursive(value, device):
 
 
 def _is_minimax_h3_path(filename: str) -> bool:
-    return "veomni/models/diffusers/minimax_h3/" in filename.replace(os.sep, "/")
+    relpath = _veomni_relpath(filename)
+    return relpath is not None and relpath.startswith(
+        ("veomni/models/diffusers/minimax_h3/", "veomni/models/diffusers/minimax_h3_image/")
+    )
+
+
+def _assert_no_minimax_h3_step_syncs(model, step, mode, attention):
+    step()
+    model.zero_grad(set_to_none=True)
+    synchronize()
+
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("warn")
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            step()
+        captured = [(w.filename, w.lineno) for w in wlist if _SYNC_RE.search(str(w.message))]
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+
+    observed = {(os.path.basename(f), _enclosing_qualname(f, ln)): ln for f, ln in captured if _is_minimax_h3_path(f)}
+    allowed = _H3_ALLOWED_SYNCS[mode]
+    offending = sorted(k for k in observed if k not in allowed)
+    dead = sorted(k for k in allowed if k not in observed)
+    assert not offending, f"New implicit CUDA sync(s) in MiniMax H3 {mode} ({attention}): {offending}"
+    assert not dead, f"Dead MiniMax H3 sync allowlist entries for {mode}: {dead}"
 
 
 @pytest.mark.parametrize("attention", ["sdpa", "veomni_flash_attention_2"])
@@ -953,24 +1007,64 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention, cfg_mo
     def step():
         sum(model(**condition.process_condition(**collated)).loss.values()).backward()
 
-    step()  # warm up lazy kernel loading
-    model.zero_grad(set_to_none=True)
-    synchronize()
+    _assert_no_minimax_h3_step_syncs(model, step, mode, attention)
 
-    prev_mode = torch.cuda.get_sync_debug_mode()
-    captured: list[tuple[str, int]] = []
-    try:
-        torch.cuda.set_sync_debug_mode("warn")
-        with warnings.catch_warnings(record=True) as wlist:
-            warnings.simplefilter("always")
-            step()
-        captured = [(w.filename, w.lineno) for w in wlist if _SYNC_RE.search(str(w.message))]
-    finally:
-        torch.cuda.set_sync_debug_mode(prev_mode)
 
-    observed = {(os.path.basename(f), _enclosing_qualname(f, ln)): ln for f, ln in captured if _is_minimax_h3_path(f)}
-    allowed = _H3_ALLOWED_SYNCS.get(mode, {})
-    offending = sorted(k for k in observed if k not in allowed)
-    dead = sorted(k for k in allowed if k not in observed)
-    assert not offending, f"New implicit CUDA sync(s) in MiniMax H3 {mode} ({attention}): {offending}"
-    assert not dead, f"Dead MiniMax H3 sync allowlist entries for {mode}: {dead}"
+@pytest.mark.parametrize("condition_source", ["cached_references", "post_encode_t2i", "online_raw_t2i"])
+def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source):
+    """Gate cached, post-encode and raw-input H3-Image training steps."""
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+
+    from tests.models.diffusers.test_minimax_h3_image_condition_training import _cached_batch, _condition_model
+    from tests.models.tiny_configs import tiny_minimax_h3_config
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
+        MiniMaxH3DiTModel,
+    )
+
+    device = get_device_type()
+    torch.manual_seed(0)
+    condition = _condition_model().to(device)
+    batch = dict(_cached_batch())
+    raw_inputs = None
+    latents_dim = batch["clean_latents"][0].shape[1]
+    text_dim = batch["prompt_embeds"][0].shape[-1]
+    if condition_source == "cached_references":
+        batch["reference_latents"] = [batch["clean_latents"]]
+        batch = _to_device_recursive(batch, device)
+    elif condition_source == "post_encode_t2i":
+        for name in ("prompt_embeds", "clean_latents"):
+            batch[name] = _to_device_recursive(batch[name], device)
+    else:
+        from PIL import Image
+
+        from tests.models.diffusers.test_minimax_h3_image import _tiny_vae
+
+        class TinyTextEncoder(torch.nn.Embedding):
+            def forward(self, input_ids, attention_mask):
+                return super().forward(input_ids[0])
+
+        condition._tokenizer = lambda *args, **kwargs: {"input_ids": [0, 1, 2]}
+        condition._text_encoder = TinyTextEncoder(3, text_dim, device=device, dtype=torch.bfloat16).eval()
+        condition._vae = _tiny_vae().to(device).eval()
+        latents_dim = condition.vae.config.latent_channels
+        raw_inputs = {"inputs": ["A rectangle"], "images": [[Image.new("RGB", (70, 20), (96, 128, 192))]]}
+    config = tiny_minimax_h3_config(
+        audio_enabled=False,
+        num_pdd_heads=condition.config.num_pdd_heads,
+        condition_model_type=condition.config.model_type,
+        latents_dim=latents_dim,
+        patch_size=(1, 2, 2),
+        text_dim=text_dim,
+    )
+    config._set_ops_implementation(make_eager_ops_config(attn_implementation="sdpa"))
+    model = MiniMaxH3DiTModel(config).to(device)
+    model.freeze_model()
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+
+    def step():
+        conditions = condition.get_condition(**raw_inputs) if raw_inputs is not None else batch
+        loss = model(**condition.process_condition(**conditions)).loss["mse_image"]
+        loss.backward()
+
+    _assert_no_minimax_h3_step_syncs(model, step, "image", "sdpa")

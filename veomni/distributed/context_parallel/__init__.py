@@ -24,11 +24,13 @@ from .sharding import (
     rebase_window_indices,
     window_owner_counts,
 )
+from .support import check_cp_platform_support
 
 
 __all__ = [
     "CompressorShardPlan",
     "all_gather_compressed_rows",
+    "check_cp_platform_support",
     "all_gather_kv",
     "empty_compressed_rows",
     "exchange_compressor_halos",

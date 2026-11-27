@@ -169,7 +169,7 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         args.accelerator.gradient_checkpointing.enable = False
         args.accelerator.torch_compile.enable = False
         # A second PinnedBufferPool on the frozen copy is wasted host RAM.
-        # Load knobs (ep_sharded_stream_load / muon_expert_zero_comm /
+        # Load knobs (extra_parallel_stream_load / muon_expert_zero_comm /
         # fqn_to_index_mapping) stay: the reference materializes the same HF
         # checkpoint as the policy.
         args.accelerator.offload_config.enable_activation = False

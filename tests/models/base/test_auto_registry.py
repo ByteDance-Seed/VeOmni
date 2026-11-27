@@ -45,6 +45,12 @@ from tests.models.tiny_configs import (
     tiny_gpt_oss_config as _tiny_gpt_oss_config,
 )
 from tests.models.tiny_configs import (
+    tiny_kimi_k3_config as _tiny_kimi_k3_config,
+)
+from tests.models.tiny_configs import (
+    tiny_kimi_linear_config as _tiny_kimi_linear_config,
+)
+from tests.models.tiny_configs import (
     tiny_llama_config as _tiny_llama_config,
 )
 from tests.models.tiny_configs import (
@@ -52,6 +58,9 @@ from tests.models.tiny_configs import (
 )
 from tests.models.tiny_configs import (
     tiny_minimax_h3_config as _tiny_minimax_h3_config,
+)
+from tests.models.tiny_configs import (
+    tiny_minimax_m3_vl_config as _tiny_minimax_m3_vl_config,
 )
 from tests.models.tiny_configs import (
     tiny_movqgan_config as _tiny_movqgan_config,
@@ -130,7 +139,6 @@ from veomni.models import (
     get_model_class,
 )
 from veomni.ops import VeomniOp
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 _CPU_LAUNCH = LaunchSpec(device="cpu")
@@ -145,22 +153,24 @@ _STANDALONE_HF_FAMILIES = frozenset(
         "gemma3_text",
         "glm_moe_dsa",
         "gpt_oss",
+        "kimi_k3",
+        "kimi_linear",
         "llama",
         "qwen2",
         "qwen2_5_omni",
-        "qwen2_5_omni_thinker",
         "qwen2_5_omni_text",
+        "qwen2_5_omni_thinker",
         "qwen2_5_vl",
         "qwen2_vl",
         "qwen3",
         "qwen3_5",
-        "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        "qwen3_5_text",
         "qwen3_moe",
         "qwen3_omni_moe",
-        "qwen3_omni_moe_thinker",
         "qwen3_omni_moe_text",
+        "qwen3_omni_moe_thinker",
         "qwen3_vl",
         "qwen3_vl_moe",
         "qwen4_exp",
@@ -206,21 +216,6 @@ class _ModelCase:
     # ops selection stamped before HF construction. Families that keep HF attn
     # as eager leave HF attn as eager; stamping sdpa makes PreTrainedModel reject them.
     stamps_hf_attn: bool = True
-
-
-# NPU glm_moe_dsa indexer keeps Hugging Face scoring and does not bind
-# ``veomni_dsa_indexer``. GPU wiring is covered by the same path below.
-_NPU_ABSENT_EAGER_OPS = frozenset(
-    {
-        "model.layers.0.self_attn.indexer.veomni_dsa_indexer",
-    }
-)
-
-
-def _eager_ops(model_case: _ModelCase) -> tuple[tuple[str, str], ...]:
-    if not IS_NPU_AVAILABLE:
-        return model_case.eager_ops
-    return tuple(item for item in model_case.eager_ops if item[0] not in _NPU_ABSENT_EAGER_OPS)
 
 
 def _tiny_hunyuanvideo15_config(architecture):
@@ -342,6 +337,42 @@ _MODEL_CASES = (
         architectures=("GlmMoeDsaForCausalLM", "GlmMoeDsaModel"),
     ),
     _ModelCase(
+        model_type="kimi_k3",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("language_model.model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("language_model.model.layers.3.self_attn.veomni_attn", "attention"),
+            ("vision_tower.encoder.blocks.0.veomni_attn", "attention"),
+            ("language_model.model.layers.1.self_attn.veomni_chunk_kda", "chunk_kda"),
+            ("language_model.model.layers.1.block_sparse_moe.experts.veomni_moe", "moe_experts"),
+            (
+                "language_model.model.layers.1.block_sparse_moe.experts.act_fn.veomni_situ_and_mul",
+                "situ_and_mul",
+            ),
+        ),
+        # The kimi_k3 moe_experts variant (SituGLU) has no fused_triton row.
+        isolation_op_path="veomni_ce",
+        config_factory=_tiny_kimi_k3_config,
+        architectures=("KimiK3ForConditionalGeneration",),
+        has_registered_config=True,
+    ),
+    _ModelCase(
+        model_type="kimi_linear",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.3.self_attn.veomni_attn", "attention"),
+            ("model.layers.1.self_attn.veomni_chunk_kda", "chunk_kda"),
+            ("model.layers.1.block_sparse_moe.experts.veomni_moe", "moe_experts"),
+            ("model.layers.1.block_sparse_moe.experts.act_fn.veomni_situ_and_mul", "situ_and_mul"),
+        ),
+        # The kimi_k3 moe_experts variant (SituGLU) has no fused_triton row.
+        isolation_op_path="veomni_ce",
+        config_factory=_tiny_kimi_linear_config,
+        architectures=("KimiLinearForCausalLM",),
+        has_registered_config=True,
+    ),
+    _ModelCase(
         model_type="llama",
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
@@ -358,6 +389,21 @@ _MODEL_CASES = (
             "LlamaForSequenceClassification",
             "LlamaModel",
         ),
+    ),
+    _ModelCase(
+        model_type="minimax_m3_vl",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.language_model.layers.0.self_attn.veomni_msa_indexer", "minimax_sparse_indexer"),
+            ("model.language_model.layers.0.self_attn.veomni_msa_attention", "minimax_sparse_attention"),
+            ("model.language_model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
+            ("model.vision_tower.layers.0.self_attn.veomni_attn", "attention"),
+        ),
+        config_factory=_tiny_minimax_m3_vl_config,
+        architectures=("MiniMaxM3SparseForConditionalGeneration",),
+        has_registered_config=True,
+        processor_class_name="MiniMaxM3VLProcessor",
     ),
     _ModelCase(
         model_type="movqgan",
@@ -755,13 +801,11 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
     assert model.config.ops_implementation["rms_norm_implementation"] == "eager"
     assert model.__class__.__name__ == model_case.architectures[0]
     _assert_expected_generated_module_source(model_case.model_type, type(model))
-    for path, expected_op in _eager_ops(model_case):
+    for path, expected_op in model_case.eager_ops:
         op = attrgetter(path)(model)
         assert isinstance(op, VeomniOp), path
         assert op.op == expected_op, path
         assert op.impl == "eager", path
-    if IS_NPU_AVAILABLE and model_case.model_type == "glm_moe_dsa":
-        assert not hasattr(model.model.layers[0].self_attn.indexer, "veomni_dsa_indexer")
 
 
 _ALTERNATE_OP_IMPLS = {
@@ -902,10 +946,11 @@ def test_context_parallel_is_refused_on_npu(monkeypatch: pytest.MonkeyPatch):
     from types import SimpleNamespace
 
     import veomni.models.auto as auto
+    from veomni.distributed.context_parallel import support as cp_support
 
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True))
-    monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", True)
     with pytest.raises(NotImplementedError, match="GPU-only"):
         check_context_parallel_supported(_tiny_qwen3_config())
 

@@ -27,6 +27,27 @@ from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 logger = logging.get_logger(__name__)
 
 
+def _local_extra_parallel_parameter(param: nn.Parameter, shard: Shard, para_size: int, para_rank: int) -> nn.Parameter:
+    """Return this rank's ExtraParallel shard in place without going through DTensor.
+
+    ``DTensor.from_local`` on a CUDA mesh materializes CPU/meta tensors prematurely
+    or keeps global storage size on meta tensors.
+    """
+    dim = shard.dim
+    size = param.size(dim)
+    if size % para_size != 0:
+        raise ValueError(
+            f"ExtraParallel shard dim {dim} of shape {tuple(param.shape)} is not divisible by {para_size}."
+        )
+    local_size = size // para_size
+    if param.is_meta:
+        local_shape = list(param.shape)
+        local_shape[dim] = local_size
+        return nn.Parameter(param.data.new_empty(local_shape), requires_grad=param.requires_grad)
+    local_data = param.data.narrow(dim, para_rank * local_size, local_size).contiguous()
+    return nn.Parameter(local_data, requires_grad=param.requires_grad)
+
+
 @dataclass
 class SpecInfo:
     para_name: str  # name of the ExtraParallel this fqn belongs to
@@ -140,10 +161,6 @@ class ParallelPlan:
                             logger.info_rank0(
                                 f"{para} sharding: slicing param {fqn} along {para}_mesh with placement {para_placement}"
                             )
-                            dtensor = DTensor.from_local(
-                                local_tensor=param.data, device_mesh=target_mesh, placements=source_placement
-                            )
-                            dtensor = dtensor.redistribute(device_mesh=target_mesh, placements=para_placement)
                             spec_info = SpecInfo(
                                 para_name=para,
                                 para_fsdp_mesh=para_fsdp_mesh,
@@ -152,9 +169,21 @@ class ParallelPlan:
                                 persistent_fsdp_shard_dim=persistent_fsdp_shard_dim,
                             )
                             if persistent_fsdp_shard_dim is not None:
+                                dtensor = DTensor.from_local(
+                                    local_tensor=param.data, device_mesh=target_mesh, placements=source_placement
+                                )
+                                dtensor = dtensor.redistribute(device_mesh=target_mesh, placements=para_placement)
                                 local_chunk = torch.nn.Parameter(dtensor, requires_grad=param.requires_grad)
                             else:
-                                local_chunk = torch.nn.Parameter(dtensor.to_local(), requires_grad=param.requires_grad)
+                                from .parallel_state import get_parallel_state
+
+                                para_rank = get_parallel_state().extra_parallel_rank(para)
+                                local_chunk = _local_extra_parallel_parameter(param, shard, para_size, para_rank)
+                                logger.info_rank0(
+                                    f"{para} sharding: {fqn} {tuple(param.shape)} {param.dtype} "
+                                    f"is_meta={param.is_meta} -> local {tuple(local_chunk.shape)} "
+                                    f"(rank {para_rank}/{para_size})"
+                                )
                             local_chunk.spec_info = spec_info
                             set_module_from_path(model, fqn, local_chunk)
                             fqn2spec_info[fqn] = spec_info

@@ -40,7 +40,7 @@ __all__ = [
 
 #: ``linear`` rows that fake-quantize the weight they are handed, and therefore
 #: cannot fall back to calling a wrapped projection module.
-QUANTIZING_IMPLS = frozenset({"qat", "torchao"})
+QUANTIZING_IMPLS = frozenset({"qat", "torchao", "deepgemm"})
 
 
 def resolve_projection(

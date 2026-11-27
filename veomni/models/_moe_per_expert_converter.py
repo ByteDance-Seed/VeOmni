@@ -29,7 +29,7 @@ their ``weight_scale_inv`` companions are not applied here, so a cast would
 silently load wrong weights.
 
 The converter also implements the optional ``fused_expert_target`` /
-``for_expert_range`` capabilities, so ``ep_sharded_stream_load`` streams these
+``for_expert_range`` capabilities, so ``extra_parallel_stream_load`` streams these
 checkpoints with each EP rank reading only its own experts.
 """
 

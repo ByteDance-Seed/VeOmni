@@ -27,20 +27,40 @@ from . import eager as _eager
 
 @dataclass(frozen=True)
 class _Meta:
-    """Whether the empty-tensor path ran, plus ``eps`` for the eager fallback."""
+    """Whether the eager path ran, plus ``eps`` for that fallback."""
 
     empty: bool
     eps: float
+    use_eager: bool = False
+
+
+def _eager_fallback(x: Tensor, weight: Tensor, eps: float) -> tuple[Tensor, SavedState]:
+    """Run the eager pair and keep its saved tensors for backward."""
+    output, saved = _eager.forward(x, weight, eps=eps)
+    eager_meta = saved.metadata
+    assert isinstance(eager_meta, _eager._Meta)
+    return output, SavedState(saved.tensors, _Meta(eager_meta.empty, eps, use_eager=True))
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
-    """NPU fused affine RMSNorm (offset 0).
+    """NPU fused affine RMSNorm (offset 0) under a same-dtype contract.
 
-    Empty ``x`` falls back to the eager pair. Otherwise saves ``(x, weight, rstd)``.
+    Non-empty ``x`` and ``weight`` must share one dtype: ``aclnnRmsNorm`` has
+    no mixed-dtype overload, so misaligned inputs are rejected instead of
+    being silently cast (callers align on their side). Empty ``x``, and
+    tensors that are not on NPU, fall back to the eager pair. The row is
+    chosen from the host, so a CPU activation on an NPU machine must not
+    enter ``npu_rms_norm``. Otherwise saves ``(x, weight, rstd)``.
     """
     if x.numel() == 0:
-        output, saved = _eager.forward(x, weight, eps=eps)
-        return output, SavedState(saved.tensors, _Meta(True, eps))
+        return _eager_fallback(x, weight, eps)
+    if x.dtype != weight.dtype:
+        raise TypeError(
+            "rms_norm/torch_npu requires x and weight to share one dtype "
+            f"(got x={x.dtype}, weight={weight.dtype}); cast on the caller side."
+        )
+    if x.device.type != "npu":
+        return _eager_fallback(x, weight, eps)
 
     import torch_npu
 
@@ -53,8 +73,8 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, weight, *optional_rstd = saved.tensors
-    if meta.empty:
-        return _eager.backward(grad_output, SavedState((x, weight), _eager._Meta(True, meta.eps)))
+    if meta.use_eager:
+        return _eager.backward(grad_output, SavedState(saved.tensors, _eager._Meta(meta.empty, meta.eps)))
 
     import torch_npu
 

@@ -112,11 +112,16 @@ class AllToAllEmbedding(torch.autograd.Function):
 
         # Look up the received ids in this rank's shard.
         local_indices = recv_ids - emb_rank * vocab_size_per_rank
-        embs = F.embedding(local_indices, embedding_table)
+        if embedding_table.device != local_indices.device:
+            embs = F.embedding(local_indices.to(embedding_table.device), embedding_table).to(
+                input_flat.device, non_blocking=True
+            )
+        else:
+            embs = F.embedding(local_indices, embedding_table)
 
         # 3rd collective: send the embeddings back.
         if sharded:
-            embs_recv = torch.empty(num_input_ids, embedding_dim, dtype=embs.dtype, device=embs.device)
+            embs_recv = torch.empty(num_input_ids, embedding_dim, dtype=embs.dtype, device=input_flat.device)
             dist.all_to_all_single(
                 embs_recv,
                 embs.contiguous(),
@@ -128,7 +133,7 @@ class AllToAllEmbedding(torch.autograd.Function):
             embs_recv = embs
 
         # Restore the input order.
-        output = torch.empty(num_input_ids, embedding_dim, dtype=embs.dtype, device=embs.device)
+        output = torch.empty(num_input_ids, embedding_dim, dtype=embs.dtype, device=input_flat.device)
         if num_input_ids > 0:
             output[full_rank_index] = embs_recv
         output = output.view(*raw_shape, embedding_dim)
@@ -138,6 +143,7 @@ class AllToAllEmbedding(torch.autograd.Function):
         ctx.sharded = sharded
         ctx.embedding_table_shape = embedding_table.shape
         ctx.embedding_table_dtype = embedding_table.dtype
+        ctx.embedding_table_device = embedding_table.device
         ctx.receive_rank_count_list = receive_rank_count_list
         ctx.send_rank_count_list = send_rank_count_list
         return output
@@ -165,8 +171,9 @@ class AllToAllEmbedding(torch.autograd.Function):
         else:
             grad_recv_buf = grad_send_buf
 
+        table_device = ctx.embedding_table_device
         grad_embedding_table = torch.zeros(
-            ctx.embedding_table_shape, device=grad_output.device, dtype=ctx.embedding_table_dtype
+            ctx.embedding_table_shape, device=table_device, dtype=ctx.embedding_table_dtype
         )
         if grad_recv_buf.numel() > 0:
             # Accumulate in at least fp32 (frequent tokens sum many rows into one), but
@@ -176,7 +183,11 @@ class AllToAllEmbedding(torch.autograd.Function):
             rows, inverse = torch.unique(local_indices.long(), return_inverse=True)
             row_grads = torch.zeros(rows.numel(), embedding_dim, device=grad_output.device, dtype=accum_dtype)
             row_grads.index_add_(0, inverse, grad_recv_buf.to(accum_dtype))
-            grad_embedding_table.index_copy_(0, rows, row_grads.to(ctx.embedding_table_dtype))
+            grad_embedding_table.index_copy_(
+                0,
+                rows.to(table_device),
+                row_grads.to(device=table_device, dtype=ctx.embedding_table_dtype),
+            )
 
         # Gradients for (group, input_tensor, embedding_table)
         return None, None, grad_embedding_table

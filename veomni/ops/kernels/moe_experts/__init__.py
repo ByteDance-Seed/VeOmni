@@ -31,6 +31,8 @@ from ...platform import (
 from ...registry import register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
+from .kimi_k3 import eager as kimi_k3_eager
+from .kimi_k3 import fused_npu as kimi_k3_fused_npu
 from .shared import unpermute
 from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
@@ -39,6 +41,9 @@ from .standard import npu as standard_npu
 from .standard import qat as standard_qat
 from .standard import quack as standard_quack
 from .standard import triton as standard_triton
+from .swiglu_oai import eager as swiglu_oai_eager
+from .swiglu_oai import npu as swiglu_oai_npu
+from .swiglu_oai import triton as swiglu_oai_triton
 
 
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
@@ -176,4 +181,53 @@ register_op(
     wrapper=gpt_oss_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("quack",),
+)
+
+
+register_op(
+    "moe_experts",
+    "kimi_k3",
+    "eager",
+    description="PyTorch routed SituGLU MoE experts (Kimi K3)",
+    wrapper=kimi_k3_eager.wrapper,
+)
+
+register_op(
+    "moe_experts",
+    "kimi_k3",
+    "fused_npu",
+    description="NPU group-GEMM situ fused MoE experts (Kimi K3 SituGLU, EP-aware)",
+    wrapper=kimi_k3_fused_npu.wrapper,
+    requirement=NpuKernelRequirement(),
+    requires=("triton",),
+    default=True,
+)
+
+register_op(
+    "moe_experts",
+    "swiglu_oai",
+    "eager",
+    description="PyTorch SwiGLU-OAI MoE experts with merged gate/up weights",
+    wrapper=swiglu_oai_eager.wrapper,
+)
+
+register_op(
+    "moe_experts",
+    "swiglu_oai",
+    "fused_triton",
+    description="Triton grouped-GEMM SwiGLU-OAI MoE experts",
+    wrapper=swiglu_oai_triton.wrapper,
+    requirement=_GPU_SM70_OR_ROCM,
+    requires=("triton",),
+    default=True,
+)
+
+register_op(
+    "moe_experts",
+    "swiglu_oai",
+    "fused_npu",
+    description="torch_npu grouped-GEMM SwiGLU-OAI MoE experts",
+    wrapper=swiglu_oai_npu.wrapper,
+    requirement=NpuKernelRequirement(),
+    default=True,
 )

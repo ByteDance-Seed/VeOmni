@@ -58,6 +58,34 @@ def _get_exact_token_id(tokenizer: "PreTrainedTokenizer", token: str, fallback_t
     raise ValueError(f"Cannot find token ({token_names}) in tokenizer vocab.")
 
 
+def _prepare_vlm_media_inputs(
+    sample: Dict[str, Any], processor: "ProcessorMixin", **kwargs
+) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Any]:
+    """Load and tensorize image/video inputs through a model's HF processor."""
+    from .multimodal.image_utils import fetch_images
+    from .multimodal.video_utils import fetch_videos_metadata
+
+    image_inputs, video_inputs = {}, {}
+    video_metadata = None
+
+    if sample.get("images"):
+        images = fetch_images(sample["images"], **kwargs)
+        image_inputs = processor.image_processor(images=images, return_tensors="pt")
+
+    if sample.get("videos"):
+        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
+        video_inputs = processor.video_processor(
+            videos=videos,
+            video_metadata=metadata,
+            do_sample_frames=False,
+            return_tensors="pt",
+            return_metadata=True,
+        )
+        video_metadata = video_inputs.pop("video_metadata", None)
+
+    return image_inputs, video_inputs, video_metadata
+
+
 def build_data_transform(transform_name: str, **kwargs) -> Callable:
     return partial(DATA_TRANSFORM_REGISTRY[transform_name], **kwargs)
 
@@ -324,9 +352,7 @@ def _process_sample_qwen_vl_base(
     **kwargs,
 ):
     """Prepare Qwen-VL media and conversations while preserving supervision."""
-    from .multimodal.image_utils import fetch_images
     from .multimodal.preprocess import conv_preprocess_qwen_vl as conv_preprocess
-    from .multimodal.video_utils import fetch_videos_metadata
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
 
@@ -336,31 +362,17 @@ def _process_sample_qwen_vl_base(
         conversations = sample
     conversations = conv_preprocess(source, conversations, **kwargs)
 
-    token_num_inputs, image_inputs, video_inputs = {}, {}, {}
-    image_grid_thw, video_grid_thw = None, None
-    video_metadata = None
+    token_num_inputs = {}
+    image_inputs, video_inputs, video_metadata = _prepare_vlm_media_inputs(sample, processor, **kwargs)
+    image_grid_thw = image_inputs["image_grid_thw"] if image_inputs else None
+    video_grid_thw = video_inputs["video_grid_thw"] if video_inputs else None
 
-    if "images" in sample and sample["images"]:
-        images = fetch_images(sample["images"], **kwargs)
-        image_inputs = processor.image_processor(images=images, return_tensors="pt")
-        image_grid_thw = image_inputs["image_grid_thw"]
+    if image_grid_thw is not None:
         merge_length = processor.image_processor.merge_size**2
         image_token_num = image_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["image"] = image_token_num
 
-    if "videos" in sample and sample["videos"]:
-        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
-        # Fetch already sampled the frames. Preserve its source indices/FPS for timestamps.
-        video_inputs = processor.video_processor(
-            videos=videos,
-            video_metadata=metadata,
-            do_sample_frames=False,
-            return_tensors="pt",
-            return_metadata=True,
-        )
-        video_grid_thw = video_inputs["video_grid_thw"]
-        video_metadata = video_inputs.pop("video_metadata", None)
-
+    if video_grid_thw is not None:
         merge_length = processor.video_processor.merge_size**2
         video_token_num = video_grid_thw.prod(dim=-1) // merge_length
         token_num_inputs["video"] = video_token_num
@@ -445,6 +457,49 @@ def process_sample_qwen_vl(
         position_id_func,
         **kwargs,
     )
+
+
+@DATA_TRANSFORM_REGISTRY.register("minimax_m3_vl")
+def process_sample_minimax_m3_vl(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    **kwargs,
+):
+    """Prepare MiniMax M3 VL image/video inputs and packed 1-D text labels."""
+    from .multimodal import conv_preprocess
+
+    source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
+    if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
+        conversations = sample["conversations"]
+    else:
+        conversations = sample
+    conversations = conv_preprocess(source, conversations, **kwargs)
+
+    image_inputs, video_inputs, video_metadata = _prepare_vlm_media_inputs(sample, processor, **kwargs)
+
+    tokenized_example = chat_template.encode_messages(
+        conversations,
+        processor=processor,
+        image_inputs=image_inputs,
+        video_inputs=video_inputs,
+        video_metadata=video_metadata,
+    )
+    tokenized_example = {
+        key: value if isinstance(value, torch.Tensor) else torch.tensor(value)
+        for key, value in tokenized_example.items()
+    }
+
+    input_ids = tokenized_example["input_ids"]
+    image_mask = input_ids == chat_template.image_token_id
+    video_mask = input_ids == chat_template.video_token_id
+    tokenized_example["image_mask"] = image_mask
+    tokenized_example["video_mask"] = video_mask
+    tokenized_example["labels"][image_mask | video_mask] = IGNORE_INDEX
+    tokenized_example["position_ids"] = torch.arange(input_ids.numel(), dtype=torch.long)
+    tokenized_example.update(image_inputs)
+    tokenized_example.update(video_inputs)
+    return [tokenized_example]
 
 
 @DATA_TRANSFORM_REGISTRY.register("gemma3")
@@ -682,4 +737,92 @@ def process_sample_qwen_omni(
             user_i += 1
         labels[assis_i + 2 : user_start_index[user_i] - 1] = input_ids[assis_i + 2 : user_start_index[user_i] - 1]
     model_inputs["labels"] = labels
+    return [model_inputs]
+
+
+@DATA_TRANSFORM_REGISTRY.register("kimi_k3")
+def process_sample_kimi_k3(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    position_id_func: "Callable",
+    max_seq_len: int = 8192,
+    **kwargs,
+):
+    """Kimi K3 multimodal processing (single image + caption).
+
+    One ``<|media_pad|>`` per merged vision token (the pre-expanded form):
+    the image is preprocessed first so ``grid_thws`` fixes the merged patch
+    count, and that many ``<|media_pad|>`` tokens are materialized inline in
+    the text. ``tpool_patch_merger`` in the modeling pools (averages) the
+    temporal axis instead of concatenating it, so an image contributes
+    ``(h // mh) * (w // mw)`` merged tokens regardless of ``t``.
+    The merge inside the modeling is then length-preserving
+    (masked_scatter of the projected features onto the pad slots), which
+    keeps the collator's packed position_ids / cu_seq_lens and the SP label
+    pre-shift valid. Labels supervise only the caption tail (everything up
+    to and including ``<|media_end|>`` is masked, which also covers the
+    expanded media span). Position ids come from the collator (per-sample
+    arange; the modeling itself is NoPE / divided-fixed), so
+    ``position_id_func`` is accepted but unused.
+    """
+    from .multimodal.image_utils import load_image_from_path
+
+    caption = str(sample.get("caption", "")).strip()
+    if not caption:
+        return []
+
+    image = load_image_from_path(str(sample["image"])).convert("RGB")
+    image_processor = getattr(processor, "image_processor", processor)
+    out = image_processor.preprocess([{"type": "image", "image": image}], return_tensors="pt")
+    grid_thws = out["grid_thws"]
+
+    merge_size = getattr(image_processor, "merge_size", None) or (2, 2)
+    mh, mw = int(merge_size[0]), int(merge_size[1])
+    # The vision tower's tpool_patch_merger AVERAGES over the temporal axis
+    # (t is pooled, not concatenated), so an image contributes
+    # (h // mh) * (w // mw) merged tokens regardless of t -- the prod-based
+    # count would multiply in t and overshoot the pad slots for multi-frame
+    # grids. (h % mh != 0 already raises inside tpool_patch_merger, so no
+    # extra guard is needed here.)
+    num_pads = int(((grid_thws[:, 1] // mh) * (grid_thws[:, 2] // mw)).sum().item())
+
+    width = int(sample["width"])
+    height = int(sample["height"])
+    text = f"<|media_begin|>image {width}x{height}<|media_content|>{'<|media_pad|>' * num_pads}<|media_end|> {caption}"
+
+    tokenizer = getattr(processor, "tokenizer", None) or getattr(chat_template, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError(
+            "kimi_k3 transform needs a tokenizer (processor.tokenizer or chat_template.tokenizer); "
+            "check model.tokenizer_path points at the kimi_k3_hf repository."
+        )
+    media_end_id = tokenizer.encode("<|media_end|>")[0]
+    input_ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
+    media_end_pos = input_ids.index(media_end_id)
+    labels = [-100] * (media_end_pos + 1) + input_ids[media_end_pos + 1 :]
+
+    if len(input_ids) > max_seq_len:
+        # Truncate the caption tail only: a cut into the media span would
+        # desynchronize input_ids from the published grid_thws (the merge
+        # scatters exactly (h // mh) * (w // mw) features per image onto the
+        # pad slots).
+        if media_end_pos + 1 >= max_seq_len:
+            raise ValueError(
+                f"Kimi K3 max_seq_len ({max_seq_len}) truncated the media span "
+                f"(the {num_pads} media_pad tokens end at position {media_end_pos}); "
+                "the sample needs a larger max_seq_len."
+            )
+        input_ids = input_ids[:max_seq_len]
+        labels = labels[:max_seq_len]
+
+    model_inputs = {
+        # 1-D per-sample tensors: MainCollator packs along dim=-1 then unsqueezes
+        # dim 0, so 2-D per-sample tensors would produce a 3-D packed batch.
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+        "pixel_values": out["pixel_values"],
+        "grid_thws": grid_thws,
+    }
     return [model_inputs]

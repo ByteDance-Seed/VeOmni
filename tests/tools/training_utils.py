@@ -180,7 +180,10 @@ def make_eager_ops_config(**overrides) -> OpsImplementationConfig:
         load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),
         rms_norm_gated_implementation=overrides.pop("rms_norm_gated_implementation", "eager"),
         causal_conv1d_implementation=overrides.pop("causal_conv1d_implementation", "eager"),
+        minimax_sparse_attention_implementation=overrides.pop("minimax_sparse_attention_implementation", "eager"),
         chunk_gated_delta_rule_implementation=overrides.pop("chunk_gated_delta_rule_implementation", "eager"),
+        situ_and_mul_implementation=overrides.pop("situ_and_mul_implementation", "eager"),
+        chunk_kda_implementation=overrides.pop("chunk_kda_implementation", "eager"),
         **overrides,
     )
 

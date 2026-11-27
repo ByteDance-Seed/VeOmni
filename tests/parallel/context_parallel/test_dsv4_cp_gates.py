@@ -45,6 +45,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.distributed import parallel_state as parallel_state_module
+from veomni.distributed.context_parallel import support as cp_support
 from veomni.models import auto as auto_module
 from veomni.models.auto import build_config, check_context_parallel_supported
 
@@ -53,16 +54,17 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _enable_npu_cp(monkeypatch):
-    # The DSA-vs-parallel-state check now runs in the builder gate, so only
-    # ``auto``'s copies of these three names matter.
+    # The platform check lives next to the collectives, so only that module's
+    # ``IS_NPU_AVAILABLE`` matters. ``auto`` still owns the parallel-state gate.
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto_module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, global_rank=0))
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", True)
 
 
 def _npu_ops_for_cp() -> dict:
-    # Only the pair the gate admits matters here; a real CP run is the shipped NPU
-    # config with these two fields switched to ``eager``.
+    # The DSA selections ``eager`` and ``cann`` are both admitted under CP. The
+    # tests below start from ``eager`` and swap a field to ``cann`` (the shipped
+    # value) or to a rejected one.
     return {"dsa_indexer_implementation": "eager", "dsa_attention_implementation": "eager"}
 
 
@@ -98,7 +100,7 @@ def test_gate_rejects_context_parallel_on_npu(monkeypatch):
         "get_parallel_state",
         lambda: SimpleNamespace(cp_enabled=True),
     )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", True)
 
     with pytest.raises(NotImplementedError, match="GPU-only"):
         check_context_parallel_supported(SimpleNamespace(model_type="qwen4_exp"))
@@ -111,10 +113,27 @@ def test_gate_allows_npu_dsv4_cp_with_eager_dsa_ops(monkeypatch):
 
 
 @pytest.mark.parametrize("field", ["dsa_indexer_implementation", "dsa_attention_implementation"])
-def test_gate_rejects_npu_dsv4_cp_with_a_non_cp_aware_dsa_operator(monkeypatch, field):
+def test_gate_allows_npu_dsv4_cp_with_cann_dsa_ops(monkeypatch, field):
+    """The CANN adapters take the query offset, so they serve CP's geometry too."""
     _enable_npu_cp(monkeypatch)
     ops = _npu_ops_for_cp()
     ops[field] = "cann"
+
+    check_context_parallel_supported(_dsv4_with_ops(ops))
+
+
+def test_gate_allows_npu_dsv4_cp_with_both_cann_dsa_ops(monkeypatch):
+    _enable_npu_cp(monkeypatch)
+    ops = dict.fromkeys(_npu_ops_for_cp(), "cann")
+
+    check_context_parallel_supported(_dsv4_with_ops(ops))
+
+
+@pytest.mark.parametrize("field", ["dsa_indexer_implementation", "dsa_attention_implementation"])
+def test_gate_rejects_npu_dsv4_cp_with_a_non_cp_aware_dsa_operator(monkeypatch, field):
+    _enable_npu_cp(monkeypatch)
+    ops = _npu_ops_for_cp()
+    ops[field] = "tilelang"
 
     with pytest.raises(NotImplementedError, match=field):
         check_context_parallel_supported(_dsv4_with_ops(ops))
@@ -126,7 +145,7 @@ def test_gate_rejects_a_native_config_adapted_by_the_builder(monkeypatch):
     load_model = Mock(return_value=torch.nn.Identity())
     monkeypatch.setattr(auto_module, "get_loader", lambda config: SimpleNamespace(load_model=load_model))
     ops = _npu_ops_for_cp()
-    ops["dsa_attention_implementation"] = "cann"
+    ops["dsa_attention_implementation"] = "tilelang"
 
     with pytest.raises(NotImplementedError, match="dsa_attention_implementation"):
         auto_module.build_foundation_model(
@@ -157,7 +176,7 @@ def test_gate_allows_context_parallel_models_on_gpu(monkeypatch, model_type):
         "get_parallel_state",
         lambda: SimpleNamespace(cp_enabled=True),
     )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", False)
 
     check_context_parallel_supported(SimpleNamespace(model_type=model_type))
 
@@ -173,7 +192,7 @@ def test_gate_allows_seed_omni_module_config_under_cp(monkeypatch):
         "get_parallel_state",
         lambda: SimpleNamespace(cp_enabled=True),
     )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(cp_support, "IS_NPU_AVAILABLE", False)
 
     # TextEncoderConfig explicitly opts in via _supports_context_parallel = True.
     check_context_parallel_supported(TextEncoderConfig(vocab_size=64, hidden_size=16))
