@@ -47,6 +47,9 @@ def wrapper(
     from flash_qla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     del chunk_size, cu_seqlens_list, chunk_indices, chunk_indices_list
+    cu_opt = optional_tensor(cu_seqlens)
+    if cu_opt is not None and cu_opt.device != query.device:
+        cu_opt = cu_opt.to(device=query.device, non_blocking=True)
     return chunk_gated_delta_rule(
         query,
         key,
@@ -57,5 +60,5 @@ def wrapper(
         initial_state=optional_tensor(initial_state),
         output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        cu_seqlens=optional_tensor(cu_seqlens),
+        cu_seqlens=cu_opt,
     )

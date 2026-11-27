@@ -696,9 +696,9 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     calls = []
     original = swiglu.merged_swiglu_forward
 
-    def record(gate_input, up):
+    def record(gate_input, up, alpha=None):
         calls.append(gate_input.shape)
-        return original(gate_input, up)
+        return original(gate_input, up, alpha)
 
     def run():
         inputs = [value.detach().clone().requires_grad_() for value in (x, gate, w1, w2)]
@@ -726,9 +726,11 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     ep_grads = torch.autograd.grad(ep_out.float().square().mean(), ep_inputs)
     assert calls == [(tokens * top_k, intermediate), (tokens, intermediate)]
 
-    monkeypatch.setattr(swiglu, "merged_swiglu_forward", lambda gate_input, up: torch.ops.aten.silu(gate_input) * up)
+    monkeypatch.setattr(
+        swiglu, "merged_swiglu_forward", lambda gate_input, up, alpha=None: torch.ops.aten.silu(gate_input) * up
+    )
 
-    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None):
+    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None, alpha=None):
         silu = torch.ops.aten.silu(gate_input)
         grad_gate = torch.ops.aten.silu_backward(grad * up, gate_input)
         grad_up = silu * grad

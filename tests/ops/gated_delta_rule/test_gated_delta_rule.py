@@ -1046,3 +1046,42 @@ def test_fla_npu_grouped_value_heads_match_expanded_reference(packed: bool, key_
             rtol=GDN_CHUNK_GRAD_RTOL,
             msg=f"{name} gradient does not match the expanded reference",
         )
+
+
+def test_fla_npu_as_int_list_caches_tensor_conversion_across_layers():
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
+
+    fla_npu._HOST_CU_SEQLENS_LIST_CACHE.clear()
+
+    class _TrackedTensor(torch.Tensor):
+        tolist_calls = 0
+
+        def tolist(self):
+            type(self).tolist_calls += 1
+            return super().tolist()
+
+    cu = torch.tensor([0, 4, 10], dtype=torch.int32).as_subclass(_TrackedTensor)
+    first = fla_npu._as_int_list(cu)
+    second = fla_npu._as_int_list(cu)
+    assert first == [0, 4, 10]
+    assert second == [0, 4, 10]
+    assert _TrackedTensor.tolist_calls == 1
+
+    # In-place mutation increments tensor._version and forces a refresh.
+    cu[1] = 5
+    third = fla_npu._as_int_list(cu)
+    assert third == [0, 5, 10]
+    assert _TrackedTensor.tolist_calls == 2
+    fla_npu._HOST_CU_SEQLENS_LIST_CACHE.clear()
+
+
+def test_fla_npu_as_int_list_accepts_inference_tensors():
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
+
+    fla_npu._HOST_CU_SEQLENS_LIST_CACHE.clear()
+    with torch.inference_mode():
+        cu = torch.tensor([0, 4, 10], dtype=torch.int32)
+    assert cu.is_inference()
+    assert fla_npu._as_int_list(cu) == [0, 4, 10]
+    assert fla_npu._as_int_list(cu) == [0, 4, 10]
+    fla_npu._HOST_CU_SEQLENS_LIST_CACHE.clear()
