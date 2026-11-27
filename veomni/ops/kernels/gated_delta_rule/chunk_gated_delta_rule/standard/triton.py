@@ -220,8 +220,8 @@ def forward(
     if cu_seqlens is None:
         cu_seqlens = unused_like(query, dtype=torch.int32)
     elif cu_seqlens.device != query.device:
-        # ``veomni.models.auto`` leaves ``cu_seq_lens_q`` on CPU for NPU fusion
-        # attention. This kernel indexes ``cu_seqlens`` on ``query.device``.
+        # Host-resident ``cu_seqlens`` can arrive from collators or tests;
+        # this kernel indexes ``cu_seqlens`` on ``query.device``.
         cu_seqlens = cu_seqlens.to(device=query.device, non_blocking=True)
 
     if query.dtype != key.dtype or key.dtype != value.dtype:

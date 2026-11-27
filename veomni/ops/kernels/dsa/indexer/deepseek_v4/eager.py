@@ -55,6 +55,8 @@ def wrapper(
     cu_seqlen_ks: Tensor | None = None,
     cu_seqlen_ke: Tensor | None = None,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
+    position_ids: Tensor | None = None,
+    require_score_grad: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Compute HF-aligned index scores and selected compressed-KV indices.
 
@@ -63,10 +65,11 @@ def wrapper(
     with shape ``[B, S, K]``. ``K`` is the supplied ``topk_indices`` width when
     present; otherwise it is ``min(topk, S_kv)``. Without ``cu_seqlen_ks`` /
     ``cu_seqlen_ke``, query row ``t`` sees compressed entries
-    ``[0, (t + 1) // compress_ratio)``. ``packed_sequence_slices`` names the
-    query segments those ranges came from and is unused here.
+    ``[0, (position_ids[t] + 1) // compress_ratio)`` (defaulting to
+    ``position_ids = arange(S)``). ``packed_sequence_slices`` names the query
+    segments those ranges came from and is unused here.
     """
-    del packed_sequence_slices
+    del packed_sequence_slices, require_score_grad
     if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
 
@@ -86,8 +89,13 @@ def wrapper(
     index_scores = (scores * eager_weights.float().unsqueeze(-1)).sum(dim=2)
 
     if cu_seqlen_ks is None:
-        position_ids = torch.arange(seq_len, device=q.device).unsqueeze(0).expand(batch, -1)
-        causal_threshold = (position_ids + 1) // compress_ratio
+        if position_ids is None:
+            positions = torch.arange(seq_len, device=q.device).unsqueeze(0).expand(batch, -1)
+        else:
+            positions = position_ids.to(device=q.device)
+            if positions.shape[0] == 1 and batch > 1:
+                positions = positions.expand(batch, -1)
+        causal_threshold = (positions + 1) // compress_ratio
         if compressed_len > 0:
             entry_indices = torch.arange(compressed_len, device=index_scores.device)
             future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)

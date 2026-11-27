@@ -271,9 +271,20 @@ def _no_ep_expert_layout(key, tensor, parallel_state, ordinary_fqns=(), shared_l
         or (dist.is_initialized() and dist.get_world_size() != 1)
     ):
         return None
+    shared_lora = _key_belongs_to_fqns(key, shared_lora_fqns)
     if not isinstance(tensor, DTensor):
         if any(size != 1 for size in parallel_state.extra_parallel_sizes.values()):
-            return None
+            # A plain tensor is a complete shared adapter only when the runtime
+            # proved its replicated ownership and its EP hook covers every rank.
+            if not (
+                ordinary
+                and shared_lora
+                and parallel_state.extra_parallel_only
+                and parallel_state.ep_enabled
+                and dist.is_initialized()
+                and dist.get_world_size(parallel_state.ep_group) == dist.get_world_size()
+            ):
+                return None
         return {
             "ep_shard_dim": None,
             "fsdp_shard_dim": None,
@@ -298,7 +309,6 @@ def _no_ep_expert_layout(key, tensor, parallel_state, ordinary_fqns=(), shared_l
     )
     # Only the shared-LoRA wrapper installs the cross-EP gradient hooks needed
     # to keep replicas on complementary FSDP meshes consistent.
-    shared_lora = _key_belongs_to_fqns(key, shared_lora_fqns)
     ep_mesh = parallel_state.extra_parallel_fsdp_device_mesh.get("ep")
     replicated_extra_fsdp = (
         ordinary and shared_lora and ep_mesh is not None and mesh == ep_mesh[ep_mesh.mesh_dim_names[:-1]]

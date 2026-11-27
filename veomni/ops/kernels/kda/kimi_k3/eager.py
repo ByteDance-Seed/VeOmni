@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025-2026 The Moonshot AI Team. All rights reserved.
 """Eager reference kernels for Kimi-K3 linear attention (ops side).
 
@@ -233,7 +232,7 @@ def _chunk_kda_core(
     V = v.shape[-1]
 
     # switch to head-first layout [B, H, T, D]
-    q, k, v, g, beta = [x.transpose(1, 2).contiguous() for x in (q, k, v, g, beta)]
+    q, k, v, g, beta = (x.transpose(1, 2).contiguous() for x in (q, k, v, g, beta))
 
     # pad to a multiple of chunk_size
     pad_size = (chunk_size - T % chunk_size) % chunk_size
@@ -248,7 +247,7 @@ def _chunk_kda_core(
     k_beta = k * beta.unsqueeze(-1)
 
     # reshape to [B, H, NT, C, D]
-    q, k, v, g, k_beta, v_beta = [x.reshape(B, H, -1, chunk_size, x.shape[-1]) for x in (q, k, v, g, k_beta, v_beta)]
+    q, k, v, g, k_beta, v_beta = (x.reshape(B, H, -1, chunk_size, x.shape[-1]) for x in (q, k, v, g, k_beta, v_beta))
     NT = q.shape[2]
 
     # chunk-local cumsum, same as triton chunk_local_cumsum

@@ -3,6 +3,7 @@
 
 """CPU/Gloo regressions for canonical EP-first DCP expert coordinates."""
 
+import os
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -752,25 +753,33 @@ def test_ple_ep1_lora_bias_all_checkpoint_export(world, unproven, tmp_path):
     spawn_with_rendezvous(_ple_ep1_lora_worker, args=(str(tmp_path / "adapter"), unproven), nprocs=world)
 
 
-def _ep_shared_lora_worker(rank, root, mode, endpoint):
+def _ep_shared_lora_worker(rank, root, mode, device_type, endpoint):
     from torch.distributed.tensor import distribute_tensor
 
+    from veomni.arguments.arguments_types import MixedPrecisionConfig
     from veomni.distributed.parallel_plan import ParallelPlan, get_runtime_parallel_plan
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
+    from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.lora import VeOmniLoraConfig
     from veomni.lora.moe_layers import LoraSharedExperts
     from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict, strip_adapter_name
+    from veomni.utils.device import get_torch_device
     from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
 
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    if device_type == "npu":
+        get_torch_device().set_device(rank)
+    backend = "hccl" if device_type == "npu" else "gloo"
+    dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
     try:
+        ep_only = mode in ("ep_only", "ep_only_unproven")
         _init_parallel_state(
             dp_size=2,
             dp_shard_size=2,
-            device_type="cpu",
+            device_type=device_type,
             extra_parallel_names=("ep",),
             extra_parallel_sizes=(2,),
             extra_parallel_placement_innermost=(False,),
+            extra_parallel_only=ep_only,
         )
         parallel = get_parallel_state()
         torch.manual_seed(42)
@@ -786,27 +795,72 @@ def _ep_shared_lora_worker(rank, root, mode, endpoint):
         model = _lora_model(config)
         base = model.base_model.model
         assert isinstance(base.experts, LoraSharedExperts)
-        if mode == "unproven_bias":
+        if mode in ("unproven_bias", "ep_only_unproven"):
             base.experts.bias = torch.nn.Parameter(torch.ones(8, 8))
         base.get_parallel_plan = lambda: ParallelPlan(
             {"ep": {"experts.gate_up_proj": Shard(0), "experts.down_proj": Shard(0)}}
         )
-        plan = get_runtime_parallel_plan(model)
-        model._fqn2spec_info = plan.apply(model, parallel.extra_parallel_fsdp_device_mesh)
+        if ep_only:
+
+            @torch.no_grad()
+            def init_weights():
+                for parameter in model.parameters():
+                    parameter.fill_(0.25)
+
+            model.init_weights = init_weights
+            from unittest.mock import patch
+
+            with patch("veomni.distributed.torch_parallelize.get_device_type", return_value=device_type):
+                model = build_parallelize_model(
+                    model,
+                    init_device="meta",
+                    weights_path=None,
+                    basic_modules=[],
+                    mixed_precision=MixedPrecisionConfig(enable=False),
+                    extra_parallel_only=True,
+                    enable_gradient_checkpointing=False,
+                )
+            if mode == "ep_only":
+                base.experts._ensure_ep_grad_sync_hooks()
+                parameters = [param for param in base.experts.parameters() if param.requires_grad]
+                assert parameters and all(not isinstance(param, DTensor) for param in parameters)
+                optimizer = torch.optim.SGD(parameters, lr=0.1)
+                sum(parameter.sum() * (rank + 1) for parameter in parameters).backward()
+                for parameter in parameters:
+                    torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 1.5), rtol=0, atol=0)
+                optimizer.step()
+                optimizer.zero_grad()
+                from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+                checkpoint = root + "-checkpoint"
+                expected_parameters = [parameter.detach().clone() for parameter in parameters]
+                DistributedCheckpointer.save(checkpoint, {"model": model}, parallel_state=parallel)
+                with torch.no_grad():
+                    for parameter in parameters:
+                        parameter.zero_()
+                DistributedCheckpointer.load(checkpoint, {"model": model}, parallel_state=parallel)
+                for parameter, expected_parameter in zip(parameters, expected_parameters, strict=True):
+                    torch.testing.assert_close(parameter, expected_parameter, rtol=0, atol=0)
+        else:
+            plan = get_runtime_parallel_plan(model)
+            model._fqn2spec_info = plan.apply(model, parallel.extra_parallel_fsdp_device_mesh)
+            selected = get_lora_state_dict(model, config=model.get_lora_config())
+            ep_mesh = parallel.extra_parallel_fsdp_device_mesh["ep"]
+            fsdp_mesh = ep_mesh[ep_mesh.mesh_dim_names[:-1]]
+            for name, param in list(model.named_parameters()):
+                if strip_adapter_name(name, "default") not in selected:
+                    continue
+                parent, attr = name.rsplit(".", 1)
+                setattr(
+                    model.get_submodule(parent),
+                    attr,
+                    torch.nn.Parameter(distribute_tensor(param.detach(), fsdp_mesh, [Shard(1)])),
+                )
         selected = get_lora_state_dict(model, config=model.get_lora_config())
-        ep_mesh = parallel.extra_parallel_fsdp_device_mesh["ep"]
-        fsdp_mesh = ep_mesh[ep_mesh.mesh_dim_names[:-1]]
-        for name, param in list(model.named_parameters()):
-            if strip_adapter_name(name, "default") not in selected:
-                continue
-            parent, attr = name.rsplit(".", 1)
-            setattr(
-                model.get_submodule(parent),
-                attr,
-                torch.nn.Parameter(distribute_tensor(param.detach(), fsdp_mesh, [Shard(1)])),
-            )
-        selected = get_lora_state_dict(model, config=model.get_lora_config())
-        expected = {name: value.full_tensor().detach().to(torch.bfloat16).cpu() for name, value in selected.items()}
+        expected = {
+            name: (value.full_tensor() if isinstance(value, DTensor) else value).detach().to(torch.bfloat16).cpu()
+            for name, value in selected.items()
+        }
         if mode in ("plan_conflict", "v2_plan_conflict"):
             base.get_parallel_plan = lambda: ParallelPlan(
                 {"ep": {"experts.gate_proj.lora_A.default.weight": Shard(0)}}
@@ -854,10 +908,10 @@ def _ep_shared_lora_worker(rank, root, mode, endpoint):
                     torch.testing.assert_close(exported[name], value, rtol=0, atol=0)
             dist.barrier()
             return
-        if mode != "valid":
+        if mode not in ("valid", "ep_only"):
             with pytest.raises(RuntimeError, match="noncanonical expert order|failed on another rank"):
                 save_lora_adapter_with_dcp(model, root, parallel_state=parallel)
-            completed = torch.tensor(1)
+            completed = torch.tensor(1, device=next(model.parameters()).device)
             dist.all_reduce(completed)
             assert completed.item() == 2
             return
@@ -873,9 +927,30 @@ def _ep_shared_lora_worker(rank, root, mode, endpoint):
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [2])
-@pytest.mark.parametrize("mode", ["valid", "plan_conflict", "unproven_bias", "v2_valid", "v2_plan_conflict"])
+@pytest.mark.parametrize(
+    "mode", ["valid", "plan_conflict", "unproven_bias", "v2_valid", "v2_plan_conflict", "ep_only", "ep_only_unproven"]
+)
 def test_ep_replicated_shared_expert_lora_export(world, mode, tmp_path):
-    spawn_with_rendezvous(_ep_shared_lora_worker, args=(str(tmp_path / "adapter"), mode), nprocs=world)
+    spawn_with_rendezvous(_ep_shared_lora_worker, args=(str(tmp_path / "adapter"), mode, "cpu"), nprocs=world)
+
+
+def _ep_only_shared_lora_launch_plan(context):
+    if context.capabilities.backend != "npu":
+        return LaunchSpec(device="cpu")
+    return LaunchSpec(nproc=2)
+
+
+@pytest.mark.launch_plan(provider=_ep_only_shared_lora_launch_plan)
+@pytest.mark.parametrize("mode", ["ep_only", "ep_only_unproven"])
+def test_native_ep_only_shared_expert_lora_export(mode, tmp_path):
+    from scripts.ci.accelerator.launch_plan import runner_capabilities
+
+    caps = runner_capabilities()
+    if caps.backend != "npu" or len(caps.devices) < 2:
+        if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
+            pytest.fail("Shared LoRA EP-only checkpoint test requires two Ascend NPUs")
+        pytest.skip("requires two Ascend NPUs")
+    spawn_with_rendezvous(_ep_shared_lora_worker, args=(str(tmp_path / "adapter"), mode, "npu"), nprocs=2)
 
 
 def _pure_extra_parallel_worker(rank, root, name, world, endpoint):

@@ -45,9 +45,13 @@ import torch
 from torch import Tensor
 
 from ......distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
+from ......utils import logging
 from ...sparse_indices import CompressedCandidates
 from ...vendor.npu_sparse_flash_mla import npu_sparse_flash_mla
 from . import eager
+
+
+logger = logging.get_logger(__name__)
 
 
 _ORI_SLIDING_CAUSAL_MASK_MODE = 4
@@ -268,30 +272,33 @@ def wrapper(
     return_lse: bool = False,
     dropout: float = 0.0,
     return_attn_weights: bool = False,
+    topk_idxs: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, ...]:
     """Run CANN sparse FlashMLA over the window and compressed selection.
 
-    Layers without compressed rows run the eager row. The kernel encodes
-    visibility as mask modes, not as a per-key mask, so a caller-supplied
-    ``attention_mask`` cannot be expressed: any call that carries one runs the
-    eager row, packed context-parallel shards included, rather than attending to
-    keys the caller excluded. The kernel needs the query
-    rows to end at the last KV row: a non-zero ``query_offset`` on a context-parallel
-    shard is served by narrowing ``ori_kv`` to that prefix, and packed
-    slices then need one call per sample because the TND path segments queries
-    and KV alike. A prefix that ends inside the first compression window holds no
-    compressed row at all; those queries run the eager row, since the kernel has
-    no mask mode for an empty compressed table. A shorter query block that also
-    ends at the last KV row is a decode layout, which the kernel does not
-    implement and outside context parallelism the adapter refuses. It validates
-    its own dtype,
-    window, ratio and head-size limits, and this adapter trims the padding a
-    context-parallel call inherits from the producer's global selection width,
-    rejecting a selection that neither spans the table nor is one of the kernel
-    widths, and one that names a row past it. Packed calls without CP take the TND
-    path, which needs batch size 1 and reads the slice boundaries on the host.
+    Layers without compressed rows, callers with explicit ``topk_idxs``, and any
+    call that carries an ``attention_mask`` run the eager row. The kernel encodes
+    visibility as mask modes, not as a per-key mask, so a caller-supplied mask
+    cannot be expressed, packed context-parallel shards included. The kernel needs
+    the query rows to end at the last KV row: a non-zero ``query_offset`` on a
+    context-parallel shard is served by narrowing ``ori_kv`` to that prefix, and
+    packed slices then need one call per sample because the TND path segments
+    queries and KV alike. A prefix that ends inside the first compression window
+    holds no compressed row at all; those queries run the eager row, since the
+    kernel has no mask mode for an empty compressed table. A shorter query block
+    that also ends at the last KV row is a decode layout, which the kernel does
+    not implement and outside context parallelism the adapter refuses. It validates
+    its own dtype, window, ratio and head-size limits, and this adapter trims the
+    padding a context-parallel call inherits from the producer's global selection
+    width, rejecting a selection that neither spans the table nor is one of the
+    kernel widths, and one that names a row past it. Packed calls without CP take
+    the TND path, which needs batch size 1 and reads the slice boundaries on the host.
     """
-    if attention_mask is not None or cmp_kv is None or cmp_kv.shape[1] == 0:
+    if topk_idxs is not None:
+        logger.warning_once(
+            "cann DeepSeek-V4 sparse attention does not consume explicit topk_idxs; running the eager row."
+        )
+    if topk_idxs is not None or attention_mask is not None or cmp_kv is None or cmp_kv.shape[1] == 0:
         return eager.wrapper(
             q,
             ori_kv,
@@ -308,6 +315,7 @@ def wrapper(
             return_lse=return_lse,
             dropout=dropout,
             return_attn_weights=return_attn_weights,
+            topk_idxs=topk_idxs,
         )
     if dropout:
         raise ValueError("cann DeepSeek-V4 sparse attention requires dropout=0.")

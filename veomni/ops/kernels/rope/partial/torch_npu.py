@@ -23,14 +23,23 @@ from ....registry import SavedState
 from . import eager as _eager
 
 
+def _needs_eager(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> bool:
+    """Eager covers empty inputs, trainable tables, and any non-NPU tensor."""
+    if q.numel() == 0 or k.numel() == 0 or cos.requires_grad or sin.requires_grad:
+        return True
+    return any(tensor.device.type != "npu" for tensor in (q, k, cos, sin))
+
+
 def forward(
     q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, unsqueeze_dim: int = 1
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
     """NPU fused partial RoPE. Only the ``cos.shape[-1]`` prefix is rotated.
 
-    Empty inputs and backward reuse the eager pair.
+    Empty inputs, trainable frequency tables, tensors that are not on NPU,
+    and backward reuse the eager pair. The row is the NPU host default, so a
+    CPU activation must not enter ``npu_rotary_mul``.
     """
-    if q.numel() == 0 or k.numel() == 0 or cos.requires_grad or sin.requires_grad:
+    if _needs_eager(q, k, cos, sin):
         return _eager.forward(q, k, cos, sin, unsqueeze_dim)
 
     import torch_npu
