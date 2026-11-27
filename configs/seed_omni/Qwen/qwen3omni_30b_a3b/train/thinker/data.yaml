@@ -1,0 +1,25 @@
+# Thinker-side mix: `graph_train.yaml` trains audio + vision + text_encoder +
+# llm, so the sources cover all four modalities the graph can consume.
+#
+# `voice_assistant` is the audio one — spoken question, text answer, so the clip
+# is a `role="user"` item and an input to the tower. It is not talker data: the
+# talker is trained on `role="assistant"` audio, which is a label, and no source
+# here carries any (see `../talker/data.yaml`). The clips are 22.05 kHz,
+# matching neither the tower (16 kHz) nor the codec (24 kHz), which is why the
+# data layer declares each clip's rate instead of normalising it.
+sources:
+  - sharegpt4v_cap_100k
+  - LLaVA-Video-178K
+  - voice_assistant
+  - tulu-3-sft-mixture
+names:
+  - sharegpt4v_cap_100k
+  - llava_video
+  - voice_assistant
+  - tulu-3-sft-mixture
+schedule:
+  - schedule_type: const
+    weights: [0.35, 0.35, 0.15, 0.15]
+level: token
+stopping_strategy: all_exhausted
+upstream_sharded: true

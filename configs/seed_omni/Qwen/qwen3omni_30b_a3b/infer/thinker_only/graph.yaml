@@ -1,0 +1,36 @@
+# Qwen3-Omni with the talker left out: audio/image/video/text in, text out.
+#
+# The thinker half of `../audio_output/graph.yaml`, stopping at `text_done` instead
+# of handing over to the talker — what upstream spells `generate(return_audio=False)`.
+# Two things run on it:
+#
+#   * Any text-out evaluation (transcription, VQA, knowledge questions). The
+#     speech half is 3.6B parameters and a vocoder pass per sample, all of it
+#     wasted when the answer you score is the text.
+#   * ASR quality-gating of generated speech corpora: transcribe each clip back
+#     through this graph and compare word overlap with its reference text.
+#
+# It also isolates faults in the speech path: if this graph is right and the
+# audio one is not, the fault is in the bridge or the talker, not the thinker.
+
+initial: prompt_encode
+
+states:
+  prompt_encode:
+    body:
+      - { from: qwen3omni_audio,        to: qwen3omni_llm }
+      - { from: qwen3omni_vision,       to: qwen3omni_llm }
+      - { from: qwen3omni_text_encoder, to: qwen3omni_llm }
+      - { from: qwen3omni_llm,          to: qwen3omni_text_encoder }
+      - { from: qwen3omni_text_encoder, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: text_ar }
+
+  text_ar:
+    body:
+      - { from: qwen3omni_text_encoder, to: qwen3omni_llm }
+      - { from: qwen3omni_llm,          to: qwen3omni_text_encoder }
+      - { from: qwen3omni_text_encoder, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }

@@ -1,0 +1,63 @@
+# Qwen3-Omni speech output: prompt -> thinker text AR -> talker RVQ codes -> waveform.
+#
+# The thinking phase is an ordinary VLM text loop. What makes this graph
+# different is the bridge afterwards: the talker does not read the thinker's
+# final hidden states, it reads an intermediate layer (accept_hidden_layer=24)
+# plus the input embeddings, accumulated over every thinker step. Only the FSM
+# knows when the thinking phase ended, so two explicit flush nodes hand those
+# traces over once `text_done` fires.
+
+initial: prompt_encode
+
+states:
+  # Encoders fan into the backbone, which emits the first token; the text
+  # encoder decodes it and decides whether the answer is already complete.
+  prompt_encode:
+    body:
+      - { from: qwen3omni_audio,        to: qwen3omni_llm }
+      - { from: qwen3omni_vision,       to: qwen3omni_llm }
+      - { from: qwen3omni_text_encoder, to: qwen3omni_llm }
+      - { from: qwen3omni_llm,          to: qwen3omni_text_encoder }
+      - { from: qwen3omni_text_encoder, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: talker_bridge }
+      - { condition: { type: default }, next_state: text_ar }
+
+  text_ar:
+    body:
+      - { from: qwen3omni_text_encoder, to: qwen3omni_llm }
+      - { from: qwen3omni_llm,          to: qwen3omni_text_encoder }
+      - { from: qwen3omni_text_encoder, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: talker_bridge }
+
+  # Hand over what the talker needs. The backbone supplies the two hidden-state
+  # traces; the text encoder supplies the token-level prompt view the talker's
+  # 3D RoPE needs, which the segmented carrier never materializes on its own.
+  talker_bridge:
+    body:
+      - { from: qwen3omni_llm.flush_thinker_states,          to: end }
+      - { from: qwen3omni_text_encoder.flush_talker_prompt,  to: end }
+    transitions:
+      - { condition: { type: default }, next_state: talker_ar }
+
+  # The talker and the codec are separate states, not two nodes of one body,
+  # because raising a signal ends the body it was raised in. Put together, the
+  # talker's `codes_done` would stop the iteration before the codec ran, and
+  # since only `audio_done` is a transition here the state would re-enter and
+  # regenerate the codes until the step budget ran out.
+  #
+  # Both are one-shot: the talker runs its own AR loop internally and appends
+  # its codes as an `output` row, then the codec decodes the whole sequence in
+  # one pass.
+  talker_ar:
+    body:
+      - { from: qwen3omni_talker, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: codes_done }, next_state: vocode }
+
+  vocode:
+    body:
+      - { from: qwen3omni_codec, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: audio_done }, next_state: done }

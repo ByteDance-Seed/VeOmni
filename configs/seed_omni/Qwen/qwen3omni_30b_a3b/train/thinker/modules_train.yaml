@@ -1,0 +1,21 @@
+# Thinker-only training: the talker and codec are not declared, so they are
+# neither built nor sharded. Both are frozen in this round — the talker is
+# trained separately, and the codec is a tokenizer, never a trainee.
+qwen3omni_audio:
+  model_path: qwen3omni_audio
+qwen3omni_vision:
+  model_path: qwen3omni_vision
+qwen3omni_text_encoder:
+  model_path: qwen3omni_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+qwen3omni_llm:
+  model_path: qwen3omni_llm
+  # Off explicitly, not just by default: retaining every layer's hidden states
+  # only pays off when a talker reads the interior one, and this graph has no
+  # talker. Stated here because checkpoints split before the converter stopped
+  # baking the flag in still carry `true` in their config.json, and the module
+  # list is what overrides them. The talker-training scenario turns it back on.
+  model_config:
+    collect_thinker_states: false

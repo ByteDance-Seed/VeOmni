@@ -1,0 +1,34 @@
+# Qwen3-Omni talker training DAG — speech output SFT (T/A/I/V -> speech).
+#
+# Flat list of edges; each endpoint is a self-describing `module[.method]`
+# string (bare module -> `.forward`). Active nodes derived from endpoints:
+#
+#   {qwen3omni_audio, qwen3omni_vision, qwen3omni_text_encoder.encode}
+#       -> qwen3omni_llm --.
+#   qwen3omni_codec.encode --> qwen3omni_talker -> end
+#
+# Two roots, because the talker needs two unrelated things: a prefill derived
+# from the frozen thinker's pass, and the RVQ codes to score it against. The
+# codec is a root — it reads the assistant's waveform straight off the carrier
+# and owes nothing to the thinker.
+#
+# `qwen3omni_text_encoder.decode` is absent, unlike the thinker graph: the
+# thinker is frozen here, so its text CE would build a loss with no parameter
+# behind it. The only loss in this graph is the talker's.
+#
+# Everything the talker reads travels on the conversation carrier, so the edges
+# below are ordering constraints rather than data plumbing:
+#
+#   qwen3omni_codec.encode        -> meta["qwen3omni_talker_labels"] (the target)
+#   qwen3omni_llm                 -> meta["thinker_embed"] / meta["thinker_hidden"]
+#   qwen3omni_text_encoder.encode -> meta["qwen3omni_talker_prompt"]
+#
+# The last two are gated by `collect_thinker_states` / `publish_talker_prompt`
+# in this scenario's modules yaml; setting one and forgetting the other cannot
+# fail silently, the talker names the flag it is missing.
+- { from: qwen3omni_audio,               to: qwen3omni_llm }     # user-side speech/sound embeds
+- { from: qwen3omni_vision,              to: qwen3omni_llm }     # image/video embeds
+- { from: qwen3omni_text_encoder.encode, to: qwen3omni_llm }     # tokenise + wte + talker prompt view
+- { from: qwen3omni_llm,                 to: qwen3omni_talker }  # thinker traces
+- { from: qwen3omni_codec.encode,        to: qwen3omni_talker }  # assistant waveform -> RVQ targets
+- { from: qwen3omni_talker,              to: end }               # semantic + residual CE

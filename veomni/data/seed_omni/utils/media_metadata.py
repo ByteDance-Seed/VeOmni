@@ -187,13 +187,17 @@ class AudioMetadata:
       by the time the backbone wants a duration, ``value`` holds mel features
       and the sample count is no longer recoverable from it.
 
-    Both describe the clip *as decoded*, and a module that resamples for its own
-    tower must not write its target rate back here. Rewriting only
-    ``sampling_rate`` leaves ``num_samples`` on the old axis and
-    :attr:`duration_seconds` then reports a length the clip never had; rewriting
-    both discards the source axis every other module still reads. Resample a
-    local copy and leave the timeline alone — the clip is the same number of
-    seconds long either way, and seconds are what the shared timeline is in.
+    Both describe the clip *as it sits on the item*. A module that only needs a
+    different rate to read the clip (the Qwen3-Omni audio tower, building mels)
+    resamples a local copy and leaves this alone — the clip is the same number
+    of seconds long either way, and seconds are what the shared timeline is in.
+
+    A module that converts the payload **in place** (the codec, which leaves a
+    24 kHz tensor on ``value`` for ``encode_wav``) has to move the metadata with
+    it, via :meth:`resampled_to`. What must never happen is one without the
+    other: rewriting ``sampling_rate`` alone leaves ``num_samples`` on the old
+    axis, and :attr:`duration_seconds` then reports a length the clip never had
+    — which reads as a retimed clip to anything placing it on TMRoPE's clock.
     """
 
     sampling_rate: int | None = None
@@ -208,6 +212,33 @@ class AudioMetadata:
         if not self.sampling_rate:
             return None
         return self.num_samples / float(self.sampling_rate)
+
+    def resampled_to(self, sampling_rate: int, num_samples: int) -> AudioMetadata:
+        """This clip's metadata after a module retuned the payload in place.
+
+        Both fields move together, which is the whole point — see the class
+        docstring for why moving one is a retimed clip. Retuning must not
+        retime, so the new length is checked against the old duration and a
+        disagreement beyond a sample's worth of rounding is refused rather than
+        recorded: for the codec the clip is the talker's target, scored against
+        text, so a clip that silently got longer trains against shifted codes.
+        """
+        if sampling_rate <= 0:
+            raise ValueError(f"resampled_to: sampling_rate must be positive, got {sampling_rate}")
+        if num_samples < 0:
+            raise ValueError(f"resampled_to: num_samples must be non-negative, got {num_samples}")
+        before, after = self.duration_seconds, num_samples / float(sampling_rate)
+        if before is not None:
+            # One sample at the coarser of the two rates is the most a correct
+            # resampler can round away.
+            tolerance = 1.0 / min(self.sampling_rate, sampling_rate)
+            if abs(after - before) > tolerance:
+                raise ValueError(
+                    f"resampled_to: {self.sampling_rate} Hz x {self.num_samples} samples is {before:.6f}s but "
+                    f"{sampling_rate} Hz x {num_samples} samples is {after:.6f}s. Resampling must preserve the "
+                    f"clip's duration; this would retime it on the shared clock."
+                )
+        return AudioMetadata(sampling_rate=int(sampling_rate), num_samples=int(num_samples))
 
 
 __all__ = ["AUDIO_METADATA_KEY", "VIDEO_METADATA_KEY", "AudioMetadata", "VideoMetadata"]

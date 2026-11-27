@@ -1,0 +1,39 @@
+# Talker-side mix.
+#
+# What the graph needs from every sample, and why:
+#
+#   * a `role="assistant"` audio turn — the waveform the talker is taught to
+#     say. `qwen3omni_codec.encode` turns it into RVQ codes and stashes them as
+#     the target. Every sample needs one: the talker all-gathers its sharded
+#     layers once per utterance, so a partly-speech mix would give the ranks
+#     different call counts (it raises rather than hangs, but the run stops).
+#   * the matching assistant *text*, supervised as usual. The talker speaks
+#     what the thinker said, so the text is the speech-span content, not
+#     optional context.
+#
+# `meta["audio_metadata"].sampling_rate` is handled for you: the data layer
+# declares whatever rate the file holds and `Qwen3OmniCodecPreprocessor`
+# resamples to the codec's 24 kHz on the worker. What a new source must not do
+# is normalise the rate away — the tower wants 16 kHz and the codec 24 kHz, so
+# "the rate" is ambiguous across this graph, and a wrong one retunes every
+# target code.
+#
+# Point `sources` at a TTS or self-speech corpus matching the
+# `voice_assistant_talker` row shape (`veomni/data/seed_omni/preprocess.py`):
+# a text question plus an assistant turn carrying both its text and its audio.
+#
+# No shipped source can substitute: `voice_assistant` is the opposite shape
+# (spoken question, text answer), so its clip is a user-side encoder input.
+sources:
+  - qwen3omni_talker_selfspeech
+names:
+  - voice_assistant_talker
+schedule:
+  - schedule_type: const
+    weights: [1.0]
+level: token
+stopping_strategy: all_exhausted
+# The generator writes one shard per 32 rows per worker, which is fewer shards
+# than a multi-node run has ranks; `false` streams every shard on every rank and
+# shards by DP rank instead, so no rank starves.
+upstream_sharded: false

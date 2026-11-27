@@ -1,0 +1,115 @@
+# Talker-only training: the talker is the sole trainee, the thinker is frozen
+# and the codec is the target tokenizer.
+#
+# All six modules are declared here, unlike the thinker round which omits the
+# talker and codec entirely. Declaring a module builds and shards it, so the
+# cost of the two extra ones is the price of the speech head existing at all.
+#
+# Freezing is per module and each module decides what "frozen" means for it
+# (`freeze_model`). Here it is whole-module for the four thinker modules; the
+# codec needs no flag because it is never a trainee under any graph. A module
+# with nothing trainable gets no optimizer and no checkpoint from
+# `ModuleRuntime`, so this is also what keeps the step and the saved state down
+# to the talker.
+qwen3omni_audio:
+  model_path: qwen3omni_audio
+  model_config:
+    freeze: true
+  accelerator:
+    # No gradient reaches these weights, so there is nothing to recompute for.
+    gradient_checkpointing:
+      enable: false
+
+qwen3omni_vision:
+  model_path: qwen3omni_vision
+  model_config:
+    freeze: true
+    # `freeze` alone would leave the patch merger trainable — the
+    # understanding-SFT recipe, where the visual pathway keeps adapting into the
+    # thinker's embedding space. Here it has to go too, and not to save an
+    # optimizer: one trainable parameter in this tower makes the thinker's
+    # `inputs_embeds` require grad (the FSDP dummy anchors are added in as
+    # `x * 0`, which preserves it), and the frozen 30B backbone would then build
+    # and retain a full un-checkpointed activation graph for a backward that
+    # never comes. The talker's inputs are detached, so nothing consumes it.
+    freeze_merger: true
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+
+qwen3omni_text_encoder:
+  model_path: qwen3omni_text_encoder
+  model_config:
+    freeze: true
+    # Rebuild the token-level prompt view the talker's 3D RoPE needs. The
+    # segmented carrier never materialises it: by the time the talker runs, the
+    # text rows hold hidden states and the token ids are gone, so only this
+    # module can capture them, and only before the backbone's scatter.
+    publish_talker_prompt: true
+    # Open every round with the checkpoint's speech system turn, the same as
+    # `infer/audio_output/modules.yaml` does at generation time. The
+    # corpus does not carry it: templating it here is what keeps the two from
+    # drifting, so the talker trains on the conditioning it will be served.
+    add_speech_system_prompt: true
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+
+qwen3omni_llm:
+  model_path: qwen3omni_llm
+  model_config:
+    freeze: true
+    # The talker reads an interior layer (`accept_hidden_layer`, 24) plus the
+    # input embeddings, so the backbone has to retain every layer's hidden
+    # states. Orthogonal to `freeze`: this round wants the traces *and* no
+    # gradient through them, which is why both are set. The traces are detached
+    # where they are published, so the freeze is about the optimizer and the
+    # saved state, not about isolation.
+    collect_thinker_states: true
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+
+qwen3omni_talker:
+  model_path: qwen3omni_talker
+  model_config:
+    # The two heads score different element counts — T+1 semantic rows against
+    # T*(G-1) residual codes at G=16 — so left at 1.0 each the residual term
+    # dominates the sum by an order of magnitude. Turn the residual side down
+    # until the semantic head is learning, then rebalance.
+    semantic_loss_weight: 1.0
+    residual_loss_weight: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+
+qwen3omni_codec:
+  model_path: qwen3omni_codec
+  accelerator:
+    # `Qwen3OmniCodec.supports_gradient_checkpointing` is False (neither the
+    # vocoder nor Mimi honours the flag), and `gradient_checkpointing_enable`
+    # raises on a module that does not support it — so inheriting the launcher's
+    # `enable: true` would abort the run during the build, before step 0.
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      # Sharded like everything else. `encode_wav` reaches the encoder as
+      # `self.mimi.encode(...)` — a method — so FSDP2's hooks on the units
+      # inside Mimi never fire; the module's `encode` hook all-gathers them
+      # itself through FSDP2's `unshard()` and gives the memory back after.
+      # `fsdp_mode: ddp` also works (the codec is frozen, so DDP hands back a
+      # plain replica of a module under a gigabyte) but it is not needed, and it
+      # is not available under `fsdp_scope: model`, where per-module wrap
+      # settings are never read.
+      #
+      # fp32, against the launcher's bf16. This module produces the talker's
+      # labels: a bf16 Mimi encoder changes ~32% of the code indices it emits
+      # (the module warns about it at `encode_wav`), which is free label noise on
+      # the only supervised signal in this graph. `enable: false` would NOT do
+      # this -- `ModuleRuntime.build_model` reads that flag to pick the build
+      # dtype and would hand back bfloat16 weights.
+      mixed_precision:
+        enable: true
+        param_dtype: float32
+        reduce_dtype: float32

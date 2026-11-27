@@ -1,0 +1,35 @@
+# Joint-round data mix.
+#
+# Every sample has to carry both a thinker target and a talker target:
+#
+#   * supervised assistant **text** — the thinker's CE target, as in
+#     `train/thinker/data.yaml`;
+#   * the assistant's **speech** for that same turn — the waveform the codec
+#     turns into RVQ codes, as in `train/talker/data.yaml`.
+#
+# `voice_assistant_talker` (`veomni/data/seed_omni/preprocess.py`) produces
+# exactly that shape: a text question, then an assistant turn carrying its text
+# *and* its audio. So this mix is the talker round's corpus, unchanged — the only
+# difference from that round is that the thinker is no longer frozen and its text
+# CE is scored.
+#
+# Do not add a text-only or image-only source here. Such a row has no assistant
+# audio, so the codec contributes no target and the talker raises rather than
+# training on part of the batch; and it has no thinker target either once the
+# speech is out of the sequence, so the graph would score nothing at all.
+#
+# Point `sources` at a TTS or self-speech corpus matching the
+# `voice_assistant_talker` row shape.
+sources:
+  - qwen3omni_talker_selfspeech
+names:
+  - voice_assistant_talker
+schedule:
+  - schedule_type: const
+    weights: [1.0]
+level: token
+stopping_strategy: all_exhausted
+# The generator writes one shard per 32 rows per worker, which is fewer shards
+# than a multi-node run has ranks; `false` streams every shard on every rank and
+# shards by DP rank instead, so no rank starves.
+upstream_sharded: false

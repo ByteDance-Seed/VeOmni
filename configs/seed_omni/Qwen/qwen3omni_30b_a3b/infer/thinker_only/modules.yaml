@@ -1,0 +1,51 @@
+# Text-only inference: audio/image/video/text in, text out. No speech half.
+#
+# Paired with `graph.yaml` in this directory, which stops at `text_done` and
+# never enters the talker, so the talker and the codec are not declared here —
+# not declaring a module means it is neither built nor loaded, and those two are
+# the larger half of the checkpoint's non-backbone weights.
+#
+# The other inference recipe (`../audio_output/modules.yaml`) is a sibling copy
+# rather than a shared base: `model_config.modules` takes one path and applies it
+# whole, with no overlay. The intended difference between the two is the
+# `qwen3omni_text_encoder` block below — speech output needs the system turn and
+# this recipe must not have it, since the 50-word cap and voice persona skew a
+# text evaluation.
+#
+# Single-process eager: no FSDP wrap, plain HF load on one device. The 30B-A3B
+# weights fit on one H20.
+qwen3omni_audio:
+  model_path: qwen3omni_audio
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+
+qwen3omni_vision:
+  model_path: qwen3omni_vision
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+
+qwen3omni_text_encoder:
+  model_path: qwen3omni_text_encoder
+  # Explicitly disabled so a checkpoint exported from a talker/joint training
+  # run (which persists `add_speech_system_prompt: true`) does not inject the
+  # 50-word speech persona during text-only evaluation.
+  model_config:
+    add_speech_system_prompt: false
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: eager
+
+qwen3omni_llm:
+  model_path: qwen3omni_llm
+  # Explicitly disabled so a checkpoint exported from a talker/joint training
+  # run (which persists `collect_thinker_states: true`) does not retain unused
+  # interior-layer traces when no talker is in the graph.
+  model_config:
+    collect_thinker_states: false
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
