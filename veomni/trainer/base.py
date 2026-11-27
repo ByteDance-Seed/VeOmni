@@ -474,6 +474,7 @@ class BaseTrainer(Stateful, ABC):
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
         self.train_dataloader = build_dataloader(
+            _veomni_trainer_controls=True,
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -488,6 +489,8 @@ class BaseTrainer(Stateful, ABC):
             dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
             dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+            dyn_bsz_buffer_policy=args.data.dyn_bsz_buffer_policy,
+            data_modality=args.data.data_modality,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
             save_steps=args.train.checkpoint.save_steps,

@@ -57,6 +57,7 @@ class BaseRLTrainer(BaseTrainer):
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         self.train_dataloader = build_dataloader(
+            _veomni_trainer_controls=True,
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -71,6 +72,8 @@ class BaseRLTrainer(BaseTrainer):
             dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
             dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+            dyn_bsz_buffer_policy=args.data.dyn_bsz_buffer_policy,
+            data_modality=args.data.data_modality,
             seed=args.train.seed,
             build_collate_fn=False,
             **dataloader_kwargs,
