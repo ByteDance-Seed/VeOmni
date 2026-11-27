@@ -75,6 +75,7 @@ veomni/
 │   ├── platform/       GPU/NPU/MLU availability requirements
 │   ├── install.py      Idempotent process-wide attention integration
 │   ├── batch_invariant/  Scoped deterministic ATen patch
+│   ├── layout/         Tensor layout helpers outside the op registry
 │   ├── qat/            Fake-quantization primitives called by the qat rows
 │   │                   (DeepSeek-V4 FP8/FP4 TileLang)
 │   └── kernels/        Registered per-op/variant eager and optimized rows
@@ -249,6 +250,12 @@ Modeling passes `config.ops_config.<field>` directly to `VeomniOp`. The attentio
 `eager` row uses model-local eager math when present and otherwise forwards to
 `veomni_sdpa`. On NPU, unweighted RMSNorm supports only `eager`; explicit
 `torch_npu`/`npu` is rejected rather than remapped across variants.
+
+MiniMax M3 sparse layers call two packed operators in sequence.
+`minimax_sparse_indexer` selects key blocks per KV group and
+`minimax_sparse_attention` consumes those indices. Both padded attention
+backends build the token mask per KV group before applying PyTorch eager or
+Ascend fused attention.
 
 The public configuration field remains `model.ops_implementation`. Trainer and
 inference entry points pass it to the model builder as

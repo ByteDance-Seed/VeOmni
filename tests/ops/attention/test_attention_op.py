@@ -265,6 +265,38 @@ def test_ulysses_helpers_reject_nondivisible_key_value_heads():
         ulysses_backend.prepare_ulysses_qkv(query, key, value, group=object(), ulysses_size=4)
 
 
+@pytest.mark.parametrize(("key_value_head_count", "ulysses_size"), [(1, 4), (2, 4), (4, 2), (4, 4)])
+def test_kv_head_exchange_keeps_per_kv_group_tensors_aligned_with_key(monkeypatch, key_value_head_count, ulysses_size):
+    """A per-KV-group tensor exchanged on its own lands on the same KV group as K on every rank."""
+    query_head_count = 8
+    for rank in range(ulysses_size):
+
+        def fake_gather_seq(tensor, *, seq_dim, head_dim, group, rank=rank):
+            local_heads = tensor.shape[head_dim] // ulysses_size
+            return tensor.narrow(head_dim, rank * local_heads, local_heads)
+
+        monkeypatch.setattr(ulysses_backend, "gather_seq_scatter_heads", fake_gather_seq)
+        query = torch.randn(1, 5, query_head_count, 8)
+        # Encode each head's global KV-group id so alignment is checkable after the exchange.
+        key = torch.arange(key_value_head_count, dtype=torch.float32).view(1, 1, -1, 1).expand(1, 5, -1, 8)
+        per_group = key.clone()
+
+        local_query, local_key, _, _ = ulysses_backend.prepare_ulysses_qkv(
+            query, key, key, group=object(), ulysses_size=ulysses_size
+        )
+        local_per_group = ulysses_backend.gather_seq_scatter_kv_heads(
+            per_group, group=object(), ulysses_size=ulysses_size
+        )
+
+        torch.testing.assert_close(local_per_group, local_key)
+        # The rank's contiguous query heads map onto exactly the KV groups it received.
+        local_query_heads = torch.arange(rank * local_query.shape[2], (rank + 1) * local_query.shape[2])
+        query_groups = local_query_heads // (query_head_count // key_value_head_count)
+        local_groups = local_key[0, 0, :, 0].long()
+        n_rep = local_query.shape[2] // local_key.shape[2]
+        torch.testing.assert_close(local_groups.repeat_interleave(n_rep), query_groups)
+
+
 def test_ulysses_head_auxiliary_slices_global_vector_by_rank(monkeypatch):
     monkeypatch.setattr(ulysses_backend.dist, "get_rank", lambda group: 1)
     sliced = ulysses_backend.slice_ulysses_head_auxiliary(
@@ -331,3 +363,82 @@ def test_lookup_raw_attention_rejects_active_ulysses_unless_skipped(monkeypatch,
         )
         torch.testing.assert_close(dsa_out, query.transpose(1, 2))
         assert dsa_meta == "eager-local"
+
+
+def test_ensure_npu_host_cu_seqlens_converts_and_caches_only_for_npu(monkeypatch):
+    from veomni.ops.kernels.attention import helper as attn_helper
+
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()
+    cu = torch.tensor([0, 3, 6], dtype=torch.int32)
+    kwargs = {"cu_seq_lens_q": cu, "cu_seq_lens_k": cu}
+
+    # Non-NPU devices leave kwargs untouched.
+    attn_helper.ensure_npu_host_cu_seqlens(kwargs, "cuda")
+    assert kwargs["cu_seq_lens_q"] is cu
+    assert kwargs["cu_seq_lens_k"] is cu
+
+    # Simulate a non-CPU tensor (device.type != "cpu") on NPU to verify one-time conversion + caching.
+    class _FakeNpuTensor(torch.Tensor):
+        cpu_calls = 0
+
+        @property
+        def device(self):
+            return SimpleNamespace(type="npu")
+
+        def cpu(self) -> torch.Tensor:
+            type(self).cpu_calls += 1
+            return torch.tensor(torch.Tensor.tolist(self), dtype=self.dtype)
+
+    fake_cu = cu.clone().as_subclass(_FakeNpuTensor)
+    first_kwargs = {"cu_seq_lens_q": fake_cu, "cu_seq_lens_k": fake_cu}
+    second_kwargs = {"cu_seq_lens_q": fake_cu, "cu_seq_lens_k": fake_cu}
+
+    first_out = attn_helper.ensure_npu_host_cu_seqlens(first_kwargs, "npu")
+    second_out = attn_helper.ensure_npu_host_cu_seqlens(second_kwargs, "npu")
+
+    assert _FakeNpuTensor.cpu_calls == 1
+    assert first_kwargs["cu_seq_lens_q"] is fake_cu
+    assert isinstance(first_out["cu_seq_lens_q"], torch.Tensor)
+    assert first_out["cu_seq_lens_q"].device.type == "cpu"
+    assert second_out["cu_seq_lens_q"] is first_out["cu_seq_lens_q"]
+    torch.testing.assert_close(first_out["cu_seq_lens_q"], cu)
+
+    # In-place mutation bumps _version and invalidates the cached host copy.
+    fake_cu[1] = 4
+    third_kwargs = {"cu_seq_lens_q": fake_cu}
+    third_out = attn_helper.ensure_npu_host_cu_seqlens(third_kwargs, "npu")
+    assert _FakeNpuTensor.cpu_calls == 2
+    assert third_out["cu_seq_lens_q"].tolist() == [0, 4, 6]
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()
+
+
+def test_ensure_npu_host_cu_seqlens_copies_inference_tensors_without_version():
+    from veomni.ops.kernels.attention import helper as attn_helper
+
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()
+
+    class _FakeNpuTensor(torch.Tensor):
+        cpu_calls = 0
+
+        @property
+        def device(self):
+            return SimpleNamespace(type="npu")
+
+        def cpu(self) -> torch.Tensor:
+            type(self).cpu_calls += 1
+            return torch.tensor(torch.Tensor.tolist(self), dtype=self.dtype)
+
+    with torch.inference_mode():
+        cu = torch.tensor([0, 3, 6], dtype=torch.int32)
+    fake_cu = cu.as_subclass(_FakeNpuTensor)
+    assert fake_cu.is_inference()
+
+    # Q and K share the tensor, and the next layer sees it again.
+    first = attn_helper.ensure_npu_host_cu_seqlens({"cu_seq_lens_q": fake_cu, "cu_seq_lens_k": fake_cu}, "npu")
+    second = attn_helper.ensure_npu_host_cu_seqlens({"cu_seq_lens_q": fake_cu}, "npu")
+    assert _FakeNpuTensor.cpu_calls == 1
+    assert first["cu_seq_lens_q"].tolist() == [0, 3, 6]
+    assert first["cu_seq_lens_q"].device.type == "cpu"
+    assert first["cu_seq_lens_q"] is first["cu_seq_lens_k"]
+    assert second["cu_seq_lens_q"] is first["cu_seq_lens_q"]
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()

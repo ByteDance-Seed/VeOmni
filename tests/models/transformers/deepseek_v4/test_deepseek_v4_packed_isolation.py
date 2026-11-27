@@ -19,7 +19,6 @@ from __future__ import annotations
 import types
 from pathlib import Path
 
-import pytest
 import torch
 import yaml
 from transformers import AutoConfig
@@ -201,12 +200,10 @@ class _FakeCannOps:
         return torch.zeros(shape, dtype=torch.int32), torch.zeros(shape)
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
-def test_deepseek_v4_packed_indexer_op_receives_segments_cann_accepts(backend, monkeypatch):
+def test_deepseek_v4_packed_indexer_op_receives_segments_cann_accepts(monkeypatch):
     """The packed CSA path hands the indexer op segment boundaries whose ranges CANN can mask."""
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
-    monkeypatch.setattr(modeling, "IS_NPU_AVAILABLE", backend == "npu")
     module = modeling
 
     torch.manual_seed(13)
@@ -390,10 +387,8 @@ def _packed_model_inputs(config, segment_lengths: tuple[int, ...]) -> dict[str, 
     }
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
-def test_deepseek_v4_packed_model_forward_skips_dense_mask(backend, monkeypatch):
+def test_deepseek_v4_packed_model_forward_skips_dense_mask(monkeypatch):
     """Packed forwards hand the op segments and per-sample candidates, never an O(S^2) mask."""
-    monkeypatch.setattr(modeling, "IS_NPU_AVAILABLE", backend == "npu")
     module = modeling
     torch.manual_seed(11)
     config = _toy_config()

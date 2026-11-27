@@ -51,6 +51,13 @@ def _build_tiny_gemma3_vlm():
     return gemma3_modeling.Gemma3ForConditionalGeneration(config)
 
 
+def test_gemma3_vlm_registry_resolves_without_an_npu():
+    from veomni.models.registry import MODELING_REGISTRY
+
+    resolved = MODELING_REGISTRY["gemma3"]("Gemma3ForConditionalGeneration")
+    assert resolved is gemma3_modeling.Gemma3ForConditionalGeneration
+
+
 def test_gemma3_vlm_binds_instance_local_ops_and_runs_text_loss():
     model = _build_tiny_gemma3_vlm()
 
