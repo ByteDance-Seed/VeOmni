@@ -236,6 +236,7 @@ resume before using the converted checkpoint for training.
 
 ## Related pages
 
+- [Data loader resume protocol](dataloader_resume_protocol.md) — forwarding the saved epoch before restoring a legacy multi-source cursor.
 - [Checkpoint conversion](checkpoint_conversion.md) — DCP shards → HuggingFace safetensors (`scripts/merge_dcp_to_hf.py`).
 - [Trainer callbacks](trainer.md#callbacks) — `CheckpointCallback` (when) vs `GlobalStateCallback` (job cursor).
 - [LoRA checkpoints](../key_features/lora.md#4-checkpoint-saving) — adapter export under `lora_ckpt/`.
