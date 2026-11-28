@@ -35,6 +35,7 @@ a host without the optional ``float8`` extra stays free.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import replace
 from importlib.metadata import PackageNotFoundError, version
 
@@ -45,6 +46,7 @@ from torch import Tensor
 from torch.distributed.tensor import DTensor
 
 from ..utils import device
+from .registry import VeomniOp
 
 
 __all__ = [
@@ -55,6 +57,7 @@ __all__ = [
     "MXFP8_BLOCK_SIZE",
     "NVFP4_BLOCK_SIZE",
     "TORCHAO_REQUIRED_VERSION",
+    "iter_mxfp8_projections",
     "mxfp8_model_projection",
     "nvfp4_fake_quant",
     "torchao_fake_quant",
@@ -334,6 +337,25 @@ def torchao_mxfp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None, 
     _require_mxfp8_runtime(None if emulated else x.device)
     output = _MXFP8LinearFunction.apply(x, weight, emulated)
     return output if bias is None else output + bias.to(output.dtype)
+
+
+def iter_mxfp8_projections(model: torch.nn.Module) -> Iterator[tuple[str, torch.nn.Module | None, VeomniOp]]:
+    """Yield each projection site bound to a standard MXFP8 row, including aliases."""
+    for path, owner in model.named_modules(remove_duplicate=False):
+        for attr, op in vars(owner).items():
+            if not (
+                isinstance(op, VeomniOp)
+                and op.op in ("linear", "gated_mlp")
+                and op.variant == "standard"
+                and op.impl == "torchao"
+                and op.kwargs.get("dtype") == "mxfp8"
+            ):
+                continue
+            # A standard linear handle calls veomni_<proj>(self.<proj>, x).
+            names = (attr.removeprefix("veomni_"),) if op.op == "linear" else ("gate_proj", "up_proj", "down_proj")
+            for name in names:
+                layer = getattr(owner, name, None)
+                yield f"{path}.{name}" if path else name, layer if isinstance(layer, torch.nn.Module) else None, op
 
 
 def validate_mxfp8_projection_hooks(projection: torch.nn.Module, name: str) -> None:

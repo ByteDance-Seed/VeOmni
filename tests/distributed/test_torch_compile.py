@@ -1238,6 +1238,47 @@ def test_compile_mxfp8_backend(backend):
             compile_decoder_blocks(model, config)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(("family", "target"), [("linear", "self_attn.q_proj"), ("gated_mlp", "mlp.down_proj")])
+def test_compile_checks_each_selected_mxfp8_projection(monkeypatch, family, target):
+    from veomni.models.transformers.llama.modeling_llama import LlamaDecoderLayer
+    from veomni.ops import VeomniOp
+    from veomni.ops import registry as ops_registry
+
+    from ..models.compare import eager_ops_config
+    from ..models.tiny_configs import tiny_llama_config
+
+    # The preflight only reads bound handles and never runs a torchao kernel.
+    is_available = ops_registry.is_package_available
+    monkeypatch.setattr(ops_registry, "is_package_available", lambda pkg: pkg == "torchao" or is_available(pkg))
+    monkeypatch.setattr(VeomniOp, "_intern", dict(VeomniOp._intern))
+    config = tiny_llama_config()
+    ops = eager_ops_config()
+    setattr(
+        ops,
+        f"{family}_implementation",
+        {
+            "name": "eager",
+            "overrides": [{"site": r"layers\.[01]\..*", "name": "torchao", "kwargs": {"dtype": "mxfp8"}}],
+        },
+    )
+    config._set_ops_implementation(ops)
+    model = nn.Module()
+    model._no_split_modules = ["LlamaDecoderLayer"]
+    model.layers = nn.ModuleList(LlamaDecoderLayer(config, index) for index in range(3))
+    compile_config = CompileConfig(backend="aot_eager")
+
+    # A clean first block can prime a graph that Dynamo would also use for the
+    # second block. Reject its hook before either block starts tracing.
+    hook = model.layers[1].get_submodule(target).register_forward_hook(lambda module, args, output: 2 * output)
+    with pytest.raises(ValueError, match=rf"MXFP8.*layers\.1\.{target}.*hooks"):
+        compile_decoder_blocks(model, compile_config)
+    assert not any(getattr(layer, "_veomni_forward_compiled", False) for layer in model.layers)
+    hook.remove()
+    model.layers[2].get_submodule(target).register_forward_hook(lambda module, args, output: 2 * output)
+    assert compile_decoder_blocks(model, compile_config) == 3
+
+
 def test_compile_rejection_is_skipped_without_an_ops_config():
     """A model with no ops config has nothing to reject and must not crash the build."""
     from veomni.distributed.torch_compile import _reject_incompatible_ops
