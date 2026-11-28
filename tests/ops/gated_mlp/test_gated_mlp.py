@@ -1172,32 +1172,43 @@ def test_torchao_mxfp8_rejects_hooked_mlp_projection(name, register, hook):
         gated_torchao.wrapper(mlp, torch.ones(1, 32), dtype="mxfp8", emulated=True)
 
 
-@_cpu
 @_requires_torchao
 @pytest.mark.parametrize(
-    ("activation_dtype", "autocast"),
-    [(torch.bfloat16, False), (torch.float32, False), (torch.float32, True)],
+    ("activation_dtype", "autocast", "emulated"),
+    [
+        pytest.param(torch.bfloat16, False, True, marks=_cpu),
+        pytest.param(torch.float32, False, True, marks=_cpu),
+        pytest.param(torch.float32, True, True, marks=_cpu),
+        pytest.param(torch.bfloat16, False, False, id="native"),
+    ],
 )
-def test_torchao_mxfp8_projects_gate_up_and_down(activation_dtype, autocast):
+def test_torchao_mxfp8_projects_gate_up_and_down(activation_dtype, autocast, emulated):
     """The selected row applies MXFP8 to all projections around the requested clamp and GELU."""
     from veomni.ops import OpsSelection, VeomniOp
     from veomni.ops.torchao import torchao_mxfp8_linear
+    from veomni.utils.device import get_device_type, get_gpu_compute_capability
 
+    if not emulated and (not IS_CUDA_AVAILABLE or torch.version.hip is not None or get_gpu_compute_capability() < 100):
+        pytest.skip("Native MXFP8 requires NVIDIA SM100+.")
+    target = "cpu" if emulated else get_device_type()
     torch.manual_seed(0)
-    mlp = _mlp_of(nn.Linear(32, 64), nn.Linear(32, 64, bias=False), nn.Linear(64, 32)).to(activation_dtype)
-    x = torch.randn(3, 32, dtype=activation_dtype, requires_grad=True)
+    mlp = _mlp_of(nn.Linear(32, 64), nn.Linear(32, 64, bias=False), nn.Linear(64, 32)).to(
+        device=target, dtype=activation_dtype
+    )
+    x = torch.randn(3, 32, dtype=activation_dtype, device=target, requires_grad=True)
     native = VeomniOp("gated_mlp", "standard", OpsSelection(name="torchao", kwargs={"dtype": "mxfp8"}))
-    with pytest.raises(RuntimeError, match="SM100"):
-        native(mlp, x)
+    if emulated:
+        with pytest.raises(RuntimeError, match="SM100"):
+            native(mlp, x)
 
-    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": True, "block_size": 32})
+    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": emulated, "block_size": 32})
     output_dtype = torch.bfloat16 if autocast else activation_dtype
-    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+    with torch.autocast(target, dtype=torch.bfloat16, enabled=autocast):
         out = VeomniOp("gated_mlp", "standard", selection)(mlp, x, swiglu_limit=0.5, activation="gelu")
-        gate = torchao_mxfp8_linear(x, mlp.gate_proj.weight, mlp.gate_proj.bias, emulated=True).to(output_dtype)
-        up = torchao_mxfp8_linear(x, mlp.up_proj.weight, emulated=True).to(output_dtype)
+        gate = torchao_mxfp8_linear(x, mlp.gate_proj.weight, mlp.gate_proj.bias, emulated=emulated).to(output_dtype)
+        up = torchao_mxfp8_linear(x, mlp.up_proj.weight, emulated=emulated).to(output_dtype)
         hidden = F.gelu(gate.clamp(max=0.5)) * up.clamp(min=-0.5, max=0.5)
-        expected = torchao_mxfp8_linear(hidden, mlp.down_proj.weight, mlp.down_proj.bias, emulated=True).to(
+        expected = torchao_mxfp8_linear(hidden, mlp.down_proj.weight, mlp.down_proj.bias, emulated=emulated).to(
             output_dtype
         )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)

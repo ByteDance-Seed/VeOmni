@@ -232,7 +232,10 @@ def _reject_incompatible_ops(model: nn.Module, backend: str | None = "inductor")
         if any("dtype='mxfp4'" in entry for entry in offending):
             reasons.append("MXFP4 uses float8_e8m0fnu scales that Inductor cannot lower")
         if any("dtype='mxfp8'" in entry for entry in offending):
-            reasons.append("the MXFP8 gated MLP produces different weight gradients under Inductor")
+            reasons.append(
+                "on B200 with PyTorch 2.11, Inductor changed the down-projection weight gradient "
+                "in both native and emulated MXFP8 gated MLPs. Use backend='aot_eager' for this row"
+            )
         raise RuntimeError(
             f"model.accelerator.torch_compile cannot be combined with {', '.join(offending)}: "
             f"{' and '.join(reasons)}. Disable compilation or select a different dtype."

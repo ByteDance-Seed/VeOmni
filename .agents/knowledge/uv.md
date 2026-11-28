@@ -41,7 +41,7 @@ pyproject.toml
 │   ├── magi         Optional NVIDIA SM100+ MagiAttention FFA (combine with gpu):
 │   │                  magi-attention + create-block-mask-cuda + flash-attn-cute
 │   │                  + magi-to-hstu-cuda + debugpy; source-built CUDA extensions
-│   ├── float8       Optional torchao==0.18.0 for float8 training and the torchao FP4 QAT rows (combine with gpu);
+│   ├── float8       Optional torchao==0.18.0 for FP8/MXFP8 training and FP4 QAT (combine with gpu);
 │   │                  kept out of gpu so jobs that use neither skip the wheel (and keep PEFT interop)
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
 │   │                  torch 2.10.0+cpu + torch-npu 2.10.0
@@ -75,7 +75,7 @@ conflicts with the NPU extras.
 ```bash
 uv sync --extra gpu --dev                      # NVIDIA GPU
 uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM100+)
-uv sync --extra gpu --extra float8 --dev       # NVIDIA GPU + torchao (float8 training SM89+, FP4 QAT rows)
+uv sync --extra gpu --extra float8 --dev       # NVIDIA GPU + torchao (FP8 SM89+, native MXFP8 SM100+, FP4 QAT)
 uv sync --extra npu --dev                      # Ascend NPU x86
 uv sync --extra npu_aarch64 --dev              # Ascend NPU ARM
 ```
@@ -138,7 +138,7 @@ See `docs/design/deepgemm_moe.md` for supported shapes and precision.
 | `flash-qla` | PyPI `0.1.2` | pure-Python wheel with usable metadata; requires TileLang 0.1.9; full forward/backward support on SM90 and SM100 |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
 | `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM100 source builds, omitted by the default GPU CI install |
-| `torchao` | PyPI `0.18.0` | optional `--extra float8`, backend of the `torchao` low-precision op rows (`fp8`, `nvfp4`, `mxfp4`); exact pin checked at runtime by `veomni/ops/torchao.py`, omitted by the default GPU CI install, so the float8 GPU tests and the torchao QAT tests skip there. Incompatible with the `gpu` extra's `peft==0.18.1` torchao integration (`LinearActivationQuantizedTensor` removed), so PEFT interop fails with the extra installed |
+| `torchao` | PyPI `0.18.0` | optional `--extra float8`, backend of the `torchao` low-precision op rows (`fp8`, `mxfp8`, `nvfp4`, `mxfp4`); exact pin checked at runtime by `veomni/ops/torchao.py`, omitted by the default GPU CI install, so the float8 GPU tests and the torchao QAT tests skip there. Incompatible with the `gpu` extra's `peft==0.18.1` torchao integration (`LinearActivationQuantizedTensor` removed), so PEFT interop fails with the extra installed |
 
 FlashQLA 0.1.2 supports full forward/backward execution on NVIDIA SM90 and
 SM100. Its SM120 path is forward-only, so VeOmni's full op registration is

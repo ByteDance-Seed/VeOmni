@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Physical two-GPU acceptance for torchao FP4 QAT rows on a VeOmni Qwen3.
+"""Two-GPU Qwen3 training with torchao FP4 or MXFP8 and ordinary FSDP2 AllGather.
 
-No CPU collective substitute: this case requires two CUDA devices and NCCL. It
-covers accumulated updates, DCP continuation and ordinary HF export/reload with
-``linear_implementation`` and ``gated_mlp_implementation`` set to every torchao
-FP4 row registered on this branch. The rows themselves are validated on CPU in
-tests/ops/; what only this case can reach is the FSDP2 and checkpoint boundary.
+Exercise accumulated updates, DCP continuation and HF export/reload on NCCL.
 """
 
 import contextlib
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -34,39 +31,31 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_comp
 
 
 _LAUNCH = LaunchSpec(nproc=2)
-_TORCHAO_FP4_DTYPES = ("nvfp4", "mxfp4")
 
 
-def _selection(dtype: str):
-    from veomni.ops import OpsSelection
-
-    return OpsSelection(name="torchao", kwargs={"dtype": dtype})
+def _rows(selection):
+    return {"linear_implementation": selection, "gated_mlp_implementation": selection}
 
 
-def _rows(dtype: str) -> dict[str, dict]:
-    sel = {"name": "torchao", "kwargs": {"dtype": dtype}}
-    return {"linear_implementation": sel, "gated_mlp_implementation": sel}
-
-
-def _qat_ops(dtype: str):
-    """The selections a training run passes for these rows, as the trainer does on every build."""
+def _qat_ops(selection):
     from tests.tools.training_utils import make_eager_ops_config
 
-    return make_eager_ops_config(**_rows(dtype))
+    return make_eager_ops_config(**_rows(selection))
 
 
-def _build_fsdp(weights_path: Path, dtype: str, *, skip_hf_load: bool = False):
+def _build_fsdp(weights_path: Path, selection: dict, *, skip_hf_load: bool = False):
     from veomni.arguments import MixedPrecisionConfig
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models import build_config, build_foundation_model
+    from veomni.ops import OpsSelection
 
-    expected = _selection(dtype)
+    expected = OpsSelection(**selection)
     config = build_config(str(weights_path))
     # The trainer passes its own ops instance, which replaces the recorded rows.
     assert config.ops_config.linear_implementation == expected
     assert config.ops_config.gated_mlp_implementation == expected
     model = build_foundation_model(
-        config, init_device="meta", torch_dtype="float32", ops_implementation=_qat_ops(dtype)
+        config, init_device="meta", torch_dtype="float32", ops_implementation=_qat_ops(selection)
     )
     assert model.config.ops_config.linear_implementation == expected
     assert type(model).__module__ == "veomni.models.transformers.qwen3.modeling_qwen3"
@@ -108,35 +97,32 @@ def _optimizer_snapshot(model, optimizer):
 
 
 @contextlib.contextmanager
-def _record_quantizer_calls():
-    """Count fake-quantizer calls per family, so a step proves both rows ran."""
+def _record_quantizer_calls(dtype):
+    """Count FP4 operand rounding or MXFP8 projections for each selected row."""
     import veomni.ops.kernels.gated_mlp.standard.torchao as mlp_row
     import veomni.ops.kernels.linear.standard.torchao as linear_row
 
     calls = {"linear": 0, "gated_mlp": 0}
-    originals = {"linear": linear_row.torchao_fake_quant, "gated_mlp": mlp_row.torchao_fake_quant}
 
-    def _recorder(family):
-        def _factory(dtype):
-            quantize = originals[family](dtype)
+    def counted(family, fn):
+        def wrapped(*args, **kwargs):
+            calls[family] += 1
+            return fn(*args, **kwargs)
 
-            def _wrapped(tensor, block_size=None):
-                calls[family] += 1
-                if block_size is None:
-                    return quantize(tensor)
-                return quantize(tensor, block_size)
+        return wrapped
 
-            return _wrapped
+    def fp4_factory(family, factory):
+        return lambda dtype: counted(family, factory(dtype))
 
-        return _factory
-
-    linear_row.torchao_fake_quant = _recorder("linear")
-    mlp_row.torchao_fake_quant = _recorder("gated_mlp")
-    try:
+    with contextlib.ExitStack() as stack:
+        for family, row in (("linear", linear_row), ("gated_mlp", mlp_row)):
+            if dtype == "mxfp8":
+                fn = counted(family, row.mxfp8_model_projection)
+                stack.enter_context(patch.object(row, "mxfp8_model_projection", fn))
+            else:
+                factory = fp4_factory(family, row.torchao_fake_quant)
+                stack.enter_context(patch.object(row, "torchao_fake_quant", factory))
         yield calls
-    finally:
-        linear_row.torchao_fake_quant = originals["linear"]
-        mlp_row.torchao_fake_quant = originals["gated_mlp"]
 
 
 def _step(model, optimizer, step):
@@ -145,7 +131,8 @@ def _step(model, optimizer, step):
     before = {name: param.to_local().detach().clone() for name, param in model.named_parameters()}
     optimizer.zero_grad(set_to_none=True)
     losses = []
-    with _record_quantizer_calls() as calls:
+    dtype = model.config.ops_config.linear_implementation.kwargs["dtype"]
+    with _record_quantizer_calls(dtype) as calls:
         # Unequal microbatch lengths exercise per-forward dynamic MX quantization.
         for microbatch, length in enumerate((17, 31)):
             generator = torch.Generator().manual_seed(1000 + 100 * step + 10 * dist.get_rank() + microbatch)
@@ -158,16 +145,12 @@ def _step(model, optimizer, step):
             loss.backward()
             losses.append(loss.detach().cpu())
 
-    # Per layer and forward pass: four attention projections with two operands
-    # each through `linear`, and five rounded tensors through `gated_mlp` (the
-    # input once for gate/up, the hidden state once, three weights). Gradient
-    # checkpointing reruns every layer's forward in backward, so each micro-batch
-    # makes two passes. Both rows must be reached. The counts were verified for
-    # torchao; a new row must re-check them against its own implementation.
-    layers, microbatches, passes = model.config.num_hidden_layers, 2, 2
+    # Four attention and three MLP projections per layer. The FP4 rows round
+    # eight attention operands and five MLP operands. Recompute repeats each forward.
+    passes = model.config.num_hidden_layers * 2 * 2
     assert calls == {
-        "linear": 4 * 2 * layers * microbatches * passes,
-        "gated_mlp": 5 * layers * microbatches * passes,
+        "linear": (4 if dtype == "mxfp8" else 8) * passes,
+        "gated_mlp": (3 if dtype == "mxfp8" else 5) * passes,
     }, calls
 
     for name, param in model.named_parameters():
@@ -181,7 +164,7 @@ def _step(model, optimizer, step):
     return torch.stack(losses)
 
 
-def _fsdp_worker(root: str, dtype: str):
+def _fsdp_worker(root: str, selection: dict):
     from safetensors import safe_open
     from transformers import Qwen3Config
 
@@ -189,6 +172,7 @@ def _fsdp_worker(root: str, dtype: str):
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
     from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config
     from veomni.models import build_foundation_model
+    from veomni.ops import OpsSelection
     from veomni.utils.save_safetensor_utils import save_hf_safetensor
 
     assert dist.get_backend() == dist.Backend.NCCL, "This acceptance case requires physical CUDA/NCCL execution."
@@ -211,15 +195,15 @@ def _fsdp_worker(root: str, dtype: str):
                 tie_word_embeddings=False,
                 use_cache=False,
             )
-            config.ops_implementation = _rows(dtype)
+            config.ops_implementation = _rows(selection)
             source = build_foundation_model(
-                config, init_device="cpu", torch_dtype="float32", ops_implementation=_qat_ops(dtype)
+                config, init_device="cpu", torch_dtype="float32", ops_implementation=_qat_ops(selection)
             )
             source.save_pretrained(base_path, safe_serialization=True)
             del source
         dist.barrier()
 
-        model, optimizer = _build_fsdp(base_path, dtype)
+        model, optimizer = _build_fsdp(base_path, selection)
         initial = _master_snapshot(model)
         with safe_open(base_path / "model.safetensors", framework="pt", device="cpu") as checkpoint:
             assert set(checkpoint.keys()) == set(initial)
@@ -237,7 +221,7 @@ def _fsdp_worker(root: str, dtype: str):
         expected_optimizer = _optimizer_snapshot(model, optimizer)
         del model, optimizer
 
-        resumed, resumed_optimizer = _build_fsdp(base_path, dtype, skip_hf_load=True)
+        resumed, resumed_optimizer = _build_fsdp(base_path, selection, skip_hf_load=True)
         DistributedCheckpointer.load(str(dcp_path), {"model": resumed, "optimizer": resumed_optimizer})
         torch.testing.assert_close(_master_snapshot(resumed), saved_weights, atol=0, rtol=0)
         torch.testing.assert_close(_optimizer_snapshot(resumed, resumed_optimizer), saved_optimizer, atol=0, rtol=0)
@@ -253,8 +237,8 @@ def _fsdp_worker(root: str, dtype: str):
             model_assets=[resumed.config],
         )
         torch.testing.assert_close(_master_snapshot(resumed), expected_weights, atol=0, rtol=0)
-        reloaded, _ = _build_fsdp(hf_path, dtype)
-        expected = _selection(dtype)
+        reloaded, _ = _build_fsdp(hf_path, selection)
+        expected = OpsSelection(**selection)
         assert reloaded.config.ops_config.linear_implementation == expected
         assert reloaded.config.ops_config.gated_mlp_implementation == expected
         rounded_weights = {name: weight.bfloat16().float() for name, weight in expected_weights.items()}
@@ -264,12 +248,23 @@ def _fsdp_worker(root: str, dtype: str):
 
 
 @pytest.mark.launch_plan(provider=_LAUNCH)
-@pytest.mark.parametrize("dtype", _TORCHAO_FP4_DTYPES)
-def test_qwen3_torchao_qat_two_gpu_fsdp2_checkpoint_resume(tmp_path, monkeypatch, dtype):
+@pytest.mark.parametrize(
+    ("dtype", "emulated"),
+    [
+        pytest.param("nvfp4", None, id="nvfp4"),
+        pytest.param("mxfp4", None, id="mxfp4"),
+        pytest.param("mxfp8", True, id="mxfp8-emulated"),
+        pytest.param("mxfp8", False, id="mxfp8-native"),
+    ],
+)
+def test_qwen3_torchao_qat_two_gpu_fsdp2_checkpoint_resume(tmp_path, monkeypatch, dtype, emulated):
     if torch.version.hip is not None or not IS_CUDA_AVAILABLE or runner_device_count() < _LAUNCH.nproc:
         pytest.skip("Requires two NVIDIA CUDA GPUs; no CPU/Gloo substitute.")
     if not all(get_gpu_compute_capability(rank) >= 80 for rank in range(_LAUNCH.nproc)):
         pytest.skip("Requires CUDA GPUs with native BF16 support.")
+    if emulated is False and any(get_gpu_compute_capability(rank) < 100 for rank in range(_LAUNCH.nproc)):
+        pytest.skip("Native MXFP8 requires two NVIDIA SM100+ devices.")
     pytest.importorskip("torchao")
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
-    torchrun(_fsdp_worker, _LAUNCH.nproc, str(tmp_path), dtype)
+    kwargs = {"dtype": dtype} if emulated is None else {"dtype": dtype, "emulated": emulated}
+    torchrun(_fsdp_worker, _LAUNCH.nproc, str(tmp_path), {"name": "torchao", "kwargs": kwargs})

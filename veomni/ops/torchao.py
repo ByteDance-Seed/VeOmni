@@ -57,6 +57,7 @@ __all__ = [
     "MXFP8_BLOCK_SIZE",
     "NVFP4_BLOCK_SIZE",
     "TORCHAO_REQUIRED_VERSION",
+    "default_emulated",
     "iter_mxfp8_projections",
     "mxfp8_model_projection",
     "nvfp4_fake_quant",
@@ -78,6 +79,11 @@ NVFP4_BLOCK_SIZE = 16
 MXFP4_BLOCK_SIZE = 32
 FP4_SUPPORTED_DTYPES: tuple[str, ...] = ("nvfp4", "mxfp4")
 _FP4_BLOCK_SIZES = {"nvfp4": NVFP4_BLOCK_SIZE, "mxfp4": MXFP4_BLOCK_SIZE}
+
+
+def default_emulated(dtype: str) -> bool:
+    """FP8 and MXFP8 default to native GEMMs; NVFP4 and MXFP4 default to emulation."""
+    return dtype in FP4_SUPPORTED_DTYPES
 
 
 def validate_float8_recipe(recipe: str) -> str:
@@ -257,6 +263,8 @@ def _quantize_mxfp8(tensor: Tensor, emulated: bool) -> Tensor:
     from torchao.quantization.quantize_.common import KernelPreference
 
     preference = KernelPreference.EMULATED if emulated else KernelPreference.AUTO
+    # RCEIL rounds amax / 448 up to an E8M0 power of two, so the block
+    # maximum fits in E4M3FN. This is the cuBLAS MXFP8 scaling recipe.
     quantized = MXTensor.to_mx(
         tensor.contiguous(),
         torch.float8_e4m3fn,
@@ -271,10 +279,12 @@ def _quantize_mxfp8(tensor: Tensor, emulated: bool) -> Tensor:
     )
 
 
-def _mxfp8_padded_rows(tensor: Tensor) -> Tensor:
-    rows = tensor.reshape(-1, tensor.shape[-1])
+def _mxfp8_wgrad_operand(rows: Tensor, emulated: bool) -> Tensor:
+    """Quantize the transpose in whole 32-token blocks, zero-filling the final block."""
     padding = (-rows.shape[0]) % MXFP8_BLOCK_SIZE
-    return F.pad(rows, (0, 0, 0, padding)) if padding else rows
+    if padding:
+        rows = F.pad(rows, (0, 0, 0, padding))
+    return _quantize_mxfp8(rows.t(), emulated)
 
 
 def _mxfp8_weight_operand(weight: Tensor, emulated: bool, *, transposed: bool = False) -> Tensor:
@@ -297,10 +307,9 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         shape = (*x.shape[:-1], weight.shape[0])
         if x.numel() == 0:
             return x.new_empty(shape, dtype=torch.bfloat16)
-        output = torch.mm(
-            _quantize_mxfp8(_mxfp8_padded_rows(x), emulated), _mxfp8_weight_operand(weight, emulated).t()
-        )
-        return output[: x.numel() // x.shape[-1]].reshape(shape)
+        x_rows = x.reshape(-1, x.shape[-1])
+        output = torch.mm(_quantize_mxfp8(x_rows, emulated), _mxfp8_weight_operand(weight, emulated).t())
+        return output.reshape(shape)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -308,17 +317,15 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         if x.numel() == 0:
             return torch.empty_like(x), grad_output.new_zeros(weight.shape, dtype=weight.dtype), None
-        x_rows, grad_rows = _mxfp8_padded_rows(x), _mxfp8_padded_rows(grad_output)
+        x_rows = x.reshape(-1, x.shape[-1])
+        grad_rows = grad_output.reshape(-1, grad_output.shape[-1])
         grad_input = torch.mm(
             _quantize_mxfp8(grad_rows, ctx.emulated), _mxfp8_weight_operand(weight, ctx.emulated, transposed=True).t()
         )
-        # The weight gradient contracts over tokens, including zero padding in
-        # the final 32-element block of each transposed operand.
         grad_weight = torch.mm(
-            _quantize_mxfp8(grad_rows.t(), ctx.emulated), _quantize_mxfp8(x_rows.t(), ctx.emulated).t()
+            _mxfp8_wgrad_operand(grad_rows, ctx.emulated), _mxfp8_wgrad_operand(x_rows, ctx.emulated).t()
         )
-        grad_input = grad_input[: x.numel() // x.shape[-1]].reshape_as(x)
-        return grad_input.to(x.dtype), grad_weight.to(weight.dtype), None
+        return grad_input.reshape_as(x).to(x.dtype), grad_weight.to(weight.dtype), None
 
 
 def torchao_mxfp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None, *, emulated: bool = False) -> Tensor:
@@ -343,7 +350,9 @@ def torchao_mxfp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None, 
     if weight.device != x.device or (bias is not None and bias.device != x.device):
         raise ValueError("MXFP8 linear operands must be on the same device.")
     if torch.is_autocast_enabled(x.device.type):
-        x = x.to(torch.get_autocast_dtype(x.device.type))
+        # The MX quantizer accepts BF16 or FP32. Keep the master weight's
+        # precision and cast the model-facing result in mxfp8_model_projection.
+        x = x.to(torch.bfloat16)
     if x.dtype not in (torch.bfloat16, torch.float32) or weight.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError(f"MXFP8 linear requires BF16 or FP32 inputs and weights, got {x.dtype} and {weight.dtype}.")
     _require_mxfp8_runtime(None if emulated else x.device)
@@ -418,8 +427,8 @@ def _mxfp4_roundtrip(x: Tensor, block_size: int) -> Tensor:
     from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-    # ``MXFP4`` is torchao's `e2m1` element type with an `e8m0` scale, one per group;
-    # there is no per-tensor scale, which is the whole difference from NVFP4.
+    # MXFP4 QAT keeps torchao's OCP-style FLOOR recipe to reproduce the E2M1
+    # deployment round trip, including saturation at the top of a block.
     quantized = MXTensor.to_mx(
         x_2d,
         torch.float4_e2m1fn_x2,

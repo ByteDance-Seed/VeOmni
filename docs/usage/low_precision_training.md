@@ -111,6 +111,12 @@ Native MXFP8 requires NVIDIA SM100+ and `torchao==0.18.0`. Set `emulated: true`
 in a row's `kwargs` for emulation. The input and output feature dimensions must
 both be multiples of 32. Token counts may be ragged or zero.
 
+Native numerical and two-GPU FSDP2 results have been verified manually on
+B200. GitHub Actions runs native tests only when a maintainer configures an
+SM100+ runner using `MXFP8_SM100_RUNNER_LABEL`. The distributed case needs
+two visible SM100+ GPUs. The regular GPU suite exercises emulated MXFP8
+with ordinary FSDP2 AllGather after installing the `float8` extra.
+
 MXFP8 reads each projection's weight directly. It rejects forward and backward
 module hooks registered on the selected linear projection or on the gate, up,
 or down projection of a selected MLP. To observe a whole block, register the
@@ -119,21 +125,26 @@ compilation. When using `torch.compile` directly across modules with different
 hook sets, set `torch._dynamo.config.skip_nnmodule_hook_guards = False` before
 the first compiled call so PyTorch checks the hooks when reusing a graph.
 
-Each group of 32 elements shares an E8M0 scale for its E4M3 values. Forward and
+Each group of 32 elements shares an E8M0 scale. The cuBLAS MXFP8 RCEIL
+recipe rounds the block maximum magnitude divided by 448 up to a power of
+two so the largest value fits in E4M3FN. MXFP4 QAT keeps torchao's
+OCP-style FLOOR recipe to match the E2M1 deployment format. Forward and
 input-gradient GEMMs quantize the supplied weight independently along their
 reduction dimensions. The weight-gradient GEMM quantizes the input and output
-gradient along the token dimension. The GEMMs produce BF16. At the model
-boundary the projection returns the active autocast dtype, or the input dtype
-when autocast is off. This also allows an FP32 model to enable MXFP8 on a single
-attention projection. FSDP2 uses its ordinary floating-point AllGather by default.
+gradient along the token dimension. The GEMMs produce BF16. Under BF16 or
+FP16 autocast the quantizer reads BF16 activations and keeps the supplied
+BF16 or FP32 weight precision. The projection returns the active autocast
+dtype, or the input dtype when autocast is off. This also allows an FP32 model
+to enable MXFP8 on a single attention projection. FSDP2 uses its ordinary
+floating-point AllGather by default.
 
-On B200 with PyTorch 2.11, CUDA Inductor supports the linear row. With bias,
-compiler fusion can round the sum differently from eager execution. For the
-gated MLP, compiled down-projection weight gradients differed from an independent
-reference by up to 6% in relative L2 in testing. Use eager execution or
-`backend: aot_eager` for that row. CPU emulation works in eager mode; CPU
+A manual B200 comparison with PyTorch 2.11 found that CUDA Inductor
+preserved the MXFP8 linear weight and input gradients. Fusing the bias
+addition can change BF16 rounding. For gated MLPs, the bias-free
+down-projection weight gradient differed from eager in both native and
+emulated execution. Use eager or `backend: aot_eager` for that row. CPU
 Inductor lacks the E8M0 scale lowering. See the
-[compiler restrictions](../key_features/torch_compile.md).
+[compiler measurements and reproducer](../key_features/torch_compile.md#what-stays-refused).
 
 ### Optional FSDP2 AllGather
 
