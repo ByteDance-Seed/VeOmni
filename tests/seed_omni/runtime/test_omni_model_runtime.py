@@ -456,6 +456,7 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
                 offload_pin_memory=False,
                 max_load_broadcast_size=20.0,
                 expert_weight_fp8_all_gather=True,
+                mxfp8_all_gather=True,
                 expert_fsdp_shard_dim=0,
             ),
             torch_compile=SimpleNamespace(
@@ -478,6 +479,7 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
 
     def fake_parallelize(model, **kwargs):
         captured["expert_weight_fp8_all_gather"] = kwargs["expert_weight_fp8_all_gather"]
+        captured["mxfp8_all_gather"] = kwargs["mxfp8_all_gather"]
         captured["expert_fsdp_shard_dim"] = kwargs["expert_fsdp_shard_dim"]
         captured["weights_path"] = kwargs["weights_path"]
         captured["children"] = list(dict(model.named_children()))
@@ -504,6 +506,7 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     runtime._parallelize_composed_model()
 
     assert captured["expert_weight_fp8_all_gather"] is True
+    assert captured["mxfp8_all_gather"] is True
     assert captured["expert_fsdp_shard_dim"] == 0
     assert list(captured["weights_path"]) == ["module_b"]
     assert "module_a" not in captured["children"]

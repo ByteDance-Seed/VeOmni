@@ -23,6 +23,7 @@ declared module, composes their models into one ``OmniModel`` and cascades the
 
 import os
 from contextlib import nullcontext
+from copy import deepcopy
 from functools import partial
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -175,7 +176,12 @@ class ModuleRuntime(VeOmniModelRuntime):
             if self.is_eager:
                 self._init_eager_inference()
             else:
-                args.accelerator.fsdp_config.mixed_precision.enable = False
+                # The module loads BF16 weights directly. Keep its inference overrides
+                # local when the caller reuses the training or composed-wrap config.
+                self.args = deepcopy(args)
+                fsdp_config = self.args.accelerator.fsdp_config
+                fsdp_config.mixed_precision.enable = False
+                fsdp_config.mxfp8_all_gather = False
                 self.setup()
                 with self._scoped():
                     self._build_model()

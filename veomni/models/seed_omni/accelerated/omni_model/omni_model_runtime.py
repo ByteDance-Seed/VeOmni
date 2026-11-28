@@ -352,6 +352,7 @@ class OmniModelRuntime:
                 max_load_broadcast_size=acc.fsdp_config.max_load_broadcast_size,
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 expert_weight_fp8_all_gather=acc.fsdp_config.expert_weight_fp8_all_gather,
+                mxfp8_all_gather=acc.fsdp_config.mxfp8_all_gather,
                 expert_fsdp_shard_dim=acc.fsdp_config.expert_fsdp_shard_dim,
                 compile_config=compile_config,
                 **kwargs,

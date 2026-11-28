@@ -304,6 +304,10 @@ def test_linear_torchao_fp8_validates_arguments_and_dispatches(monkeypatch):
 
     with pytest.raises(ValueError, match="does not accept block_size"):
         linear_torchao.wrapper(linear, x, dtype="fp8", block_size=16)
+    with pytest.raises(ValueError, match="block_size=32"):
+        linear_torchao.wrapper(linear, x, dtype="mxfp8", block_size=16)
+    with pytest.raises(ValueError, match="recipe is only valid"):
+        linear_torchao.wrapper(linear, x, dtype="mxfp8", recipe="rowwise")
     with pytest.raises(ValueError, match="float8 recipe"):
         linear_torchao.wrapper(linear, x, dtype="fp8", recipe="invalid")
     with pytest.raises(ValueError, match="recipe is only valid for dtype='fp8'"):
@@ -325,6 +329,41 @@ def test_linear_torchao_fp8_validates_arguments_and_dispatches(monkeypatch):
     out_emulated = linear_torchao.wrapper(linear, x, dtype="fp8", emulated=True)
     torch.testing.assert_close(out_emulated, linear(x))
     assert seen[-1] == ((2, 32), (16, 32), True, "tensorwise", True)
+
+
+@_requires_torchao
+@pytest.mark.parametrize(
+    ("activation_dtype", "autocast"),
+    [(torch.bfloat16, False), (torch.float32, False), (torch.float32, True)],
+)
+def test_linear_torchao_mxfp8_uses_plain_parameters(activation_dtype, autocast):
+    """The selected row computes MXFP8 with the original FP32 weight and bias."""
+    from veomni.ops import OpsSelection
+    from veomni.ops.torchao import torchao_mxfp8_linear
+
+    torch.manual_seed(0)
+    linear = torch.nn.Linear(64, 32)
+    weight, bias = linear.weight, linear.bias
+    x = torch.randn(2, 5, 64, dtype=activation_dtype, requires_grad=True)
+    native = VeomniOp("linear", "standard", OpsSelection(name="torchao", kwargs={"dtype": "mxfp8"}))
+    with pytest.raises(RuntimeError, match="SM100"):
+        native(linear, x)
+
+    op = VeomniOp("linear", "standard", OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": True}))
+    output_dtype = torch.bfloat16 if autocast else activation_dtype
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        out = op(linear, x)
+        primitive = torchao_mxfp8_linear(x, weight, bias, emulated=True)
+    assert primitive.dtype == torch.bfloat16
+    expected = primitive.to(output_dtype)
+    assert linear.weight is weight and linear.bias is bias
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    for actual, reference in zip(
+        torch.autograd.grad(out.sum(), (x, weight, bias)),
+        torch.autograd.grad(expected.sum(), (x, weight, bias)),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @_requires_torchao

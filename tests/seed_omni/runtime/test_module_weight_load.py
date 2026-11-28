@@ -103,6 +103,7 @@ def test_parallelize_forwards_module_skip_decision(
                 offload_pin_memory=False,
                 low_precision_reduce_scatter_comm=False,
                 expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
+                mxfp8_all_gather=True,
                 expert_fsdp_shard_dim=0,
                 max_load_broadcast_size=20.0,
                 extra_parallel_only=False,
@@ -116,3 +117,4 @@ def test_parallelize_forwards_module_skip_decision(
     assert parallelize.call_args.kwargs["should_skip_hf_weight_load"] is False
     assert parallelize.call_args.kwargs["expert_weight_fp8_all_gather"] is expert_weight_fp8_all_gather
     assert parallelize.call_args.kwargs["expert_fsdp_shard_dim"] == 0
+    assert parallelize.call_args.kwargs["mxfp8_all_gather"] is True

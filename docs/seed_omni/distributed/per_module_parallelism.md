@@ -59,6 +59,14 @@ The same selection rule applies to standalone models and the composed
 `fsdp_scope: model` wrap; no separate scope flag is needed.
 See [DeepGEMM FP8 transport](../../design/deepgemm_moe.md#optional-fp8-parameter-all-gather).
 
+For dense torchao MXFP8 rows, `mxfp8_all_gather` follows the wrap owner.
+Set it per child under `fsdp_scope: module`, or on the top-level accelerator
+under `fsdp_scope: model`. The composed wrap rejects conflicting child
+overrides. See [dense MXFP8 transport](../../usage/low_precision_training.md#optional-fsdp2-allgather).
+
+During inference, a module that owns its FSDP2 wrap loads BF16 weights
+directly and uses ordinary AllGather. Its selected MXFP8 operators still run.
+
 Two per-module properties are not accelerator settings but change how the
 module is wrapped and saved:
 

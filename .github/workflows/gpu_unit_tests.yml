@@ -153,16 +153,56 @@ jobs:
       - name: Run the torchao float8 tests
         run: |
           uv run --frozen pytest -q tests/models/test_float8_training.py
-      - name: Run the torchao QAT tests
+      - name: Run the torchao projection tests
         shell: bash
         run: |
           files=(
-            tests/ops/linear/test_linear.py
+            tests/ops/linear/
+            tests/models/transformers/qwen/test_qwen3.py::test_qwen3_mxfp8_preserves_tied_weights
             tests/ops/gated_mlp/test_gated_mlp.py
+            tests/models/test_qat_fsdp.py
+            tests/distributed/test_torch_compile.py::test_mxfp8_aot_eager_training
           )
-          # The two-rank QAT acceptance lands with the FP4 format PR; run it once
-          # the file exists rather than failing on a missing path.
-          if [ -f tests/models/test_qat_fsdp.py ]; then
-            files+=(tests/models/test_qat_fsdp.py)
-          fi
           uv run --frozen pytest -q "${files[@]}"
+
+  mxfp8_native:
+    if: github.repository_owner == 'ByteDance-Seed' && vars.MXFP8_SM100_RUNNER_LABEL != ''
+    needs: lint
+    runs-on: [self-hosted, "${{ vars.MXFP8_SM100_RUNNER_LABEL }}"]
+    timeout-minutes: 30
+    container:
+      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:v0.1.11_cu130
+      options: --gpus all --ipc host --shm-size 32g
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: uv sync --frozen --extra gpu --extra float8 --group dev
+      - name: Check native MXFP8 devices
+        id: devices
+        run: |
+          uv run --no-sync python - <<'PYTHON'
+          import os
+          import torch
+          import torchao
+
+          if not torch.version.cuda or not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 10:
+              raise SystemExit("Native MXFP8 CI requires one visible NVIDIA SM100+ device.")
+          has_pair = torch.cuda.device_count() >= 2 and torch.cuda.get_device_capability(1)[0] >= 10
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"has_pair={str(has_pair).lower()}", file=output)
+          PYTHON
+      - name: Check native MXFP8 projections and compiled linear gradients
+        run: |
+          uv run --no-sync pytest -q -rs \
+            tests/ops/linear/test_mxfp8.py::test_native_mxfp8_matches_independent_oracle \
+            'tests/ops/gated_mlp/test_gated_mlp.py::test_torchao_mxfp8_projects_gate_up_and_down[native]' \
+            tests/distributed/test_torch_compile.py::test_native_mxfp8_inductor_linear
+      - name: Run native MXFP8 training with ordinary FSDP2 AllGather
+        if: steps.devices.outputs.has_pair == 'true'
+        run: |
+          uv run --no-sync pytest -q -rs \
+            'tests/models/test_qat_fsdp.py::test_qwen3_torchao_qat_two_gpu_fsdp2_checkpoint_resume[mxfp8-native]'
+      - name: Run two-rank MXFP8 transport and checkpoint tests
+        if: steps.devices.outputs.has_pair == 'true'
+        run: |
+          uv run --no-sync pytest -q -rs \
+            tests/models/test_mxfp8_fsdp.py::test_mxfp8_all_gather_two_gpu_checkpoint_resume

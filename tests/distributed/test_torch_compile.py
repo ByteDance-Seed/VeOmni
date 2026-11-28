@@ -1152,29 +1152,33 @@ def _model_with_ops(**ops_fields) -> nn.Module:
     return model
 
 
-@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
-def test_compile_rejects_torchao_mxfp4(field):
-    """MXTensor emits float8_e8m0fnu scales, which Inductor has no lowering for."""
+@pytest.mark.parametrize(
+    ("field", "dtype"),
+    [("linear_implementation", "mxfp4"), ("gated_mlp_implementation", "mxfp4"), ("gated_mlp_implementation", "mxfp8")],
+)
+def test_compile_rejects_torchao_mx_formats(field, dtype):
+    """Fallback config checks recognize incompatible base selections and merged overrides."""
     from veomni.distributed.torch_compile import _reject_incompatible_ops
     from veomni.ops import OpsSelection, SiteOverride
 
-    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"})
-    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='mxfp4'\)"):
+    selection = OpsSelection(name="torchao", kwargs={"dtype": dtype})
+    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='{dtype}'\)"):
         _reject_incompatible_ops(_model_with_ops(**{field: selection}))
 
     chained_override = OpsSelection(
         name="eager",
         overrides=[
             SiteOverride(site=r"layers\.0\.q_proj", name="torchao"),
-            SiteOverride(site=r"layers\.0\.q_proj", kwargs={"dtype": "mxfp4"}),
+            SiteOverride(site=r"layers\.0\.q_proj", kwargs={"dtype": dtype}),
         ],
     )
-    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='mxfp4'\)"):
-        _reject_incompatible_ops(_model_with_ops(**{field: chained_override}))
+    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='{dtype}'\)"):
+        _reject_incompatible_ops(_model_with_ops(**{field: chained_override}), backend=None)
 
 
-def test_compile_checks_bound_handles_for_unmatched_mxfp4_override(monkeypatch):
-    """An unmatched MXFP4 override on a real model with bound eager handles does not block compile."""
+@pytest.mark.parametrize(("op", "dtype"), [("linear", "mxfp4"), ("gated_mlp", "mxfp8")])
+def test_compile_checks_bound_handles_for_unmatched_mx_override(monkeypatch, op, dtype):
+    """An unmatched MX override on a real model with bound eager handles does not block compile."""
     from veomni.distributed.torch_compile import _reject_incompatible_ops
     from veomni.ops import OpsSelection, SiteOverride, VeomniOp
     from veomni.ops import registry as ops_registry
@@ -1184,18 +1188,18 @@ def test_compile_checks_bound_handles_for_unmatched_mxfp4_override(monkeypatch):
 
     selection = OpsSelection(
         name="eager",
-        overrides=[SiteOverride(site=r"layers\.99\.q_proj", name="torchao", kwargs={"dtype": "mxfp4"})],
+        overrides=[SiteOverride(site=r"layers\.99\.q_proj", name="torchao", kwargs={"dtype": dtype})],
     )
-    model = _model_with_ops(linear_implementation=selection)
-    model.veomni_q_proj = VeomniOp("linear", "standard", selection, site="layers.0.q_proj")
+    model = _model_with_ops(**{f"{op}_implementation": selection})
+    model.handle = VeomniOp(op, "standard", selection, site="layers.0.q_proj")
     _reject_incompatible_ops(model)
 
-    model.veomni_q_proj = VeomniOp("linear", "standard", selection, site="layers.99.q_proj")
-    with pytest.raises(RuntimeError, match=r"linear_implementation=torchao\(dtype='mxfp4'\)"):
+    model.handle = VeomniOp(op, "standard", selection, site="layers.99.q_proj")
+    with pytest.raises(RuntimeError, match=rf"{op}_implementation=torchao\(dtype='{dtype}'\)"):
         _reject_incompatible_ops(model)
 
     # Concrete model that binds gated_mlp (like Gemma3) but no linear handles:
-    # an unused linear_implementation MXFP4 selection must not block compile.
+    # an unused linear_implementation MX selection must not block compile.
     no_linear_model = _model_with_ops(linear_implementation=selection, gated_mlp_implementation="eager")
     no_linear_model.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", "eager")
     _reject_incompatible_ops(no_linear_model)
@@ -1216,6 +1220,145 @@ def test_compile_allows_other_rows(ops_fields):
     from veomni.distributed.torch_compile import _reject_incompatible_ops
 
     _reject_incompatible_ops(_model_with_ops(**ops_fields))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("backend", [None, "inductor"])
+@pytest.mark.parametrize("emulated", [False, True])
+def test_compile_rejects_mxfp8_gated_inductor(backend, emulated):
+    from veomni.ops import OpsSelection
+
+    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": emulated})
+    with pytest.raises(RuntimeError, match="down-projection weight gradient"):
+        compile_decoder_blocks(_model_with_ops(gated_mlp_implementation=selection), CompileConfig(backend=backend))
+
+
+class _MXFP8Block(nn.Module):
+    """Small decoder block using the same bound projection rows as a model."""
+
+    def __init__(self, family, emulated):
+        super().__init__()
+        from veomni.ops import OpsSelection, VeomniOp
+
+        selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": emulated})
+        if family == "linear":
+            self.q_proj = nn.Linear(64, 64)
+            self.veomni_q_proj = VeomniOp("linear", "standard", selection)
+        else:
+            self.gate_proj = nn.Linear(64, 128)
+            self.up_proj = nn.Linear(64, 128, bias=False)
+            self.down_proj = nn.Linear(128, 64)
+            self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", selection)
+
+    def forward(self, x):
+        if hasattr(self, "q_proj"):
+            return self.veomni_q_proj(self.q_proj, x)
+        return self.veomni_gated_mlp(self, x, swiglu_limit=2.0, activation="silu")
+
+
+def _mxfp8_training_result(model, x, dy):
+    x = x.detach().requires_grad_()
+    output = model(x)
+    parameters = dict(model.named_parameters())
+    dx, *grads = torch.autograd.grad(output, (x, *parameters.values()), dy)
+    return {"output": output.detach(), "input gradient": dx, **dict(zip(parameters, grads, strict=True))}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("family", ["linear", "gated_mlp"])
+def test_mxfp8_aot_eager_training(family):
+    pytest.importorskip("torchao")
+    torch.manual_seed(73)
+    model = nn.Sequential(*(_MXFP8Block(family, emulated=True) for _ in range(2)))
+    model._no_split_modules = ["_MXFP8Block"]
+    x, dy = torch.randn(2, 33, 64, dtype=torch.bfloat16).unbind()
+    expected = _mxfp8_training_result(model, x, dy)
+
+    assert compile_decoder_blocks(model, CompileConfig(backend="aot_eager", fullgraph=True)) == 2
+    for name, tensor in _mxfp8_training_result(model, x, dy).items():
+        torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+def test_native_mxfp8_inductor_linear():
+    from tests.ops.utils import require_nvidia_cuda
+
+    require_nvidia_cuda("torchao", min_cc=100)
+    torch.manual_seed(73)
+    model = nn.Sequential(_MXFP8Block("linear", emulated=False)).cuda()
+    model._no_split_modules = ["_MXFP8Block"]
+    x, dy = torch.randn(2, 33, 64, device="cuda", dtype=torch.bfloat16).unbind()
+    expected = _mxfp8_training_result(model, x, dy)
+
+    assert compile_decoder_blocks(model, CompileConfig(backend="inductor", fullgraph=True)) == 1
+    # Inductor can round the fused bias addition differently from eager BF16.
+    for name, tensor in _mxfp8_training_result(model, x, dy).items():
+        ref = expected[name].float()
+        relative_l2 = (tensor.float() - ref).norm() / ref.norm()
+        assert relative_l2 < 0.005, f"{name}: relative L2 = {relative_l2.item():.4%}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+@pytest.mark.parametrize("emulated", [False, True], ids=["native", "emulated"])
+def test_mxfp8_gated_inductor_down_gradient(emulated):
+    """Reproduce the unsupported backend directly to track when its gradient matches."""
+    from tests.ops.utils import require_nvidia_cuda
+
+    require_nvidia_cuda("torchao", min_cc=100)
+    torch.manual_seed(73)
+    model = _MXFP8Block("gated_mlp", emulated).cuda()
+    for proj in (model.gate_proj, model.up_proj, model.down_proj):
+        proj.bias = None
+    x, dy = torch.randn(2, 33, 64, device="cuda", dtype=torch.bfloat16).unbind()
+    expected = _mxfp8_training_result(model, x, dy)["down_proj.weight"]
+    # VeOmni rejects this combination before compilation; deliberately bypass that check.
+    model.compile(backend="inductor", fullgraph=True)
+    actual = _mxfp8_training_result(model, x, dy)["down_proj.weight"]
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert torch.isfinite(relative_l2)
+    if relative_l2 > 0.005:
+        pytest.xfail(f"Inductor MXFP8 down-projection gradient: relative L2 = {relative_l2.item():.4%}")
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(("family", "target"), [("linear", "self_attn.q_proj"), ("gated_mlp", "mlp.down_proj")])
+def test_compile_checks_each_selected_mxfp8_projection(monkeypatch, family, target):
+    from veomni.models.transformers.llama.modeling_llama import LlamaDecoderLayer
+    from veomni.ops import VeomniOp
+    from veomni.ops import registry as ops_registry
+
+    from ..models.compare import eager_ops_config
+    from ..models.tiny_configs import tiny_llama_config
+
+    # The preflight only reads bound handles and never runs a torchao kernel.
+    is_available = ops_registry.is_package_available
+    monkeypatch.setattr(ops_registry, "is_package_available", lambda pkg: pkg == "torchao" or is_available(pkg))
+    monkeypatch.setattr(VeomniOp, "_intern", dict(VeomniOp._intern))
+    config = tiny_llama_config()
+    ops = eager_ops_config()
+    setattr(
+        ops,
+        f"{family}_implementation",
+        {
+            "name": "eager",
+            "overrides": [{"site": r"layers\.[01]\..*", "name": "torchao", "kwargs": {"dtype": "mxfp8"}}],
+        },
+    )
+    config._set_ops_implementation(ops)
+    model = nn.Module()
+    model._no_split_modules = ["LlamaDecoderLayer"]
+    model.layers = nn.ModuleList(LlamaDecoderLayer(config, index) for index in range(3))
+    compile_config = CompileConfig(backend="aot_eager")
+
+    # A clean first block can prime a graph that Dynamo would also use for the
+    # second block. Reject its hook before either block starts tracing.
+    hook = model.layers[1].get_submodule(target).register_forward_hook(lambda module, args, output: 2 * output)
+    with pytest.raises(ValueError, match=rf"MXFP8.*layers\.1\.{target}.*hooks"):
+        compile_decoder_blocks(model, compile_config)
+    assert not any(getattr(layer, "_veomni_forward_compiled", False) for layer in model.layers)
+    hook.remove()
+    model.layers[2].get_submodule(target).register_forward_hook(lambda module, args, output: 2 * output)
+    assert compile_decoder_blocks(model, compile_config) == 3
 
 
 def test_compile_rejection_is_skipped_without_an_ops_config():

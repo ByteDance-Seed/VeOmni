@@ -466,6 +466,13 @@ def test_build_omni_model_runtime_args_rejects_a_launcher_compile_under_the_comp
         build_omni_model_runtime_args(args)
 
 
+def test_composed_wrap_rejects_child_mxfp8_transport_override():
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"fsdp_config": {"mxfp8_all_gather": True}}}})
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    with pytest.raises(ValueError, match=rf"mxfp8_all_gather.*{MODULE_B}"):
+        build_omni_model_runtime_args(args)
+
+
 def test_build_omni_model_runtime_args_rejects_extra_parallel_only_under_composed_wrap():
     """``fsdp_scope='model'`` rejects both top-level and per-module ``extra_parallel_only=True``."""
     # Root extra_parallel_only=True must be rejected even when every child overrides it to False,

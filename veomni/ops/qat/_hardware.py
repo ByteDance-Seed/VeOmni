@@ -21,7 +21,7 @@ from functools import cache
 import torch
 from torch import nn
 
-from ..platform import NVIDIA_SM90_PLUS
+from ..platform import NVIDIA_SM90_PLUS, NVIDIA_SM100_PLUS
 
 
 _TORCHAO_ROW = "torchao"
@@ -31,10 +31,10 @@ _TORCHAO_FIELDS = (
 )
 
 
-def _torchao_pair(kwargs: dict) -> tuple[str, bool]:
-    dtype = kwargs.get("dtype", "nvfp4")
-    emulated = kwargs.get("emulated")
-    return (dtype, (dtype != "fp8") if emulated is None else bool(emulated))
+def _torchao_pair(dtype: str, emulated: bool | None) -> tuple[str, bool]:
+    from ..torchao import default_emulated
+
+    return dtype, default_emulated(dtype) if emulated is None else bool(emulated)
 
 
 def _torchao_configs_for_selection(value) -> list[tuple[str, bool]]:
@@ -66,11 +66,7 @@ def _torchao_configs_for_selection(value) -> list[tuple[str, bool]]:
                     )
                 )
         states = next_states
-    return [
-        (dtype, (dtype != "fp8") if emulated is None else bool(emulated))
-        for name, dtype, emulated in states
-        if name == _TORCHAO_ROW
-    ]
+    return [_torchao_pair(dtype, emulated) for name, dtype, emulated in states if name == _TORCHAO_ROW]
 
 
 def _bound_torchao_configs(model) -> tuple[bool, list[tuple[str, bool]]]:
@@ -87,7 +83,7 @@ def _bound_torchao_configs(model) -> tuple[bool, list[tuple[str, bool]]]:
             if isinstance(attr, VeomniOp):
                 has_bound_ops = True
                 if attr.op in tracked_ops and attr.impl == _TORCHAO_ROW:
-                    found.append(_torchao_pair(attr.kwargs))
+                    found.append(_torchao_pair(attr.kwargs.get("dtype", "nvfp4"), attr.kwargs.get("emulated")))
     return has_bound_ops, found
 
 
@@ -130,26 +126,29 @@ def _native_bf16_qat_selections(model: nn.Module) -> set[str]:
 
 
 def reject_qat_without_native_bf16(model: nn.Module) -> None:
-    """Refuse unsupported CUDA hardware for selected torchao low-precision rows.
+    """Refuse unsupported hardware for selected torchao low-precision rows.
 
     * Native FP8 (``dtype="fp8"``, ``emulated=False``) requires NVIDIA CUDA SM89+
       (Ada, Hopper, Blackwell; ROCm is unsupported).
+    * Native MXFP8 requires NVIDIA CUDA SM100+ for block-scaled GEMMs.
     * Emulated FP4/FP8 rows require a CUDA device with native BF16 support
       (SM80 or newer) during distributed training.
 
     A training-path precondition rather than a row ``requirement``: emulated rows
-    also run on CPU for op-level tests, so non-CUDA hosts are skipped here.
+    also run on CPU for op-level tests.
     """
     configs = _model_torchao_configs(model)
     if not configs:
         return
     from ...utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
+    cc = get_gpu_compute_capability()
+    if ("mxfp8", False) in configs and (torch.version.hip is not None or cc < NVIDIA_SM100_PLUS.min_cc):
+        raise RuntimeError("Native MXFP8 (dtype='mxfp8', emulated=False) requires an NVIDIA CUDA SM100+ device.")
     if not IS_CUDA_AVAILABLE:
         return
 
-    cc = get_gpu_compute_capability()
-    if any(dtype == "fp8" and not emulated for dtype, emulated in configs):
+    if ("fp8", False) in configs:
         if torch.version.hip or cc < 89:
             raise RuntimeError(
                 "torchao native float8 (dtype='fp8', emulated=False) requires an NVIDIA CUDA SM89 or newer "

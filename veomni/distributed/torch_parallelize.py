@@ -547,6 +547,16 @@ def _configure_fsdp_gradient_reduction(
         module.set_gradient_divide_factor(gradient_divide_factor)
 
 
+def _uses_mxfp8_all_gather(model: nn.Module, enabled: bool) -> bool:
+    if not isinstance(enabled, bool):
+        raise ValueError("mxfp8_all_gather must be a boolean.")
+    if not enabled:
+        return False
+    from .fsdp2.mxfp8_all_gather import has_mxfp8_all_gather_targets
+
+    return has_mxfp8_all_gather_targets(model)
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
@@ -560,6 +570,7 @@ def parallelize_model_fsdp2(
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    mxfp8_all_gather: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -585,6 +596,20 @@ def parallelize_model_fsdp2(
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
+    mxfp8_all_gather = _uses_mxfp8_all_gather(model, mxfp8_all_gather)
+    if mxfp8_all_gather:
+        if (
+            extra_parallel_only
+            or kwargs.get("enable_fsdp_offload")
+            or not (mixed_precision.enable and mixed_precision.param_dtype == "bfloat16")
+        ):
+            raise ValueError("mxfp8_all_gather requires native FSDP2 with BF16 mixed precision and no CPU offload.")
+        if compile_config is not None and compile_config.enable:
+            raise ValueError("mxfp8_all_gather does not support torch.compile.")
+        from .fsdp2.mxfp8_all_gather import shared_mxfp8_weight_aliases
+
+        mxfp8_aliases = shared_mxfp8_weight_aliases(model)
+
     parallel_state = get_parallel_state()
     if extra_parallel_only and mixed_precision.enable:
         raise ValueError(
@@ -1019,6 +1044,10 @@ def parallelize_model_fsdp2(
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
+    if mxfp8_all_gather:
+        for alias, first_name in mxfp8_aliases.items():
+            if model.get_parameter(alias) is not model.get_parameter(first_name):
+                raise ValueError(f"Shared MXFP8 weights must belong to the same FSDP unit: {first_name}, {alias}.")
     # Persistent ExtraParallel parameters are ignored by every FSDP group and
     # retain their original 2D DTensor identity. Record them after wrapping so
     # gradient clipping can reduce their unique local shards once over the
@@ -1100,6 +1129,12 @@ def parallelize_model_fsdp2(
         module_is_peft_model=kwargs.pop("module_is_peft_model", None),
         module_adapter_path=kwargs.pop("module_adapter_path", None),
     )
+
+    if mxfp8_all_gather:
+        from .fsdp2.mxfp8_all_gather import register_mxfp8_all_gather
+
+        count = register_mxfp8_all_gather(model)
+        logger.info_rank0(f"Enabled MXFP8 all-gather for {count} dense projection weights.")
 
     if expert_weight_fp8_all_gather:
         from .fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
@@ -1221,6 +1256,7 @@ def build_parallelize_model(
     should_skip_hf_weight_load: bool = False,
     freeze_ple_embeddings: bool = False,
     frozen_ple_dtype: Optional[str] = None,
+    mxfp8_all_gather: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -1237,6 +1273,7 @@ def build_parallelize_model(
             enabled gradient checkpointing and before FSDP2 shards the blocks.
         expert_weight_fp8_all_gather: Gather weights of actual DeepGEMM experts in FP8.
             Ignored when the model contains no matching experts.
+        mxfp8_all_gather: Gather the weights used by dense torchao MXFP8 rows in both GEMM orientations.
         freeze_ple_embeddings: Freeze Qwen4-Exp PLE n-gram tables before parallelization.
         frozen_ple_dtype: Optional storage dtype (``"float32"`` or ``"bfloat16"``) applied
             to frozen PLE tables after parallelization and weight loading.
@@ -1251,6 +1288,9 @@ def build_parallelize_model(
 
     parallel_state = get_parallel_state()
     reject_qat_without_native_bf16(model)
+    if mxfp8_all_gather is not False and not (parallel_state.fsdp_enabled and parallel_state.dp_mode == "fsdp2"):
+        if _uses_mxfp8_all_gather(model, mxfp8_all_gather):
+            raise ValueError("mxfp8_all_gather requires a native FSDP2 wrap.")
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
@@ -1358,6 +1398,7 @@ def build_parallelize_model(
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 low_precision_reduce_scatter_comm=low_precision_reduce_scatter_comm,
                 expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
+                mxfp8_all_gather=mxfp8_all_gather,
                 expert_fsdp_shard_dim=expert_fsdp_shard_dim,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
