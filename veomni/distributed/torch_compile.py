@@ -156,38 +156,27 @@ def validate_compile_runtime(
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
 
-#: Op rows whose kernels emit dtypes Inductor cannot lower, keyed by
-#: ``(config field, row name)`` and giving the format that triggers it.
-#:
-#: ``mxfp4`` materializes ``float8_e8m0fnu`` scale tensors, and Inductor's codegen
-#: has no lowering for that dtype. A runtime check cannot catch it, so the selection
-#: is refused here, from the config. It is keyed on the *format* rather than the row
-#: because the row is ``torchao`` for both FP4 layouts: a config may compile with
-#: ``dtype: nvfp4`` (float8_e4m3fn scales plus an FP32 per-tensor scale, both of
-#: which Inductor knows) and must not with ``dtype: mxfp4``.
-_UNCOMPILABLE_FORMATS: dict[str, tuple[str, str, str]] = {
-    "linear_implementation": ("linear", "torchao", "mxfp4"),
-    "gated_mlp_implementation": ("gated_mlp", "torchao", "mxfp4"),
-}
+# The torchao row selects a quantization format per op family. Preserve the
+# existing MXFP4 restrictions; the MXFP8 gated MLP restriction is Inductor-only.
+_MXFP4_FORMATS = (("linear", "mxfp4"), ("gated_mlp", "mxfp4"))
+_INDUCTOR_FORMATS = (*_MXFP4_FORMATS, ("gated_mlp", "mxfp8"))
 
 
-def _bound_uncompilable_ops(model: nn.Module) -> tuple[bool, list[str]]:
+def _bound_uncompilable_ops(model: nn.Module, formats: tuple[tuple[str, str], ...]) -> tuple[bool, list[str]]:
     """Inspect concrete ``VeomniOp`` handles bound on ``model`` for uncompilable formats."""
     from ..ops.registry import VeomniOp
 
-    op_to_rule = {op: (field, impl, dtype) for field, (op, impl, dtype) in _UNCOMPILABLE_FORMATS.items()}
     has_bound_ops = False
     offending: list[str] = []
     for module in model.modules():
         for attr in vars(module).values():
             if isinstance(attr, VeomniOp):
                 has_bound_ops = True
-                if attr.op in op_to_rule:
-                    field, impl, dtype = op_to_rule[attr.op]
-                    if attr.impl == impl and attr.kwargs.get("dtype") == dtype:
-                        entry = f"{field}={impl}(dtype={dtype!r})"
-                        if entry not in offending:
-                            offending.append(entry)
+                dtype = attr.kwargs.get("dtype")
+                if attr.impl == "torchao" and (attr.op, dtype) in formats:
+                    entry = f"{attr.op}_implementation=torchao(dtype={dtype!r})"
+                    if entry not in offending:
+                        offending.append(entry)
     return has_bound_ops, offending
 
 
@@ -208,19 +197,20 @@ def _selection_reaches(value, target_impl: str, target_dtype: str) -> bool:
     return (target_impl, target_dtype) in states
 
 
-def _uncompilable_selections(ops) -> list[str]:
+def _uncompilable_selections(ops, formats: tuple[tuple[str, str], ...]) -> list[str]:
     """Return the offending ``field=row(dtype=...)`` strings on one ops config, if any."""
     if ops is None:
         return []
     offending: list[str] = []
-    for field, (_op, impl, dtype) in _UNCOMPILABLE_FORMATS.items():
-        if _selection_reaches(getattr(ops, field, None), impl, dtype):
-            offending.append(f"{field}={impl}(dtype={dtype!r})")
+    for op, dtype in formats:
+        field = f"{op}_implementation"
+        if _selection_reaches(getattr(ops, field, None), "torchao", dtype):
+            offending.append(f"{field}=torchao(dtype={dtype!r})")
     return offending
 
 
-def _reject_incompatible_ops(model: nn.Module) -> None:
-    """Reject op selections ``torch.compile`` cannot lower, at any config depth.
+def _reject_incompatible_ops(model: nn.Module, backend: str | None = "inductor") -> None:
+    """Reject op selections incompatible with the requested compiler backend, at any config depth.
 
     On a concrete model that binds ``VeomniOp`` handles, inspect only those
     resolved handles so unmatched overrides or op families the model never
@@ -231,19 +221,28 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
     Called once per compiled module, so a sibling that stayed eager never reaches
     this — its selection is irrelevant because Inductor never sees it.
     """
-    has_bound_ops, offending = _bound_uncompilable_ops(model)
+    # None leaves torch.compile on its default Inductor backend.
+    formats = _INDUCTOR_FORMATS if backend in (None, "inductor") else _MXFP4_FORMATS
+    has_bound_ops, offending = _bound_uncompilable_ops(model, formats)
     if not has_bound_ops:
         config = getattr(model, "config", None)
-        offending = _uncompilable_at(config, prefix="")
+        offending = _uncompilable_at(config, prefix="", formats=formats)
     if offending:
+        reasons = []
+        if any("dtype='mxfp4'" in entry for entry in offending):
+            reasons.append("MXFP4 uses float8_e8m0fnu scales that Inductor cannot lower")
+        if any("dtype='mxfp8'" in entry for entry in offending):
+            reasons.append(
+                "on B200 with PyTorch 2.11, Inductor changed the down-projection weight gradient "
+                "in both native and emulated MXFP8 gated MLPs. Use backend='aot_eager' for this row"
+            )
         raise RuntimeError(
-            "model.accelerator.torch_compile cannot be combined with "
-            f"{', '.join(offending)}: those selections emit tensors of a dtype Inductor cannot lower "
-            "(float8_e8m0fnu for the mxfp4 layout). Disable compilation or select a different dtype."
+            f"model.accelerator.torch_compile cannot be combined with {', '.join(offending)}: "
+            f"{' and '.join(reasons)}. Disable compilation or select a different dtype."
         )
 
 
-def _uncompilable_at(config, *, prefix: str) -> list[str]:
+def _uncompilable_at(config, *, prefix: str, formats: tuple[tuple[str, str], ...] = _INDUCTOR_FORMATS) -> list[str]:
     """Collect offending selections on ``config`` and every sub-config below it.
 
     A SeedOmni composed ``OmniConfig`` files its children in ``_module_configs``
@@ -254,13 +253,13 @@ def _uncompilable_at(config, *, prefix: str) -> list[str]:
     """
     if config is None:
         return []
-    found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None))]
+    found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None), formats)]
     for name in getattr(config, "sub_configs", {}) or {}:
         child = getattr(config, name, None)
         if child is not None:
-            found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+            found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}.", formats=formats))
     for name, child in (getattr(config, "_module_configs", None) or {}).items():
-        found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+        found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}.", formats=formats))
     return found
 
 
@@ -282,7 +281,7 @@ def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> i
             "model.accelerator.torch_compile.enable requires torch.compile, but this PyTorch build has no torch.compile."
         )
 
-    _reject_incompatible_ops(model)
+    _reject_incompatible_ops(model, compile_config.backend)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,
@@ -298,10 +297,19 @@ def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> i
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    blocks = set(_block_fqns(model))
+    from ..ops.torchao import iter_mxfp8_projections, validate_mxfp8_projection_hooks
+
+    blocks = [(fqn, model.get_submodule(fqn)) for fqn in _block_fqns(model)]
+    # Dynamo can reuse one block's graph for a sibling with different hooks.
+    # Inspect each selected projection before handing any block to the compiler.
+    for fqn, block in blocks:
+        for path, projection, _ in iter_mxfp8_projections(block):
+            if projection is not None:
+                validate_mxfp8_projection_hooks(projection, f"{fqn}.{path}")
+
     compiled = 0
-    for fqn, module in model.named_modules():
-        if fqn not in blocks or getattr(module, "_veomni_forward_compiled", False):
+    for fqn, module in blocks:
+        if getattr(module, "_veomni_forward_compiled", False):
             continue
 
         original_forward = module.forward

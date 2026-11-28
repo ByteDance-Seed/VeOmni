@@ -697,6 +697,37 @@ def test_qwen3_nvfp4_qat_trains_and_rounds(device: str):
 
 @_cpu
 @_requires_torchao
+@pytest.mark.parametrize("autocast", [True, False], ids=["bf16-autocast", "fp32"])
+def test_qwen3_mxfp8_preserves_tied_weights(autocast):
+    """Per-site MXFP8 attention and gated MLP train alongside a tied, ordinary LM head."""
+    torch.manual_seed(0)
+    config = _tiny_config(num_hidden_layers=1, tie_word_embeddings=True)
+    mxfp8 = {"name": "torchao", "kwargs": {"dtype": "mxfp8", "emulated": True}}
+    model = _qwen3_with_ops(
+        config,
+        linear_implementation={"name": "eager", "overrides": [{"site": r"layers\.0\.v_proj", **mxfp8}]},
+        gated_mlp_implementation=mxfp8,
+    )
+    layer = model.model.layers[0]
+    assert layer.self_attn.veomni_v_proj.kwargs == mxfp8["kwargs"]
+    assert layer.self_attn.veomni_k_proj.impl == "eager"
+    assert layer.mlp.veomni_gated_mlp.kwargs == mxfp8["kwargs"]
+    tied = model.model.embed_tokens.weight
+    assert model.lm_head.weight is tied
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    tokens = torch.randint(3, config.vocab_size, (1, 7))
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        loss = model(input_ids=tokens, labels=tokens, use_cache=False).loss
+    loss.backward()
+    for param in (tied, layer.self_attn.v_proj.weight, layer.mlp.down_proj.weight):
+        assert param.grad.dtype == torch.float32
+        assert torch.isfinite(param.grad).all() and torch.count_nonzero(param.grad) > 0
+    optimizer.step()
+    assert model.lm_head.weight is model.model.embed_tokens.weight is tied
+
+
+@_cpu
+@_requires_torchao
 def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
     """Pin the recipe: every attention/MLP projection weight is rounded, nothing else is.
 

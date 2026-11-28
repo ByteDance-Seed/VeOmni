@@ -28,8 +28,8 @@ If a field is not in this table, it is not an op-selection knob.
 | MiniMax sparse attention | `minimax_sparse_attention_implementation` | `eager`, `torch_npu` | NPU: `torch_npu`; otherwise: `eager` | Sparse layers bind `minimax_sparse_indexer/standard` for block selection and `minimax_sparse_attention/standard` for attention. Explicit `eager` uses PyTorch on every device. |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Gated MLP | `gated_mlp_implementation` | `eager`, `liger_kernel`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`), `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only on the `standard` variant and is skipped for anything else (the `geglu` variant is not selectable here; Gemma3 binds it in code, and there `liger_kernel` computes GELU-tanh) |
-| Dense projection | `linear_implementation` | `eager`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`, `standard` only), `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). Consumers: DeepSeek-V4 (`standard` + `grouped`), Qwen3 (`standard`), and Llama (`standard`) |
+| Gated MLP | `gated_mlp_implementation` | `eager`, `liger_kernel`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=fp8`, `mxfp8`, `nvfp4`, or `mxfp4`), `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only on the `standard` variant and is skipped for anything else (the `geglu` variant is not selectable here; Gemma3 binds it in code, and there `liger_kernel` computes GELU-tanh) |
+| Dense projection | `linear_implementation` | `eager`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=fp8`, `mxfp8`, `nvfp4`, or `mxfp4`, `standard` only), `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). Consumers: DeepSeek-V4 (`standard` + `grouped`), Qwen3 (`standard`), and Llama (`standard`) |
 | KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+; `fp4` is NVIDIA-only, `standard` / `deepseek_v4` also cover ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the variant that owns its geometry *and* element format: `deepseek_v4` fixes the model's two FP8 geometries, `fp4` stores E2M1, and `standard` is model-agnostic and takes them as call arguments. **DeepSeek-V4 is the only consumer** |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
@@ -301,16 +301,15 @@ one row everywhere, which is what every existing config and checkpoint records.
 **The row name names the kernel; the format is an argument.** `qat` is TileLang's
 fake quantization, `torchao` is torchao's, `deepgemm` is the vendor's real GEMM --
 that much is what the name says. *Which* format it rounds to is `dtype`
-(`fp8`/`fp4` for `qat`, `fp8`/`nvfp4`/`mxfp4` for `torchao`, `fp8` for `deepgemm`), because
+(`fp8`/`fp4` for `qat`, `fp8`/`mxfp8`/`nvfp4`/`mxfp4` for `torchao`, `fp8` for `deepgemm`), because
 one row serves several checkpoints and naming it after one format would either
 multiply rows or lie about the rest. There is no separate `enable` flag to keep in
 sync with it: turning quantization off for a site means naming a reference row such
 as `eager` or `liger_kernel` in that rule.
 
-**Emulated vs. native is also a call argument (`emulated`)**, because the same
-`torchao` row serves both native dynamic FP8 GEMMs (`dtype: fp8`, defaulting to
-`emulated: false`) and fake-quantized FP4/FP8 training (`emulated: true`, the
-default for `nvfp4` and `mxfp4`).
+**The `emulated` argument selects the execution mode.** On the `torchao` row,
+`fp8` and `mxfp8` default to native GEMMs. Set `emulated: true` to run their
+emulated arithmetic. The FP4 formats (`nvfp4` and `mxfp4`) default to fake quantization.
 
 ```yaml
 linear_implementation:
@@ -768,7 +767,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger SwiGLU row (SiLU only) | `liger-kernel` package |
 | `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
-| `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row, `dtype=fp8`, `nvfp4`, or `mxfp4` ([Low-Precision Training](../usage/low_precision_training.md)) | `torchao` package |
+| `torchao` | Registered FP8 and MXFP8 GEMMs and FP4 fake quantization, `dtype=fp8`, `mxfp8`, `nvfp4`, or `mxfp4` ([Low-Precision Training](../usage/low_precision_training.md)) | `torchao` package |
 | `deepgemm` | Real FP8 tensor-core forward, dgrad and wgrad through DeepGEMM (`dtype=fp8` only) | `deep_gemm` + `triton`, NVIDIA SM90 or SM100 |
 | `eager` | Registered PyTorch reference row | — |
 
@@ -778,7 +777,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 |-------|---------------|---|
 | `eager` | Registered row that calls the projection module | — |
 | `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
-| `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row (`standard` only, `dtype=fp8`, `nvfp4`, or `mxfp4`; [Low-Precision Training](../usage/low_precision_training.md)) | `torchao` package |
+| `torchao` | Registered FP8 and MXFP8 GEMMs and FP4 fake quantization (`standard` only, `dtype=fp8`, `mxfp8`, `nvfp4`, or `mxfp4`; [Low-Precision Training](../usage/low_precision_training.md)) | `torchao` package |
 | `deepgemm` | Real FP8 tensor-core forward, dgrad and wgrad through DeepGEMM (`dtype=fp8` only; `standard` and `grouped`) | `deep_gemm` + `triton`, NVIDIA SM90 or SM100 |
 
 The quantizing rows refuse to run on a projection substituted after
