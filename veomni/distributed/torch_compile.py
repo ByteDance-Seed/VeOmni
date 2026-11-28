@@ -294,10 +294,19 @@ def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> i
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    blocks = set(_block_fqns(model))
+    from ..ops.torchao import iter_mxfp8_projections, validate_mxfp8_projection_hooks
+
+    blocks = [(fqn, model.get_submodule(fqn)) for fqn in _block_fqns(model)]
+    # Dynamo can reuse one block's graph for a sibling with different hooks.
+    # Inspect each selected projection before handing any block to the compiler.
+    for fqn, block in blocks:
+        for path, projection, _ in iter_mxfp8_projections(block):
+            if projection is not None:
+                validate_mxfp8_projection_hooks(projection, f"{fqn}.{path}")
+
     compiled = 0
-    for fqn, module in model.named_modules():
-        if fqn not in blocks or getattr(module, "_veomni_forward_compiled", False):
+    for fqn, module in blocks:
+        if getattr(module, "_veomni_forward_compiled", False):
             continue
 
         original_forward = module.forward

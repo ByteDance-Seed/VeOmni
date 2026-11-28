@@ -9,54 +9,35 @@ import torch
 from torch import nn
 from torch.distributed.fsdp import FSDPModule
 
-from ...ops import VeomniOp
-from ...ops.torchao import MXFP8_BLOCK_SIZE, _require_mxfp8_runtime
+from ...ops.torchao import MXFP8_BLOCK_SIZE, _require_mxfp8_runtime, iter_mxfp8_projections
 from .mxfp8_weight import MXFP8AllGather
-
-
-def _mxfp8_handles(model):
-    for path, module in model.named_modules(remove_duplicate=False):
-        for attr, op in vars(module).items():
-            if (
-                isinstance(op, VeomniOp)
-                and op.op in ("linear", "gated_mlp")
-                and op.variant == "standard"
-                and op.impl == "torchao"
-                and op.kwargs.get("dtype") == "mxfp8"
-            ):
-                yield path, module, attr, op
 
 
 def has_mxfp8_all_gather_targets(model: nn.Module) -> bool:
     """Whether this model bound an MXFP8 dense projection or gated MLP."""
-    return next(_mxfp8_handles(model), None) is not None
+    return next(iter_mxfp8_projections(model), None) is not None
 
 
 def _selected_weights(model):
     selected = {}
     shared_aliases = {}
     selected_names = set()
-    for path, owner, attr, op in _mxfp8_handles(model):
-        # Standard linear sites call self.veomni_<proj>(self.<proj>, x).
-        # The standard gated MLP row consumes all three projections together.
-        names = (attr.removeprefix("veomni_"),) if op.op == "linear" else ("gate_proj", "up_proj", "down_proj")
+    for path, layer, op in iter_mxfp8_projections(model):
+        fqn = f"{path}.weight"
+        if type(layer) is not nn.Linear:
+            raise ValueError(f"MXFP8 all-gather requires a plain nn.Linear at {fqn}.")
         emulated = op.kwargs.get("emulated")
         if emulated is None:
             emulated = False
         elif type(emulated) is not bool:
-            raise ValueError(f"MXFP8 emulated must be a bool or None: {path}.{attr}.")
-        for name in names:
-            layer = getattr(owner, name, None)
-            fqn = ".".join(filter(None, (path, name, "weight")))
-            if type(layer) is not nn.Linear:
-                raise ValueError(f"MXFP8 all-gather requires a plain nn.Linear at {fqn}.")
-            param_id = id(layer.weight)
-            first_name, first_mode = selected.setdefault(param_id, (fqn, emulated))
-            if first_mode != emulated:
-                raise ValueError(f"Shared MXFP8 weight has conflicting emulated modes: {first_name}, {fqn}.")
-            if first_name != fqn:
-                shared_aliases[fqn] = first_name
-            selected_names.add(fqn)
+            raise ValueError(f"MXFP8 emulated must be a bool or None: {path}.")
+        param_id = id(layer.weight)
+        first_name, first_mode = selected.setdefault(param_id, (fqn, emulated))
+        if first_mode != emulated:
+            raise ValueError(f"Shared MXFP8 weight has conflicting emulated modes: {first_name}, {fqn}.")
+        if first_name != fqn:
+            shared_aliases[fqn] = first_name
+        selected_names.add(fqn)
     # FSDP exposes the same gathered weight at every alias. An eager consumer
     # (for example a tied embedding) cannot read the two MXFP8 representations.
     if selected:

@@ -111,6 +111,14 @@ Native MXFP8 requires NVIDIA SM100+ and `torchao==0.18.0`. Set `emulated: true`
 in a row's `kwargs` for emulation. The input and output feature dimensions must
 both be multiples of 32. Token counts may be ragged or zero.
 
+MXFP8 reads each projection's weight directly. It rejects forward and backward
+module hooks registered on the selected linear projection or on the gate, up,
+or down projection of a selected MLP. To observe a whole block, register the
+hook on the enclosing module. VeOmni checks each decoder block before
+compilation. When using `torch.compile` directly across modules with different
+hook sets, set `torch._dynamo.config.skip_nnmodule_hook_guards = False` before
+the first compiled call so PyTorch checks the hooks when reusing a graph.
+
 Each group of 32 elements shares an E8M0 scale for its E4M3 values. Forward and
 input-gradient GEMMs quantize the supplied weight independently along their
 reduction dimensions. The weight-gradient GEMM quantizes the input and output
