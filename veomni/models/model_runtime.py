@@ -150,12 +150,23 @@ class VeOmniModelRuntime:
         self.args = args
         self.model_name = model_name
         self.train_args = train
+        balance = getattr(train, "moe_ep_load_balance", None)
+        if balance is not None:
+            balance.validate(args, load_path=train.checkpoint.load_path)
         self.model_assets = []
         self.setup()
         with use_parallel_state(self.model_name):
             self._build_model()
             self._freeze_model_module()
             self._build_parallelized_model()
+            if balance is not None and balance.enabled:
+                from ..distributed.moe.ep_load_balance import attach_ep_load_balancers
+
+                attached = attach_ep_load_balancers(
+                    self.model, balance.max_replicas_per_rank, optimize_memory=balance.optimize_memory
+                )
+                if not attached:
+                    raise RuntimeError("EP load balancing requires expert modules that declare replica support.")
             self._build_optimizer()
         self._build_model_assets()
         self.build_checkpoint()

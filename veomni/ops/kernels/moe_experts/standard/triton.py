@@ -617,6 +617,20 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         )
 
 
+def _balanced_experts(tokens, gate, down, plan, group, gate_transfer, down_transfer, memory, limit, activation):
+    from ..shared.ep import BalancedEPMergedFc1GroupGemm, EPMergedFc1GroupGemm
+
+    cumsum = plan.tokens_per_local_physical_expert.sum(dim=0).cumsum(dim=0).to(tokens.device)
+    if gate_transfer is None:
+        return EPMergedFc1GroupGemm.apply(tokens, cumsum, gate, down, limit, activation, None)
+    replica_gate = gate_transfer.wait()
+    replica_down = down_transfer.wait()
+    transfers = (gate_transfer, down_transfer) if memory else None
+    return BalancedEPMergedFc1GroupGemm.apply(
+        tokens, cumsum, gate, down, replica_gate, replica_down, plan, group, limit, activation, transfers
+    )
+
+
 def group_gemm_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -630,6 +644,8 @@ def group_gemm_fused_moe_forward(
     assume_distinct_experts: bool = False,
     activation: str = "silu",
     swiglu_alpha: float | None = None,
+    *,
+    load_balancer=None,
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -659,6 +675,24 @@ def group_gemm_fused_moe_forward(
     This flag does not change EP's original fallback row bounds.
     """
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
+    if load_balancer is not None:
+        if swiglu_alpha is not None:
+            raise ValueError("Qwen3.5 EP load balancing requires standard SwiGLU.")
+        from .....distributed.moe.moe_layer import dispatch_to_ep_with_replicas
+
+        gate = fc1_1_2_weight if fc1_1_weight is None and fc1_2_weight is None else None
+        return dispatch_to_ep_with_replicas(
+            _balanced_experts,
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            gate,
+            fc2_weight,
+            load_balancer,
+            swiglu_limit,
+            activation,
+        )
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:
         from .....distributed.moe import dispatch_to_ep_class
@@ -743,6 +777,7 @@ def wrapper(
     block_size: int = 128,
     dtype: str = "fp8",
     activation: str = "silu",
+    load_balancer=None,
 ) -> Tensor:
     """Call the Triton fused MoE Function. Empty weights are ``None``.
 
@@ -764,4 +799,5 @@ def wrapper(
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
         activation=activation,
+        load_balancer=load_balancer,
     )

@@ -18,9 +18,22 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed as dist
 
+from ...utils.device import is_nvidia_cuda_device
 from ..parallel_state import get_parallel_state
+from .chunk_permutation import ChunkPermutation
 from .comm import all_to_all
-from .moe_utils import generate_weights_idx, permute, sort_chunks_by_idxs, unpermute
+from .ep_dispatch import _record_ep_balance, _validate_ep_balance_dispatch
+from .ep_load_balance import ExpertReplicaTransfer
+from .moe_utils import (
+    alias_permute,
+    compact_permute,
+    compact_unpermute,
+    generate_weights_idx,
+    permute,
+    sort_chunks_by_idxs,
+    unpermute,
+)
+from .weighted_combine import weighted_combine
 
 
 def preprocess(
@@ -215,6 +228,63 @@ def dispatch_to_ep_class(
         org_hidden_states_shape=org_hidden_states_shape,
         ep_group=ep_state.ep_group,
     )
+
+
+def dispatch_to_ep_with_replicas(
+    local_experts: Callable[..., torch.Tensor],
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gate: torch.Tensor | None,
+    down: torch.Tensor,
+    load_balancer: Any,
+    swiglu_limit: float | None,
+    activation: str,
+) -> torch.Tensor:
+    """Run a physical alias plan with a backend-owned expert computation."""
+    plan = _validate_ep_balance_dispatch(num_experts, selected_experts, gate, down, load_balancer)
+    _record_ep_balance(load_balancer, plan)
+    group = load_balancer.ep_group
+    memory = load_balancer.optimize_memory and gate.is_contiguous() and down.is_contiguous() and bool(plan.replicas)
+    gate_transfer = down_transfer = None
+    if plan.replicas:
+        pool = load_balancer.buffer_pool if memory else None
+        gate_transfer = ExpertReplicaTransfer.start(gate, plan, group, pool=pool)
+        down_transfer = ExpertReplicaTransfer.start(down, plan, group, pool=pool)
+
+    physical_ids = plan.selected_physical_experts
+    counts = plan.tokens_per_local_physical_expert
+    tokens = hidden_states.reshape(-1, hidden_states.shape[-1])
+    output_shape = tokens.shape
+    if plan.replicas:
+        routing = plan._host_routing if memory and plan._host_routing is not None else (physical_ids, selected_experts)
+        tokens, mapping = alias_permute(tokens, *routing)
+    else:
+        tokens, mapping = compact_permute(tokens, physical_ids)
+    exchanged = all_to_all(group, tokens, plan.output_splits, plan.input_splits)
+    order = torch.arange(counts.numel()).reshape(counts.shape).T.ravel().tolist()
+    chunk = None
+    if is_nvidia_cuda_device(exchanged.device):
+        chunk = ChunkPermutation(counts.ravel(), order, exchanged.device)
+        permuted = chunk.apply(exchanged)
+    else:
+        permuted = sort_chunks_by_idxs(exchanged, counts.ravel(), order)
+    del tokens, exchanged
+
+    expert_output = local_experts(
+        permuted, gate, down, plan, group, gate_transfer, down_transfer, memory, swiglu_limit, activation
+    )
+    del permuted
+    if chunk is None:
+        reverse_order = torch.arange(counts.numel()).reshape(counts.shape[1], counts.shape[0]).T.ravel().tolist()
+        expert_output = sort_chunks_by_idxs(expert_output, counts.T.ravel(), reverse_order)
+    else:
+        expert_output = chunk.apply(expert_output, inverse=True)
+    returned = all_to_all(group, expert_output, plan.input_splits, plan.output_splits)
+    if plan.replicas:
+        return weighted_combine(returned, routing_weights, output_shape, *mapping)
+    return compact_unpermute(returned, routing_weights, output_shape, mapping)
 
 
 def tokens_post_all2all(

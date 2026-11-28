@@ -943,6 +943,16 @@ boundary, including before a step after a failed forward/backward, so stale
 autograd keys cannot affect the next step. The path wraps selected module instances
 and is not intended to be captured by `torch.compile`.
 
+### MoEEPBalanceConfig
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enabled | `bool` | `False` | Enable temporary replicas for supported Qwen3.5-MoE expert-parallel training. |
+| max_replicas_per_rank | `int` | `1` | Bound the number of temporary expert replicas per EP rank. |
+| optimize_memory | `bool` | `False` | Use separate local and replica weights and a layer-local buffer pool. Requires `enabled=true`. |
+
+Set these fields under `train.moe_ep_load_balance`. See the [supported training scope](../design/qwen3_5_moe_ep_load_balance.md#usage-and-scope).
+
 ### CheckpointConfig
 
 `train.checkpoint.*` — Checkpoint saving and loading. On-disk layout: [Checkpoint layout](checkpoint.md).

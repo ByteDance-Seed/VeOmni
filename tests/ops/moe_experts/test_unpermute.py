@@ -8,7 +8,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY, VeomniOp
-from veomni.utils.device import get_device_type, is_nvidia_cuda_device
+from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type, is_nvidia_cuda_device
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -126,3 +126,24 @@ def test_ep_unpermute_preserves_token_dtype_with_fp32_routing_weights():
         (weights.grad, reference_weights.grad),
     ):
         torch.testing.assert_close(value, expected, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=1))
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires Ascend native reduction")
+@pytest.mark.parametrize("topk,tokens,hidden", [(2, 2048, 256), (8, 256, 2048)])
+def test_npu_eager_unpermute_repeated_destinations(topk, tokens, hidden):
+    generator = torch.Generator().manual_seed(43)
+    rows = torch.randint(-8, 9, (topk * tokens, hidden), generator=generator).to(torch.bfloat16)
+    weights = torch.randint(-4, 5, (topk * tokens,), generator=generator).to(torch.bfloat16) / 8
+    indices = torch.arange(tokens, dtype=torch.int64).repeat(topk)
+    expected = (rows * weights[:, None]).float().reshape(topk, tokens, hidden).sum(0).to(torch.bfloat16)
+    values = rows.to("npu").requires_grad_()
+    routing_weights = weights.to("npu").requires_grad_()
+    destinations = indices.to("npu")
+    combine = VeomniOp("moe_unpermute", "standard", "eager")
+    for _ in range(4):
+        actual = combine(values, routing_weights, destinations, num_tokens=tokens)
+        torch.testing.assert_close(actual.detach().cpu(), expected, rtol=0, atol=0)
+    actual.sum().backward()
+    torch.testing.assert_close(values.grad.cpu(), weights[:, None].expand_as(rows), rtol=0, atol=0)
+    torch.testing.assert_close(routing_weights.grad.cpu(), rows.float().sum(1).to(torch.bfloat16), rtol=0, atol=0)

@@ -147,6 +147,7 @@ design/ci_case_scheduling.md
 design/op_selection.md
 design/module_config.md
 design/fused_moe_ops.md
+design/qwen3_5_moe_ep_load_balance.md
 design/deepgemm_moe.md
 design/local_parallel_state.md
 design/qwen4_exp_ple_2d_parallelism.md

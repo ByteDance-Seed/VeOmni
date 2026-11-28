@@ -1096,6 +1096,9 @@ class Qwen3_5MoeMLP(nn.Module):
 class Qwen3_5MoeExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
+    _veomni_supports_ep_replicas = True
+    _veomni_ep_load_balancer = None
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -1115,6 +1118,8 @@ class Qwen3_5MoeExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         unused = self.gate_up_proj.new_empty(0)
+        balance = self._veomni_ep_load_balancer
+        kwargs = {"load_balancer": balance} if balance is not None else {}
         return self.veomni_moe(
             hidden_states,
             top_k_weights,
@@ -1125,6 +1130,7 @@ class Qwen3_5MoeExperts(nn.Module):
             self.gate_up_proj,
             num_experts=self.num_experts,
             activation=self.activation,
+            **kwargs,
         )
 
 

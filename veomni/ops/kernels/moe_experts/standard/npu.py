@@ -188,6 +188,40 @@ def _npu_expert_math(permute_tokens, cumsum, fc1_weight, fc2_weight, swiglu_limi
     return npu_group_gemm(activated, fc2_weight, counts)
 
 
+def _balanced_experts(tokens, gate, down, plan, group, gate_transfer, down_transfer, memory, limit, activation):
+    host_counts = plan.tokens_per_local_physical_expert.sum(dim=0)
+    counts = host_counts.to(tokens.device, dtype=torch.int64, non_blocking=True)
+    if gate_transfer is None:
+        intermediate = npu_group_gemm(tokens, gate.transpose(1, 2), counts)
+        return npu_group_gemm(_swiglu(intermediate, limit), down.transpose(1, 2), counts)
+
+    from .npu_ep_memory import balanced_group_gemm
+
+    replica_gate = gate_transfer.wait()
+    replica_down = down_transfer.wait()
+    try:
+        intermediate = balanced_group_gemm(
+            tokens, gate, replica_gate, counts, host_counts, plan, group, gate_transfer, memory, npu_group_gemm
+        )
+        return balanced_group_gemm(
+            _swiglu(intermediate, limit),
+            down,
+            replica_down,
+            counts,
+            host_counts,
+            plan,
+            group,
+            down_transfer,
+            memory,
+            npu_group_gemm,
+        )
+    finally:
+        try:
+            gate_transfer.record_stream_use()
+        finally:
+            down_transfer.record_stream_use()
+
+
 def npu_ep_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -200,12 +234,34 @@ def npu_ep_fused_moe_forward(
     ep_group: dist.ProcessGroup | None = None,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
+    *,
+    load_balancer=None,
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
 
     Accepts either split fc1 weights or a merged fc1_1_2_weight tensor. The all-to-all
     plumbing is shared with every other fused row; only the per-rank math is Ascend's.
     """
+    if load_balancer is not None:
+        if swiglu_alpha is not None:
+            raise ValueError("Qwen3.5 EP load balancing requires standard SwiGLU.")
+        from .....distributed.moe.moe_layer import dispatch_to_ep_with_replicas
+
+        if ep_group is None or ep_group is not load_balancer.ep_group:
+            raise ValueError("NPU EP load balancing requires the entry point and controller to use the same group.")
+        gate = fc1_1_2_weight if fc1_1_weight is None and fc1_2_weight is None else None
+        return dispatch_to_ep_with_replicas(
+            _balanced_experts,
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            gate,
+            fc2_weight,
+            load_balancer,
+            swiglu_limit,
+            "silu",
+        )
     fc1_weight = _fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight).transpose(1, 2)
     return dispatch_to_ep_class(
         _npu_expert_math,
@@ -232,6 +288,8 @@ def npu_fused_moe_forward(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
     swiglu_alpha: float | None = None,
+    *,
+    load_balancer=None,
 ):
     """NPU fused MoE entry. Branches on EP."""
     # Router scores stay float32. Cast before the fused scale so the NPU GEMM
@@ -255,8 +313,11 @@ def npu_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
+            load_balancer=load_balancer,
         )
     else:
+        if load_balancer is not None:
+            raise ValueError("NPU EP load balancing requires expert parallelism.")
         final_hidden_states = _npu_fused_moe_forward(
             num_experts,
             routing_weights,
@@ -287,9 +348,12 @@ def wrapper(
     block_size: int = 128,
     dtype: str = "fp8",
     activation: str = "silu",
+    load_balancer=None,
 ) -> Tensor:
     """Call the NPU fused MoE path. Empty weights are ``None``."""
     if not is_silu(activation):
+        if load_balancer is not None:
+            raise ValueError("NPU EP load balancing requires SiLU routed experts.")
         # This kernel computes SiLU inside the grouped GEMM, so another activation has
         # no seam here. The ``eager`` row runs the reference expert loop, which also
         # owns the expert-parallel dispatch those sharded weights need.
@@ -323,4 +387,5 @@ def wrapper(
         fc1_1_2_weight if fc1_1_2_weight.numel() else None,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
+        load_balancer=load_balancer,
     )

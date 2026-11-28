@@ -24,6 +24,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from veomni.utils.device import empty_cache
+from veomni.utils.env import get_env
+
 from .....registry import SavedState
 from . import eager as _eager
 from .eager import _grad_and_value, _Meta, _needs_input_grad
@@ -99,6 +102,8 @@ def forward(
     materialized; otherwise ``logits_bias`` has shape ``hidden.shape[:-1] + (V,)``
     and is added directly to each chunk's fp32 logits.
     """
+    if hidden.device.type == "npu" and get_env("VEOMNI_NPU_CHUNK_LOSS_EMPTY_CACHE") == "1":
+        empty_cache()
     if weight.numel() == 0:
         raise RuntimeError("chunk_loss requires a nonempty ``weight`` (fused-linear path)")
     if logits_bias_weight is not None and logits_bias is None:

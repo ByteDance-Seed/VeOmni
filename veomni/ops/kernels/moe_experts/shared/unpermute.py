@@ -7,10 +7,14 @@ import torch
 
 
 def eager(tokens, weights, indices, *, num_tokens):
-    """Multiply in the promoted dtype, scatter-add in FP32, then cast back."""
+    """Multiply in the promoted dtype, accumulate in FP32, then cast back."""
     weighted = tokens * weights[:, None]
     output = torch.zeros((num_tokens, tokens.shape[1]), dtype=torch.float32, device=tokens.device)
-    output.scatter_add_(0, indices[:, None].expand_as(tokens), weighted.float())
+    if tokens.device.type == "npu":
+        # Ascend scatter_add_ can vary across repeated destinations even for identical inputs.
+        output.index_add_(0, indices, weighted.float())
+    else:
+        output.scatter_add_(0, indices[:, None].expand_as(tokens), weighted.float())
     return output.to(weighted.dtype)
 
 

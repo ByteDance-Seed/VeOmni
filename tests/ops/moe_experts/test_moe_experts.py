@@ -1690,7 +1690,7 @@ def test_every_triton_function_backward_returns_one_gradient_per_argument():
         if arguments != entries:
             mismatches.append((cls.name, arguments, entries))
 
-    assert checked == 4, f"expected both Triton and both EP Functions, checked {checked}"
+    assert checked == 5, f"expected both Triton Functions and three EP Functions, checked {checked}"
     assert not mismatches, f"backward tuple does not match forward's arguments: {mismatches}"
 
 
@@ -1880,7 +1880,8 @@ def test_the_expert_parallel_functions_receive_the_activation():
 
     source = pathlib.Path(ep_module.__file__).read_text()
     checked = 0
-    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+    base_ep_classes = {"EPGroupGemm", "EPMergedFc1GroupGemm"}
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name in base_ep_classes):
         forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
         backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
         if forward is None or backward is None:
@@ -1929,7 +1930,7 @@ def test_every_backward_keeps_its_weight_gradient_inside_the_requires_grad_guard
                 if "requires_grad" not in test:
                     continue
                 body = ast.unparse(node)
-                if "group_gemm" not in body:
+                if not any(call in body for call in ("group_gemm", "launch_weight_grad(", "weight_grad_fn(")):
                     problems.append(f"{cls.name}: `if {test}` computes no weight gradient")
 
     assert not problems, f"a weight gradient moved out of its guard: {problems}"
@@ -2044,7 +2045,7 @@ def test_every_backward_attribute_exists_on_the_ctx_its_forward_built():
             }
             missing.extend(f"{cls.name}.{name}" for name in read - assigned - {"saved_tensors", "needs_input_grad"})
 
-    assert checked == 4, f"expected four Functions across both modules, checked {checked}"
+    assert checked == 5, f"expected five Functions across both modules, checked {checked}"
     assert not missing, f"backward reads a ctx attribute its forward never sets: {missing}"
 
 

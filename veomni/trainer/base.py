@@ -535,13 +535,13 @@ class BaseTrainer(Stateful, ABC):
         # (EnvironMeter, DCP checkpointer) are handed the state directly, so
         # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
         #
-        # ``channel_loss_callback`` is ordered after the meter (which resets
-        # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
-        # logs them), so its per-source metrics survive into the logged payload.
+        # Compute channel-loss and MoE metrics after the meter resets the step
+        # metrics and before Wandb reads them.
         self._callbacks = [
             self.environ_meter_callback,
             self.tqdm_callback,
             self.channel_loss_callback,
+            self.moe_monitor_callback,
             self.wandb_callback,
             self.profile_callback,
             # Weights first, then the cursor: at resume the DCP load frees its
@@ -552,7 +552,6 @@ class BaseTrainer(Stateful, ABC):
             self.checkpoint_callback,
             self.global_state_callback,
             self.evaluate_callback,
-            self.moe_monitor_callback,
         ]
         self.state = TrainerState()
 

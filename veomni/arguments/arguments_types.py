@@ -16,6 +16,7 @@ import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field
+from operator import index
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
@@ -1086,6 +1087,89 @@ class AcceleratorConfig:
 
 
 @dataclass
+class MoEEPBalanceConfig:
+    """train.moe_ep_load_balance.* — Temporary expert-replica load balancing."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable temporary expert replicas to balance MoE expert-parallel token load."},
+    )
+    max_replicas_per_rank: int = field(
+        default=1,
+        metadata={"help": "Maximum temporary expert replicas allocated on each EP rank when enabled."},
+    )
+    optimize_memory: bool = field(
+        default=False,
+        metadata={"help": "Use separate local/replica expert weights and reusable replica buffers (experimental)."},
+    )
+
+    def validate(self, model: "ModelArguments", *, load_path: Optional[str]) -> None:
+        """Apply the same EP restrictions to job configs and standalone model builds."""
+        for flag in ("enabled", "optimize_memory"):
+            if type(getattr(self, flag)) is not bool:
+                raise ValueError(f"train.moe_ep_load_balance.{flag} must be a boolean.")
+        if not self.enabled:
+            if self.optimize_memory:
+                raise ValueError("train.moe_ep_load_balance.optimize_memory requires load balancing enabled.")
+            return
+
+        from ..utils.import_utils import is_torch_mlu_available
+
+        if is_torch_mlu_available():
+            raise ValueError("train.moe_ep_load_balance.enabled is unsupported on Cambricon MLU.")
+        replicas = self.max_replicas_per_rank
+        error = "train.moe_ep_load_balance.max_replicas_per_rank must be a positive integer when load balancing is enabled."
+        try:
+            max_replicas = index(replicas)
+        except TypeError as exc:
+            raise ValueError(error) from exc
+        if isinstance(replicas, bool) or max_replicas <= 0:
+            raise ValueError(error)
+        self.max_replicas_per_rank = max_replicas
+
+        accelerator = model.accelerator
+        if accelerator.ep_size <= 1:
+            raise ValueError("train.moe_ep_load_balance.enabled requires model.accelerator.ep_size > 1.")
+        if accelerator.fsdp_config.fsdp_mode != "fsdp2":
+            raise ValueError(
+                "train.moe_ep_load_balance.enabled requires model.accelerator.fsdp_config.fsdp_mode='fsdp2'."
+            )
+        if accelerator.dp_replicate_size != 1:
+            raise ValueError(
+                "train.moe_ep_load_balance.enabled requires resolved "
+                "model.accelerator.dp_replicate_size == 1; HSDP is unsupported."
+            )
+        if accelerator.ep_outside:
+            raise ValueError("train.moe_ep_load_balance.enabled requires model.accelerator.ep_outside=False.")
+        if accelerator.fsdp_config.offload:
+            raise ValueError("train.moe_ep_load_balance.enabled requires model.accelerator.fsdp_config.offload=False.")
+        if accelerator.offload_config.enable_activation:
+            raise ValueError(
+                "train.moe_ep_load_balance.enabled requires model.accelerator.offload_config.enable_activation=False."
+            )
+        if accelerator.offload_config.enable_async_activation:
+            raise ValueError(
+                "train.moe_ep_load_balance.enabled requires "
+                "model.accelerator.offload_config.enable_async_activation=False."
+            )
+        if load_path:
+            raise ValueError(
+                "train.moe_ep_load_balance.enabled requires train.checkpoint.load_path=None; "
+                "checkpoint resume is unsupported."
+            )
+        if model.lora_config:
+            raise ValueError("train.moe_ep_load_balance.enabled requires full (non-LoRA) training.")
+        moe_impl = model.ops_implementation.moe_implementation
+        if isinstance(moe_impl, OpsSelection):
+            moe_impl = moe_impl.name
+        if moe_impl not in (None, "fused_npu", "fused_triton"):
+            raise ValueError(
+                "train.moe_ep_load_balance.enabled requires model.ops_implementation.moe_implementation "
+                "to be 'fused_npu' or 'fused_triton'."
+            )
+
+
+@dataclass
 class CheckpointConfig:
     """train.checkpoint.* — Checkpoint saving and loading."""
 
@@ -1333,6 +1417,7 @@ class TrainingArguments:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
+    moe_ep_load_balance: MoEEPBalanceConfig = field(default_factory=MoEEPBalanceConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
@@ -2375,6 +2460,7 @@ class VeOmniArguments:
 
     def __post_init__(self):
         self.train._derive_batch_config(self.model.accelerator)
+        self.train.moe_ep_load_balance.validate(self.model, load_path=self.train.checkpoint.load_path)
 
         if self.train.pad_to_length:
             if not self.train.dyn_bsz:

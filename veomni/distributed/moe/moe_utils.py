@@ -16,6 +16,80 @@
 import torch
 
 
+def compact_permute(tokens: torch.Tensor, selected_experts: torch.Tensor):
+    """Stable expert-major dispatch without a dense expert/token mask.
+
+    Native top-k and its replica aliases have unique physical IDs per token.
+    Keep the flattened occurrence index so combine can recover its exact weight.
+    """
+    topk = selected_experts.shape[-1]
+    if topk == 0:
+        raise ValueError("Compact EP dispatch requires at least one selected expert.")
+    order = torch.argsort(selected_experts.reshape(-1), stable=True)
+    token_indices = torch.div(order, topk, rounding_mode="floor")
+    return tokens.index_select(0, token_indices), order
+
+
+def compact_unpermute(tokens, routing_weights, hidden_states_shape, occurrence_order):
+    """Preserve expert-major multiplication and the existing FP32 scatter sum."""
+    weights = routing_weights.reshape(-1).index_select(0, occurrence_order)
+    token_indices = torch.div(occurrence_order, routing_weights.shape[-1], rounding_mode="floor")
+    from ...ops.kernels.moe_experts.shared.unpermute import eager
+
+    return eager(tokens, weights, token_indices, num_tokens=hidden_states_shape[0])
+
+
+class _OrderedAliasGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tokens, logical_indices, physical_indices, logical_to_physical):
+        ctx.input_shape = tokens.shape
+        ctx.save_for_backward(logical_indices, logical_to_physical)
+        return tokens.index_select(0, physical_indices)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        logical_indices, logical_to_physical = ctx.saved_tensors
+        logical_gradient = gradient.index_select(0, logical_to_physical)
+        token_gradient = torch.ops.aten.index_select_backward(logical_gradient, ctx.input_shape, 0, logical_indices)
+        return token_gradient, None, None, None
+
+
+def alias_permute(tokens: torch.Tensor, physical_experts: torch.Tensor, logical_experts: torch.Tensor):
+    """Dispatch physical rows while accumulating input gradients in logical order.
+
+    The second gather is a one-to-one occurrence permutation, so its backward
+    cannot add or round contributions. The first gather retains the unbalanced
+    dispatch's logical expert-major accumulation order, independent of aliases.
+    """
+    if physical_experts.shape != logical_experts.shape:
+        raise ValueError("Physical aliases must preserve the logical routing shape.")
+    topk = physical_experts.shape[-1]
+    if topk == 0:
+        raise ValueError("Alias EP dispatch requires at least one selected expert.")
+    logical_order = torch.argsort(logical_experts.reshape(-1), stable=True)
+    physical_order = torch.argsort(physical_experts.reshape(-1), stable=True)
+    inverse_logical = torch.empty_like(logical_order)
+    positions = torch.arange(logical_order.numel(), device=logical_order.device)
+    inverse_logical.scatter_(0, logical_order, positions)
+    physical_to_logical = inverse_logical.index_select(0, physical_order)
+    logical_to_physical = torch.empty_like(physical_to_logical)
+    logical_to_physical.scatter_(0, physical_to_logical, positions)
+    logical_token_indices = torch.div(logical_order, topk, rounding_mode="floor")
+    if logical_order.device != tokens.device:
+        physical_token_indices = torch.div(physical_order, topk, rounding_mode="floor")
+        indices = torch.stack((logical_order, logical_token_indices, physical_token_indices, logical_to_physical))
+        logical_order, logical_token_indices, physical_token_indices, logical_to_physical = (
+            indices.pin_memory().to(tokens.device, non_blocking=True).unbind()
+        )
+        # Gather physical rows directly; accumulate duplicate input gradients in logical order.
+        physical_tokens = _OrderedAliasGather.apply(
+            tokens, logical_token_indices, physical_token_indices, logical_to_physical
+        )
+        return physical_tokens, (logical_order, logical_to_physical)
+    logical_tokens = tokens.index_select(0, logical_token_indices)
+    return logical_tokens.index_select(0, physical_to_logical), (logical_order, logical_to_physical)
+
+
 def permute(tokens: torch.Tensor, routing_map: torch.Tensor):
     """
     Permutes the tokens according to the routing map.

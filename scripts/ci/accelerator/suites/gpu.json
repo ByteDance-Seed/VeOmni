@@ -652,5 +652,37 @@
       "-x",
       "tests/optim/test_swap_adamw_device.py"
     ]
+  },
+  {
+    "name": "moe-ep-balance-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/test_moe_ep_load_balance_planner.py",
+      "tests/parallel/test_moe_ep_planner_priority.py",
+      "tests/parallel/test_moe_ep_load_balance_executor.py",
+      "tests/parallel/test_moe_ordered_weight_grad.py",
+      "tests/parallel/test_moe_weight_grad_overlap.py",
+      "tests/parallel/test_moe_ep_load_balance_dispatch.py",
+      "tests/parallel/test_moe_ep_cuda_host_plan.py",
+      "tests/utils/test_moe_ep_load_balance_config.py",
+      "tests/utils/test_moe_monitor.py",
+      "tests/utils/test_fsdp_singleton_grad_scaling.py"
+    ]
+  },
+  {
+    "name": "moe-ep-balance-e2e",
+    "suite": "e2e",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/e2e/test_qwen3_5_moe_ep_load_balance.py"
+    ],
+    "env": {
+      "VEOMNI_REQUIRE_EP_BALANCE_E2E": "1"
+    }
   }
 ]
