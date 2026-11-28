@@ -138,13 +138,13 @@ dtype, or the input dtype when autocast is off. This also allows an FP32 model
 to enable MXFP8 on a single attention projection. FSDP2 uses its ordinary
 floating-point AllGather.
 
-On B200 with PyTorch 2.11, CUDA Inductor supports the linear row. With bias,
-compiler fusion can round the sum differently from eager execution. For the
-gated MLP, compiled down-projection weight gradients differed from an independent
-reference by up to 6% in relative L2 in testing. Use eager execution or
-`backend: aot_eager` for that row. CPU emulation works in eager mode; CPU
+A manual B200 comparison with PyTorch 2.11 found that CUDA Inductor
+preserved the MXFP8 linear weight and input gradients. Fusing the bias
+addition can change BF16 rounding. For gated MLPs, the bias-free
+down-projection weight gradient differed from eager in both native and
+emulated execution. Use eager or `backend: aot_eager` for that row. CPU
 Inductor lacks the E8M0 scale lowering. See the
-[compiler restrictions](../key_features/torch_compile.md).
+[compiler measurements and reproducer](../key_features/torch_compile.md#what-stays-refused).
 
 ---
 

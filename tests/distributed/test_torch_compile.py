@@ -1173,7 +1173,7 @@ def test_compile_rejects_torchao_mx_formats(field, dtype):
         ],
     )
     with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='{dtype}'\)"):
-        _reject_incompatible_ops(_model_with_ops(**{field: chained_override}))
+        _reject_incompatible_ops(_model_with_ops(**{field: chained_override}), backend=None)
 
 
 @pytest.mark.parametrize(("op", "dtype"), [("linear", "mxfp4"), ("gated_mlp", "mxfp8")])
@@ -1222,20 +1222,102 @@ def test_compile_allows_other_rows(ops_fields):
     _reject_incompatible_ops(_model_with_ops(**ops_fields))
 
 
-@pytest.mark.parametrize("backend", [None, "inductor", "aot_eager"])
-def test_compile_mxfp8_backend(backend):
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("backend", [None, "inductor"])
+@pytest.mark.parametrize("emulated", [False, True])
+def test_compile_rejects_mxfp8_gated_inductor(backend, emulated):
     from veomni.ops import OpsSelection
 
-    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8"})
-    config = CompileConfig(backend=backend)
-    # The standalone linear GEMMs preserve activation and weight gradients on Inductor.
-    assert compile_decoder_blocks(_model_with_ops(linear_implementation=selection), config) == 0
-    model = _model_with_ops(gated_mlp_implementation=selection)
-    if backend == "aot_eager":
-        assert compile_decoder_blocks(model, config) == 0
-    else:
-        with pytest.raises(RuntimeError, match="different weight gradients"):
-            compile_decoder_blocks(model, config)
+    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": emulated})
+    with pytest.raises(RuntimeError, match="down-projection weight gradient"):
+        compile_decoder_blocks(_model_with_ops(gated_mlp_implementation=selection), CompileConfig(backend=backend))
+
+
+class _MXFP8Block(nn.Module):
+    """Small decoder block using the same bound projection rows as a model."""
+
+    def __init__(self, family, emulated):
+        super().__init__()
+        from veomni.ops import OpsSelection, VeomniOp
+
+        selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": emulated})
+        if family == "linear":
+            self.q_proj = nn.Linear(64, 64)
+            self.veomni_q_proj = VeomniOp("linear", "standard", selection)
+        else:
+            self.gate_proj = nn.Linear(64, 128)
+            self.up_proj = nn.Linear(64, 128, bias=False)
+            self.down_proj = nn.Linear(128, 64)
+            self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", selection)
+
+    def forward(self, x):
+        if hasattr(self, "q_proj"):
+            return self.veomni_q_proj(self.q_proj, x)
+        return self.veomni_gated_mlp(self, x, swiglu_limit=2.0, activation="silu")
+
+
+def _mxfp8_training_result(model, x, dy):
+    x = x.detach().requires_grad_()
+    output = model(x)
+    parameters = dict(model.named_parameters())
+    dx, *grads = torch.autograd.grad(output, (x, *parameters.values()), dy)
+    return {"output": output.detach(), "input gradient": dx, **dict(zip(parameters, grads, strict=True))}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("family", ["linear", "gated_mlp"])
+def test_mxfp8_aot_eager_training(family):
+    pytest.importorskip("torchao")
+    torch.manual_seed(73)
+    model = nn.Sequential(*(_MXFP8Block(family, emulated=True) for _ in range(2)))
+    model._no_split_modules = ["_MXFP8Block"]
+    x, dy = torch.randn(2, 33, 64, dtype=torch.bfloat16).unbind()
+    expected = _mxfp8_training_result(model, x, dy)
+
+    assert compile_decoder_blocks(model, CompileConfig(backend="aot_eager", fullgraph=True)) == 2
+    for name, tensor in _mxfp8_training_result(model, x, dy).items():
+        torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+def test_native_mxfp8_inductor_linear():
+    from tests.ops.utils import require_nvidia_cuda
+
+    require_nvidia_cuda("torchao", min_cc=100)
+    torch.manual_seed(73)
+    model = nn.Sequential(_MXFP8Block("linear", emulated=False)).cuda()
+    model._no_split_modules = ["_MXFP8Block"]
+    x, dy = torch.randn(2, 33, 64, device="cuda", dtype=torch.bfloat16).unbind()
+    expected = _mxfp8_training_result(model, x, dy)
+
+    assert compile_decoder_blocks(model, CompileConfig(backend="inductor", fullgraph=True)) == 1
+    # Inductor can round the fused bias addition differently from eager BF16.
+    for name, tensor in _mxfp8_training_result(model, x, dy).items():
+        ref = expected[name].float()
+        relative_l2 = (tensor.float() - ref).norm() / ref.norm()
+        assert relative_l2 < 0.005, f"{name}: relative L2 = {relative_l2.item():.4%}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+@pytest.mark.parametrize("emulated", [False, True], ids=["native", "emulated"])
+def test_mxfp8_gated_inductor_down_gradient(emulated):
+    """Reproduce the unsupported backend directly to track when its gradient matches."""
+    from tests.ops.utils import require_nvidia_cuda
+
+    require_nvidia_cuda("torchao", min_cc=100)
+    torch.manual_seed(73)
+    model = _MXFP8Block("gated_mlp", emulated).cuda()
+    for proj in (model.gate_proj, model.up_proj, model.down_proj):
+        proj.bias = None
+    x, dy = torch.randn(2, 33, 64, device="cuda", dtype=torch.bfloat16).unbind()
+    expected = _mxfp8_training_result(model, x, dy)["down_proj.weight"]
+    # VeOmni rejects this combination before compilation; deliberately bypass that check.
+    model.compile(backend="inductor", fullgraph=True)
+    actual = _mxfp8_training_result(model, x, dy)["down_proj.weight"]
+    relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert torch.isfinite(relative_l2)
+    if relative_l2 > 0.005:
+        pytest.xfail(f"Inductor MXFP8 down-projection gradient: relative L2 = {relative_l2.item():.4%}")
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
