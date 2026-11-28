@@ -1155,6 +1155,24 @@ def test_torchao_fp8_validates_and_dispatches_three_projections(monkeypatch):
 
 
 @_cpu
+@pytest.mark.parametrize("name", ["gate_proj", "up_proj", "down_proj"])
+@pytest.mark.parametrize(
+    ("register", "hook"),
+    [
+        ("register_forward_hook", lambda module, args, output: 2 * output),
+        ("register_forward_pre_hook", lambda module, args: (2 * args[0],)),
+    ],
+)
+def test_torchao_mxfp8_rejects_hooked_mlp_projection(name, register, hook):
+    from veomni.ops.kernels.gated_mlp.standard import torchao as gated_torchao
+
+    mlp = _tiny_qwen3_mlp(32, 64)
+    getattr(getattr(mlp, name), register)(hook)
+    with pytest.raises(ValueError, match=f"MXFP8.*projection '{name}'.*hooks"):
+        gated_torchao.wrapper(mlp, torch.ones(1, 32), dtype="mxfp8", emulated=True)
+
+
+@_cpu
 @_requires_torchao
 @pytest.mark.parametrize(
     ("activation_dtype", "autocast"),

@@ -61,6 +61,7 @@ __all__ = [
     "torchao_fp8_linear",
     "torchao_mxfp8_linear",
     "validate_float8_recipe",
+    "validate_mxfp8_projection_hooks",
 ]
 
 #: Supported torchao dynamic float8 scaling recipes.
@@ -333,6 +334,20 @@ def torchao_mxfp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None, 
     _require_mxfp8_runtime(None if emulated else x.device)
     output = _MXFP8LinearFunction.apply(x, weight, emulated)
     return output if bias is None else output + bias.to(output.dtype)
+
+
+def validate_mxfp8_projection_hooks(projection: torch.nn.Module, name: str) -> None:
+    """Reject local module hooks that reading a projection's weight would bypass."""
+    if (
+        projection._forward_pre_hooks
+        or projection._forward_hooks
+        or projection._backward_pre_hooks
+        or projection._backward_hooks
+    ):
+        raise ValueError(
+            f"MXFP8 reads projection {name!r} by weight and would skip its module hooks. "
+            "Attach the hooks to the enclosing module or use a path that calls the projection."
+        )
 
 
 def mxfp8_model_projection(x: Tensor, weight: Tensor, bias: Tensor | None = None, *, emulated: bool = False) -> Tensor:

@@ -72,6 +72,24 @@ def test_emulated_mxfp8_matches_independent_oracle(tokens, weight_dtype, autocas
     _check_projection(tokens, weight_dtype, "cpu", emulated=True, autocast=autocast)
 
 
+@pytest.mark.parametrize(
+    ("register", "hook"),
+    [
+        ("register_forward_hook", lambda module, args, output: 2 * output),
+        ("register_forward_pre_hook", lambda module, args: (2 * args[0],)),
+        ("register_full_backward_hook", lambda module, grad_input, grad_output: (2 * grad_input[0],)),
+        ("register_full_backward_pre_hook", lambda module, grad_output: (2 * grad_output[0],)),
+    ],
+)
+def test_mxfp8_rejects_projection_hooks(register, hook):
+    from veomni.ops.kernels.linear.standard import torchao as linear_torchao
+
+    layer = torch.nn.Linear(32, 32)
+    getattr(layer, register)(hook)
+    with pytest.raises(ValueError, match="MXFP8.*projection.*hooks"):
+        linear_torchao.wrapper(layer, torch.ones(1, 32), dtype="mxfp8", emulated=True)
+
+
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 def test_native_mxfp8_matches_independent_oracle():
     if not device.IS_CUDA_AVAILABLE or torch.version.hip is not None or device.get_gpu_compute_capability() < 100:

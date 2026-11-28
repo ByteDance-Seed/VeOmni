@@ -38,6 +38,7 @@ from ....torchao import (
     torchao_fake_quant,
     torchao_fp8_linear,
     validate_float8_recipe,
+    validate_mxfp8_projection_hooks,
 )
 from ....torchao import FP4_SUPPORTED_DTYPES as _FP4_DTYPES
 from .._module import resolve_projection
@@ -102,6 +103,7 @@ def wrapper(
     assert shortcut is None
     bias = getattr(linear, "bias", None)
     if dtype == "mxfp8":
+        validate_mxfp8_projection_hooks(linear, "linear")
         return mxfp8_model_projection(x, weight, bias, emulated=use_emulated)
     quantize = torchao_fake_quant(dtype)
     return F.linear(quantize(x, block_size), quantize(weight, block_size), bias)

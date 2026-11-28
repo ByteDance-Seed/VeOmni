@@ -43,6 +43,7 @@ from ....torchao import (
     torchao_fake_quant,
     torchao_fp8_linear,
     validate_float8_recipe,
+    validate_mxfp8_projection_hooks,
 )
 from ....torchao import FP4_SUPPORTED_DTYPES as _FP4_DTYPES
 from . import eager as _eager
@@ -105,6 +106,8 @@ def wrapper(
                 raise ValueError(
                     f"gated_mlp_implementation='torchao' with dtype='mxfp8' requires block_size={MXFP8_BLOCK_SIZE}."
                 )
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                validate_mxfp8_projection_hooks(getattr(mlp, name), name)
             project = partial(mxfp8_model_projection, emulated=use_emulated)
 
         gate_w, gate_b, up_w, up_b, down_w, down_b = render(mlp, impl="torchao", activation=activation).weights
