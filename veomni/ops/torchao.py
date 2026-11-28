@@ -257,6 +257,8 @@ def _quantize_mxfp8(tensor: Tensor, emulated: bool) -> Tensor:
     from torchao.quantization.quantize_.common import KernelPreference
 
     preference = KernelPreference.EMULATED if emulated else KernelPreference.AUTO
+    # RCEIL rounds amax / 448 up to an E8M0 power of two, so the block
+    # maximum fits in E4M3FN. This is the cuBLAS MXFP8 scaling recipe.
     quantized = MXTensor.to_mx(
         tensor.contiguous(),
         torch.float8_e4m3fn,
@@ -406,8 +408,8 @@ def _mxfp4_roundtrip(x: Tensor, block_size: int) -> Tensor:
     from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-    # ``MXFP4`` is torchao's `e2m1` element type with an `e8m0` scale, one per group;
-    # there is no per-tensor scale, which is the whole difference from NVFP4.
+    # MXFP4 QAT keeps torchao's OCP-style FLOOR recipe to reproduce the E2M1
+    # deployment round trip, including saturation at the top of a block.
     quantized = MXTensor.to_mx(
         x_2d,
         torch.float4_e2m1fn_x2,

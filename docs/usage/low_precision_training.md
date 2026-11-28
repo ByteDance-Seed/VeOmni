@@ -125,7 +125,10 @@ compilation. When using `torch.compile` directly across modules with different
 hook sets, set `torch._dynamo.config.skip_nnmodule_hook_guards = False` before
 the first compiled call so PyTorch checks the hooks when reusing a graph.
 
-Each group of 32 elements shares an E8M0 scale for its E4M3 values. Forward and
+Each group of 32 elements shares an E8M0 scale. The cuBLAS MXFP8 RCEIL
+recipe rounds the block maximum magnitude divided by 448 up to a power of
+two so the largest value fits in E4M3FN. MXFP4 QAT keeps torchao's
+OCP-style FLOOR recipe to match the E2M1 deployment format. Forward and
 input-gradient GEMMs quantize the supplied weight independently along their
 reduction dimensions. The weight-gradient GEMM quantizes the input and output
 gradient along the token dimension. The GEMMs produce BF16. At the model
