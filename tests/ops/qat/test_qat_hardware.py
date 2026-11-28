@@ -16,7 +16,7 @@
 
 Emulated FP4/FP8 rows also run on CPU for op-level tests; only distributed
 training on CUDA requires SM80+ (native BF16) for emulated rows and NVIDIA
-SM89+ (Ada/Hopper/Blackwell) for native FP8.
+SM89+ for native FP8 or SM100+ for native MXFP8.
 """
 
 from types import SimpleNamespace
@@ -119,7 +119,33 @@ def test_native_fp8_requires_nvidia_sm89(monkeypatch, field):
     reject_qat_without_native_bf16(_model(**{field: fp8_chained}))
 
 
-def test_bound_handles_are_authoritative_for_unused_families(monkeypatch):
+@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
+def test_native_mxfp8_requires_nvidia_sm100(monkeypatch, field):
+    site = r"layers\.0\..*"
+    default = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8"})
+    explicit = OpsSelection(
+        name="eager",
+        overrides=[
+            SiteOverride(site=site, name="torchao", kwargs={"dtype": "mxfp8"}),
+            SiteOverride(site=site, kwargs={"emulated": False}),
+        ],
+    )
+    emulated = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": True})
+
+    for cuda, capability, hip in [(True, 90, None), (True, 100, "6.0"), (False, 0, None)]:
+        _device(monkeypatch, cuda=cuda, capability=capability, hip=hip)
+        for selection in (default, explicit):
+            with pytest.raises(RuntimeError, match="SM100"):
+                reject_qat_without_native_bf16(_model(**{field: selection}))
+        reject_qat_without_native_bf16(_model(**{field: emulated}))
+
+    _device(monkeypatch, cuda=True, capability=100)
+    for selection in (default, explicit):
+        reject_qat_without_native_bf16(_model(**{field: selection}))
+
+
+@pytest.mark.parametrize(("dtype", "capability", "minimum"), [("fp8", 80, 89), ("mxfp8", 90, 100)])
+def test_bound_handles_are_authoritative_for_unused_families(monkeypatch, dtype, capability, minimum):
     """Concrete models without a ``linear`` handle (e.g. Gemma3) ignore unused ``linear_implementation`` FP8."""
     from torch import nn
 
@@ -129,15 +155,15 @@ def test_bound_handles_are_authoritative_for_unused_families(monkeypatch):
     monkeypatch.setattr(ops_registry, "is_package_available", lambda _pkg: True)
     monkeypatch.setattr(VeomniOp, "_intern", dict(VeomniOp._intern))
 
-    fp8 = OpsSelection(name="torchao", kwargs={"dtype": "fp8", "recipe": "rowwise"})
+    fp8 = OpsSelection(name="torchao", kwargs={"dtype": dtype})
     ops = SimpleNamespace(linear_implementation=fp8, gated_mlp_implementation="eager")
     model = nn.Linear(2, 2)
     model.config = SimpleNamespace(ops_config=ops, sub_configs={})
     model.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", "eager")
 
-    _device(monkeypatch, cuda=True, capability=80)
+    _device(monkeypatch, cuda=True, capability=capability)
     reject_qat_without_native_bf16(model)
 
     model.veomni_q_proj = VeomniOp("linear", "standard", fp8, site="layers.0.q_proj")
-    with pytest.raises(RuntimeError, match="SM89"):
+    with pytest.raises(RuntimeError, match=f"SM{minimum}"):
         reject_qat_without_native_bf16(model)

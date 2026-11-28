@@ -57,6 +57,7 @@ __all__ = [
     "MXFP8_BLOCK_SIZE",
     "NVFP4_BLOCK_SIZE",
     "TORCHAO_REQUIRED_VERSION",
+    "default_emulated",
     "iter_mxfp8_projections",
     "mxfp8_model_projection",
     "nvfp4_fake_quant",
@@ -78,6 +79,11 @@ NVFP4_BLOCK_SIZE = 16
 MXFP4_BLOCK_SIZE = 32
 FP4_SUPPORTED_DTYPES: tuple[str, ...] = ("nvfp4", "mxfp4")
 _FP4_BLOCK_SIZES = {"nvfp4": NVFP4_BLOCK_SIZE, "mxfp4": MXFP4_BLOCK_SIZE}
+
+
+def default_emulated(dtype: str) -> bool:
+    """FP8 and MXFP8 default to native GEMMs; NVFP4 and MXFP4 default to emulation."""
+    return dtype in FP4_SUPPORTED_DTYPES
 
 
 def validate_float8_recipe(recipe: str) -> str:

@@ -39,6 +39,7 @@ from ....activation import apply_activation
 from ....torchao import (
     DEFAULT_FLOAT8_RECIPE,
     MXFP8_BLOCK_SIZE,
+    default_emulated,
     mxfp8_model_projection,
     torchao_fake_quant,
     torchao_fp8_linear,
@@ -54,9 +55,9 @@ SUPPORTED_DTYPES: tuple[str, ...] = ("fp8", "mxfp8", *_FP4_DTYPES)
 
 
 def _resolve_emulated(dtype: str, emulated: bool | None) -> bool:
-    """Resolve ``emulated`` default per format: native for FP8, emulated for FP4."""
+    """Apply the format default or validate an explicit emulation setting."""
     if emulated is None:
-        return dtype in _FP4_DTYPES
+        return default_emulated(dtype)
     if type(emulated) is not bool:
         raise ValueError(f"gated_mlp_implementation='torchao': emulated must be a bool or None, got {emulated!r}.")
     return emulated
