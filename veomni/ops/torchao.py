@@ -14,13 +14,16 @@
 
 """Shared TorchAO low-precision primitives for the ``linear`` and ``gated_mlp`` rows.
 
-Covers both formats exposed by the ``torchao`` op row:
+Covers the formats exposed by the ``torchao`` op row:
 
 * **Dynamic FP8** (``torchao_fp8_linear``): drives torchao's functional
   ``matmul_with_hp_or_float8_args`` directly from plain ``nn.Linear`` weights
   without module swapping, supporting ``tensorwise``, ``rowwise``, and
   ``rowwise_with_gw_hp`` scaling in native ``aten::_scaled_mm`` (SM89+) or
   emulated mode.
+* **Block-scaled MXFP8** (``torchao_mxfp8_linear``): forward and backward
+  GEMMs with E4M3 values and one E8M0 scale per 32 elements, native on
+  SM100+ or emulated.
 * **FP4 fake quantization** (``torchao_fake_quant``, ``nvfp4_fake_quant``):
   emulated NVFP4 (16-wide groups, E4M3 block scale + FP32 per-tensor scale) and
   MXFP4 (32-wide groups, E8M0 power-of-two block scale) straight-through
@@ -49,11 +52,14 @@ __all__ = [
     "FLOAT8_RECIPES",
     "FP4_SUPPORTED_DTYPES",
     "MXFP4_BLOCK_SIZE",
+    "MXFP8_BLOCK_SIZE",
     "NVFP4_BLOCK_SIZE",
     "TORCHAO_REQUIRED_VERSION",
+    "mxfp8_model_projection",
     "nvfp4_fake_quant",
     "torchao_fake_quant",
     "torchao_fp8_linear",
+    "torchao_mxfp8_linear",
     "validate_float8_recipe",
 ]
 
@@ -61,6 +67,7 @@ __all__ = [
 FLOAT8_RECIPES: tuple[str, ...] = ("tensorwise", "rowwise", "rowwise_with_gw_hp")
 DEFAULT_FLOAT8_RECIPE: str = "tensorwise"
 TORCHAO_REQUIRED_VERSION: str = "0.18.0"
+MXFP8_BLOCK_SIZE = 32
 
 #: Group widths for the two torchao FP4 fake-quantization layouts.
 NVFP4_BLOCK_SIZE = 16
@@ -77,16 +84,18 @@ def validate_float8_recipe(recipe: str) -> str:
 
 
 def _require_torchao_version() -> None:
-    """Verify the pinned torchao extra is installed before importing ``torchao.float8``."""
+    """Verify the pinned torchao extra before loading its low-precision APIs."""
     try:
         installed_version = version("torchao")
     except PackageNotFoundError as exc:
         raise ImportError(
-            f"float8 training requires torchao=={TORCHAO_REQUIRED_VERSION}, which is an optional extra: "
+            f"TorchAO-backed low-precision training requires torchao=={TORCHAO_REQUIRED_VERSION}, which is an optional extra: "
             "uv sync --extra gpu --extra float8 --dev"
         ) from exc
     if Version(installed_version).public != TORCHAO_REQUIRED_VERSION:
-        raise ImportError(f"float8 training requires torchao=={TORCHAO_REQUIRED_VERSION}; found {installed_version}.")
+        raise ImportError(
+            f"TorchAO-backed low-precision training requires torchao=={TORCHAO_REQUIRED_VERSION}; found {installed_version}."
+        )
 
 
 _FLOAT8_CONFIG_CACHE: dict[tuple[str, bool], tuple] = {}
@@ -217,6 +226,120 @@ def torchao_fp8_linear(
     if bias is not None:
         output = output + bias.to(output.dtype)
     return output
+
+
+_CHECKED_MXFP8_DEVICES: set[torch.device | None] = set()
+
+
+@torch._dynamo.assume_constant_result
+def _require_mxfp8_runtime(native_device: torch.device | None) -> None:
+    """Check the pinned API and native execution device outside the compiled graph."""
+    if native_device in _CHECKED_MXFP8_DEVICES:
+        return
+    from .platform import NVIDIA_SM100_PLUS
+
+    _require_torchao_version()
+    if native_device is not None and (
+        not device.is_nvidia_cuda_device(native_device)
+        or device.get_gpu_compute_capability(native_device) < NVIDIA_SM100_PLUS.min_cc
+    ):
+        raise RuntimeError(f"Native MXFP8 requires an NVIDIA CUDA SM100+ device, got {native_device}.")
+    _CHECKED_MXFP8_DEVICES.add(native_device)
+
+
+def _quantize_mxfp8(tensor: Tensor, emulated: bool) -> Tensor:
+    from torchao.prototype.mx_formats.config import ScaleCalculationMode
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor
+    from torchao.quantization.quantize_.common import KernelPreference
+
+    preference = KernelPreference.EMULATED if emulated else KernelPreference.AUTO
+    quantized = MXTensor.to_mx(
+        tensor.contiguous(),
+        torch.float8_e4m3fn,
+        block_size=MXFP8_BLOCK_SIZE,
+        scaling_mode=ScaleCalculationMode.RCEIL,
+        kernel_preference=preference,
+    )
+    # Derive scales from the supplied precision, including FP32 weights. Use
+    # BF16 for the logical GEMM output to match the native block-scaled kernel.
+    return MXTensor.from_qdata_and_scales(
+        quantized.qdata, quantized.scale, torch.bfloat16, block_size=MXFP8_BLOCK_SIZE, kernel_preference=preference
+    )
+
+
+def _mxfp8_padded_rows(tensor: Tensor) -> Tensor:
+    rows = tensor.reshape(-1, tensor.shape[-1])
+    padding = (-rows.shape[0]) % MXFP8_BLOCK_SIZE
+    return F.pad(rows, (0, 0, 0, padding)) if padding else rows
+
+
+@torch._dynamo.allow_in_graph
+class _MXFP8LinearFunction(torch.autograd.Function):
+    """Quantize both operands along the reduction axis of each training GEMM."""
+
+    @staticmethod
+    def forward(ctx, x, weight, emulated):
+        """Multiply rowwise-quantized inputs by rowwise-quantized weights."""
+        ctx.save_for_backward(x, weight)
+        ctx.emulated = emulated
+        shape = (*x.shape[:-1], weight.shape[0])
+        if x.numel() == 0:
+            return x.new_empty(shape, dtype=torch.bfloat16)
+        output = torch.mm(_quantize_mxfp8(_mxfp8_padded_rows(x), emulated), _quantize_mxfp8(weight, emulated).t())
+        return output[: x.numel() // x.shape[-1]].reshape(shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Quantize the transpose of the original weight for input gradients."""
+        x, weight = ctx.saved_tensors
+        if x.numel() == 0:
+            return torch.empty_like(x), torch.zeros_like(weight), None
+        x_rows, grad_rows = _mxfp8_padded_rows(x), _mxfp8_padded_rows(grad_output)
+        grad_input = torch.mm(_quantize_mxfp8(grad_rows, ctx.emulated), _quantize_mxfp8(weight.t(), ctx.emulated).t())
+        # The weight gradient contracts over tokens, including zero padding in
+        # the final 32-element block of each transposed operand.
+        grad_weight = torch.mm(
+            _quantize_mxfp8(grad_rows.t(), ctx.emulated), _quantize_mxfp8(x_rows.t(), ctx.emulated).t()
+        )
+        grad_input = grad_input[: x.numel() // x.shape[-1]].reshape_as(x)
+        return grad_input.to(x.dtype), grad_weight.to(weight.dtype), None
+
+
+def torchao_mxfp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None, *, emulated: bool = False) -> Tensor:
+    """Compute a BF16 dense projection using 32-wide MXFP8 blocks for all three training GEMMs.
+
+    Accepts local FP32 or BF16 inputs and a plain weight whose dimensions are
+    positive multiples of 32. Arbitrary leading token dimensions, including
+    empty batches, are supported. Set ``emulated=True`` to run without SM100+.
+    """
+    if type(emulated) is not bool:
+        raise ValueError(f"MXFP8 emulated flag must be a bool, got {emulated!r}.")
+    if isinstance(x, DTensor) or isinstance(weight, DTensor) or isinstance(bias, DTensor):
+        raise TypeError("torchao MXFP8 linear expects local tensor operands.")
+    if weight.ndim != 2 or any(size == 0 or size % MXFP8_BLOCK_SIZE for size in weight.shape):
+        raise ValueError(
+            f"MXFP8 weight must be 2D with positive dimensions divisible by 32, got {tuple(weight.shape)}."
+        )
+    if x.ndim == 0 or x.shape[-1] != weight.shape[1]:
+        raise ValueError(f"Expected {weight.shape[1]} input features, got input shape {tuple(x.shape)}.")
+    if bias is not None and bias.shape != (weight.shape[0],):
+        raise ValueError(f"MXFP8 linear expects bias of shape ({weight.shape[0]},), got {tuple(bias.shape)}.")
+    if weight.device != x.device or (bias is not None and bias.device != x.device):
+        raise ValueError("MXFP8 linear operands must be on the same device.")
+    if torch.is_autocast_enabled(x.device.type):
+        x = x.to(torch.get_autocast_dtype(x.device.type))
+    if x.dtype not in (torch.bfloat16, torch.float32) or weight.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"MXFP8 linear requires BF16 or FP32 inputs and weights, got {x.dtype} and {weight.dtype}.")
+    _require_mxfp8_runtime(None if emulated else x.device)
+    output = _MXFP8LinearFunction.apply(x, weight, emulated)
+    return output if bias is None else output + bias.to(output.dtype)
+
+
+def mxfp8_model_projection(x: Tensor, weight: Tensor, bias: Tensor | None = None, *, emulated: bool = False) -> Tensor:
+    """Return the BF16 MXFP8 result in the dtype used by neighboring model projections."""
+    output = torchao_mxfp8_linear(x, weight, bias, emulated=emulated)
+    output_dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
+    return output.to(output_dtype)
 
 
 def _nvfp4_roundtrip(x: Tensor, block_size: int) -> Tensor:

@@ -1,4 +1,4 @@
-# Low-Precision Training (FP8, FP4 QAT, and DeepGEMM MoE)
+# Low-Precision Training (FP8, MXFP8, FP4 QAT, and DeepGEMM MoE)
 
 VeOmni configures low-precision training **per op family** through
 `model.ops_implementation`, rather than through a global quantization switch or
@@ -6,10 +6,10 @@ module-swapping patch:
 
 | Field | Low-precision rows | Supported `dtype` | Execution | Hardware / Extra |
 | --- | --- | --- | --- | --- |
-| `linear_implementation` | `torchao` (`standard` only) | `fp8` (`emulated: false`), `nvfp4` / `mxfp4` (`emulated: true`) | Native FP8 (`aten::_scaled_mm`) or FP4 fake-quant | `--extra float8` (`torchao==0.18.0`); SM89+ for native FP8, CPU / SM80+ for emulated |
+| `linear_implementation` | `torchao` (`standard` only) | `fp8` / `mxfp8` (`emulated: false`), `nvfp4` / `mxfp4` (`emulated: true`) | Dynamic FP8, block-scaled MXFP8, or FP4 fake-quant | `--extra float8` (`torchao==0.18.0`); SM89+ for native FP8, SM100+ for native MXFP8, CPU / SM80+ for emulated |
 | `linear_implementation` | `qat` (`standard`, `grouped`) | `fp8` | Blockwise FP8 fake-quant | SM90+, `tilelang` |
 | `linear_implementation` | `deepgemm` (`standard`, `grouped`) | `fp8` only | Native FP8 GEMM (forward, dgrad, wgrad) | Hopper SM90 / Blackwell SM100, `deep_gemm` + `triton` |
-| `gated_mlp_implementation` | `torchao` | `fp8` (`emulated: false`), `nvfp4` / `mxfp4` (`emulated: true`) | Native FP8 (`aten::_scaled_mm`) or FP4 fake-quant | `--extra float8` (`torchao==0.18.0`); SM89+ for native FP8, CPU / SM80+ for emulated |
+| `gated_mlp_implementation` | `torchao` | `fp8` / `mxfp8` (`emulated: false`), `nvfp4` / `mxfp4` (`emulated: true`) | Dynamic FP8, block-scaled MXFP8, or FP4 fake-quant | `--extra float8` (`torchao==0.18.0`); SM89+ for native FP8, SM100+ for native MXFP8, CPU / SM80+ for emulated |
 | `gated_mlp_implementation` | `qat` | `fp8` | Blockwise FP8 fake-quant | SM90+, `tilelang` |
 | `gated_mlp_implementation` | `deepgemm` (`standard`) | `fp8` only | Native FP8 GEMM (forward, dgrad, wgrad); SiLU / `swish` only | Hopper SM90 / Blackwell SM100, `deep_gemm` + `triton` |
 | `moe_implementation` | `deepgemm` | `fp8` only (today) | Native FP8 grouped GEMM (forward, dgrad, wgrad) | Hopper SM90 / Blackwell SM100, `deep_gemm` + `triton` |
@@ -19,8 +19,8 @@ module-swapping patch:
 Every projection stays a plain `torch.nn.Linear` (and every expert stack stays
 ordinary floating-point tensors): parameters and optimizer updates remain FP32,
 FSDP2 unshards parameters to BF16 and reduces gradients in FP32, and checkpoints
-remain standard floating-point weights. When `torchao` is not selected, `torchao`
-is never imported.
+remain standard floating-point weights. The projection operators load their
+optional torchao kernels when a torchao row executes.
 
 `lm_head` is outside the `linear` and `gated_mlp` op families and is never
 quantized by these selections.
@@ -33,7 +33,7 @@ See [op selection](../design/op_selection.md) for the full registry design and
 ## Install
 
 The `torchao` backend (used by `linear_implementation: torchao` and
-`gated_mlp_implementation: torchao` for both Float8 and FP4 QAT) is an optional
+`gated_mlp_implementation: torchao` for FP8, MXFP8, and FP4 QAT) is an optional
 extra so jobs that do not select it avoid pulling it in:
 
 ```bash
@@ -42,9 +42,8 @@ source .venv/bin/activate      # train.sh resolves torchrun from PATH
 ```
 
 Selecting `torchao` without `torchao` installed raises an explicit error at
-model construction; running `dtype: fp8` with a mismatched version raises
-`ImportError: float8 training requires torchao==0.18.0, ...` because torchao's
-float8 training internals are not stable across minor versions.
+model construction. The FP8 and MXFP8 implementations also check the installed
+torchao version at runtime because they use version-specific APIs.
 
 > **PEFT interop note**: `peft==0.18.1` (from the `gpu` extra) imports
 > `LinearActivationQuantizedTensor` from torchao when torchao is installed,
@@ -89,6 +88,44 @@ model:
 - **Hardware**: Native (`emulated: false`) requires NVIDIA CUDA SM89+ (Ada, Hopper, Blackwell). Emulated (`emulated: true`) runs on CPU or CUDA SM80+.
 - **Shapes**: Plain `nn.Linear` projections with `in_features` and `out_features` divisible by 16.
 - **Implementation**: [`veomni/ops/torchao.py`](../../veomni/ops/torchao.py), invoked by [`veomni/ops/kernels/linear/standard/torchao.py`](../../veomni/ops/kernels/linear/standard/torchao.py) and [`veomni/ops/kernels/gated_mlp/standard/torchao.py`](../../veomni/ops/kernels/gated_mlp/standard/torchao.py).
+
+---
+
+## TorchAO MXFP8 (`dtype: mxfp8`)
+
+Select MXFP8 on either dense op family. For example, this configuration runs
+the attention projections and all three MLP projections in Qwen3 with MXFP8:
+
+```yaml
+model:
+  ops_implementation:
+    linear_implementation:
+      name: torchao
+      kwargs: {dtype: mxfp8}
+    gated_mlp_implementation:
+      name: torchao
+      kwargs: {dtype: mxfp8}
+```
+
+Native MXFP8 requires NVIDIA SM100+ and `torchao==0.18.0`. Set `emulated: true`
+in a row's `kwargs` for emulation. The input and output feature dimensions must
+both be multiples of 32. Token counts may be ragged or zero.
+
+Each group of 32 elements shares an E8M0 scale for its E4M3 values. Forward and
+input-gradient GEMMs quantize the supplied weight independently along their
+reduction dimensions. The weight-gradient GEMM quantizes the input and output
+gradient along the token dimension. The GEMMs produce BF16. At the model
+boundary the projection returns the active autocast dtype, or the input dtype
+when autocast is off. This also allows an FP32 model to enable MXFP8 on a single
+attention projection. FSDP2 uses its ordinary floating-point AllGather.
+
+On B200 with PyTorch 2.11, CUDA Inductor supports the linear row. With bias,
+compiler fusion can round the sum differently from eager execution. For the
+gated MLP, compiled down-projection weight gradients differed from an independent
+reference by up to 6% in relative L2 in testing. Use eager execution or
+`backend: aot_eager` for that row. CPU emulation works in eager mode; CPU
+Inductor lacks the E8M0 scale lowering. See the
+[compiler restrictions](../key_features/torch_compile.md).
 
 ---
 

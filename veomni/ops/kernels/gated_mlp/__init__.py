@@ -87,7 +87,7 @@ register_op(
     "gated_mlp",
     "standard",
     "torchao",
-    description="TorchAO low-precision (FP8 / NVFP4 / MXFP4) gated MLP with optional activation clamping",
+    description="TorchAO low-precision (FP8 / MXFP8 / NVFP4 / MXFP4) gated MLP with optional activation clamping",
     wrapper=standard_torchao.wrapper,
     requires=("torchao",),
 )

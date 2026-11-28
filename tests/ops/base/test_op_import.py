@@ -38,6 +38,8 @@ def test_import_veomni_without_optional_kernel_packages() -> None:
 import builtins
 import sys
 
+# Simulate a host without the float8 extra even when CI has installed it.
+sys.modules["torchao"] = None
 real_import = builtins.__import__
 attempted_optional_imports = []
 optional_roots = {

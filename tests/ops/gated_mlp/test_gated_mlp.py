@@ -1126,6 +1126,10 @@ def test_torchao_fp8_validates_and_dispatches_three_projections(monkeypatch):
 
     with pytest.raises(ValueError, match="does not accept block_size"):
         gated_torchao.wrapper(mlp, x, dtype="fp8", block_size=16)
+    with pytest.raises(ValueError, match="block_size=32"):
+        gated_torchao.wrapper(mlp, x, dtype="mxfp8", block_size=16)
+    with pytest.raises(ValueError, match="recipe is only valid"):
+        gated_torchao.wrapper(mlp, x, dtype="mxfp8", recipe="rowwise")
     with pytest.raises(ValueError, match="float8 recipe"):
         gated_torchao.wrapper(mlp, x, dtype="fp8", recipe="invalid")
     with pytest.raises(ValueError, match="recipe is only valid for dtype='fp8'"):
@@ -1148,6 +1152,42 @@ def test_torchao_fp8_validates_and_dispatches_three_projections(monkeypatch):
         (mlp.up_proj.weight.shape, "rowwise_with_gw_hp", False),
         (mlp.down_proj.weight.shape, "rowwise_with_gw_hp", False),
     ]
+
+
+@_cpu
+@_requires_torchao
+@pytest.mark.parametrize(
+    ("activation_dtype", "autocast"),
+    [(torch.bfloat16, False), (torch.float32, False), (torch.float32, True)],
+)
+def test_torchao_mxfp8_projects_gate_up_and_down(activation_dtype, autocast):
+    """The selected row applies MXFP8 to all projections around the requested clamp and GELU."""
+    from veomni.ops import OpsSelection, VeomniOp
+    from veomni.ops.torchao import torchao_mxfp8_linear
+
+    torch.manual_seed(0)
+    mlp = _mlp_of(nn.Linear(32, 64), nn.Linear(32, 64, bias=False), nn.Linear(64, 32)).to(activation_dtype)
+    x = torch.randn(3, 32, dtype=activation_dtype, requires_grad=True)
+    native = VeomniOp("gated_mlp", "standard", OpsSelection(name="torchao", kwargs={"dtype": "mxfp8"}))
+    with pytest.raises(RuntimeError, match="SM100"):
+        native(mlp, x)
+
+    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": True, "block_size": 32})
+    output_dtype = torch.bfloat16 if autocast else activation_dtype
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        out = VeomniOp("gated_mlp", "standard", selection)(mlp, x, swiglu_limit=0.5, activation="gelu")
+        gate = torchao_mxfp8_linear(x, mlp.gate_proj.weight, mlp.gate_proj.bias, emulated=True).to(output_dtype)
+        up = torchao_mxfp8_linear(x, mlp.up_proj.weight, emulated=True).to(output_dtype)
+        hidden = F.gelu(gate.clamp(max=0.5)) * up.clamp(min=-0.5, max=0.5)
+        expected = torchao_mxfp8_linear(hidden, mlp.down_proj.weight, mlp.down_proj.bias, emulated=True).to(
+            output_dtype
+        )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    leaves = (x, *mlp.parameters())
+    for actual, reference in zip(
+        torch.autograd.grad(out.sum(), leaves), torch.autograd.grad(expected.sum(), leaves), strict=True
+    ):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 def test_the_deepgemm_row_is_registered_on_sm90_or_sm100():

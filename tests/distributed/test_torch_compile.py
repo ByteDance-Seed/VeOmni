@@ -1152,29 +1152,33 @@ def _model_with_ops(**ops_fields) -> nn.Module:
     return model
 
 
-@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
-def test_compile_rejects_torchao_mxfp4(field):
-    """MXTensor emits float8_e8m0fnu scales, which Inductor has no lowering for."""
+@pytest.mark.parametrize(
+    ("field", "dtype"),
+    [("linear_implementation", "mxfp4"), ("gated_mlp_implementation", "mxfp4"), ("gated_mlp_implementation", "mxfp8")],
+)
+def test_compile_rejects_torchao_mx_formats(field, dtype):
+    """Fallback config checks recognize incompatible base selections and merged overrides."""
     from veomni.distributed.torch_compile import _reject_incompatible_ops
     from veomni.ops import OpsSelection, SiteOverride
 
-    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"})
-    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='mxfp4'\)"):
+    selection = OpsSelection(name="torchao", kwargs={"dtype": dtype})
+    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='{dtype}'\)"):
         _reject_incompatible_ops(_model_with_ops(**{field: selection}))
 
     chained_override = OpsSelection(
         name="eager",
         overrides=[
             SiteOverride(site=r"layers\.0\.q_proj", name="torchao"),
-            SiteOverride(site=r"layers\.0\.q_proj", kwargs={"dtype": "mxfp4"}),
+            SiteOverride(site=r"layers\.0\.q_proj", kwargs={"dtype": dtype}),
         ],
     )
-    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='mxfp4'\)"):
+    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='{dtype}'\)"):
         _reject_incompatible_ops(_model_with_ops(**{field: chained_override}))
 
 
-def test_compile_checks_bound_handles_for_unmatched_mxfp4_override(monkeypatch):
-    """An unmatched MXFP4 override on a real model with bound eager handles does not block compile."""
+@pytest.mark.parametrize(("op", "dtype"), [("linear", "mxfp4"), ("gated_mlp", "mxfp8")])
+def test_compile_checks_bound_handles_for_unmatched_mx_override(monkeypatch, op, dtype):
+    """An unmatched MX override on a real model with bound eager handles does not block compile."""
     from veomni.distributed.torch_compile import _reject_incompatible_ops
     from veomni.ops import OpsSelection, SiteOverride, VeomniOp
     from veomni.ops import registry as ops_registry
@@ -1184,18 +1188,18 @@ def test_compile_checks_bound_handles_for_unmatched_mxfp4_override(monkeypatch):
 
     selection = OpsSelection(
         name="eager",
-        overrides=[SiteOverride(site=r"layers\.99\.q_proj", name="torchao", kwargs={"dtype": "mxfp4"})],
+        overrides=[SiteOverride(site=r"layers\.99\.q_proj", name="torchao", kwargs={"dtype": dtype})],
     )
-    model = _model_with_ops(linear_implementation=selection)
-    model.veomni_q_proj = VeomniOp("linear", "standard", selection, site="layers.0.q_proj")
+    model = _model_with_ops(**{f"{op}_implementation": selection})
+    model.handle = VeomniOp(op, "standard", selection, site="layers.0.q_proj")
     _reject_incompatible_ops(model)
 
-    model.veomni_q_proj = VeomniOp("linear", "standard", selection, site="layers.99.q_proj")
-    with pytest.raises(RuntimeError, match=r"linear_implementation=torchao\(dtype='mxfp4'\)"):
+    model.handle = VeomniOp(op, "standard", selection, site="layers.99.q_proj")
+    with pytest.raises(RuntimeError, match=rf"{op}_implementation=torchao\(dtype='{dtype}'\)"):
         _reject_incompatible_ops(model)
 
     # Concrete model that binds gated_mlp (like Gemma3) but no linear handles:
-    # an unused linear_implementation MXFP4 selection must not block compile.
+    # an unused linear_implementation MX selection must not block compile.
     no_linear_model = _model_with_ops(linear_implementation=selection, gated_mlp_implementation="eager")
     no_linear_model.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", "eager")
     _reject_incompatible_ops(no_linear_model)
@@ -1216,6 +1220,22 @@ def test_compile_allows_other_rows(ops_fields):
     from veomni.distributed.torch_compile import _reject_incompatible_ops
 
     _reject_incompatible_ops(_model_with_ops(**ops_fields))
+
+
+@pytest.mark.parametrize("backend", [None, "inductor", "aot_eager"])
+def test_compile_mxfp8_backend(backend):
+    from veomni.ops import OpsSelection
+
+    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8"})
+    config = CompileConfig(backend=backend)
+    # The standalone linear GEMMs preserve activation and weight gradients on Inductor.
+    assert compile_decoder_blocks(_model_with_ops(linear_implementation=selection), config) == 0
+    model = _model_with_ops(gated_mlp_implementation=selection)
+    if backend == "aot_eager":
+        assert compile_decoder_blocks(model, config) == 0
+    else:
+        with pytest.raises(RuntimeError, match="different weight gradients"):
+            compile_decoder_blocks(model, config)
 
 
 def test_compile_rejection_is_skipped_without_an_ops_config():

@@ -156,10 +156,12 @@ async Ulysses pipelines the same exchanges across steps. Refused for every train
   this repo yet, for either, and refusing it uniformly is deliberate rather than a
   claim that one of them works.
 
-Compiling also requires FSDP2 and CUDA; that is checked in the same
-`validate_compile_runtime`, not per model. A selection Inductor cannot lower — the
-`torchao_mxfp4` rows emit `float8_e8m0fnu` scale tensors, which have no Inductor
-lowering — is rejected up front by config field rather than failing at runtime.
+Training with compiled decoder blocks requires FSDP2 and CUDA. The runtime
+checks the selected `linear` and `gated_mlp` formats before compiling a block.
+The torchao MXFP4 restriction applies to both projection families. For MXFP8
+the CUDA Inductor backend supports `linear`. The `gated_mlp` row is rejected
+with Inductor because its weight gradients diverged from the eager reference
+on B200. Use eager execution or `backend: aot_eager` for MXFP8 gated MLPs.
 
 ## The default `mode=None`
 
