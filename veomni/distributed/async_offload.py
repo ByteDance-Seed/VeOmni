@@ -537,7 +537,12 @@ class async_save_on_cpu(saved_tensors_hooks):
         custom_check_fn=None,
         prefetch=True,
     ) -> None:
+        from .fsdp2.mxfp8_weight import MXFP8GatheredWeight
+
         def _pack_to_cpu(tensor):
+            # FSDP owns the gathered payload buffers across reshard and unshard.
+            if isinstance(tensor, MXFP8GatheredWeight):
+                return tensor
             matched_hidden = (
                 custom_check_fn is not None and isinstance(tensor, torch.Tensor) and custom_check_fn(tensor)
             )

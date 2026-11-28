@@ -887,16 +887,23 @@ def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArg
 def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
     """Reject settings that a top-level ``fsdp_scope='model'`` wrap cannot honour.
 
-    Three of them: ``torch_compile`` (a module cannot wrap itself inside the
-    parent that owns the wrap, and the parent cannot compile blocks that are its
-    children), an ``eager`` module (nothing would build it sharded), and
-    ``extra_parallel_only`` (it removes the wrap the composed parent owns, so the
-    per-module plan would be left applying to a parent that is also sharded for
-    storage).
+    The parent owns compilation, FSDP wrapping and MXFP8 transport. Children
+    cannot compile inside that wrap, bypass it with eager or ExtraParallel-only
+    execution, or override its MXFP8 transport policy.
     """
     fsdp_config = accelerator.fsdp_config
     if fsdp_config.fsdp_scope != "model":
         return
+    conflicting = [
+        name
+        for name, module in modules.items()
+        if module.accelerator.fsdp_config.mxfp8_all_gather != fsdp_config.mxfp8_all_gather
+    ]
+    if conflicting:
+        raise ValueError(
+            f"fsdp_scope='model' uses one mxfp8_all_gather setting. Set it on the top-level accelerator "
+            f"or use fsdp_scope='module' for overrides on {sorted(conflicting)}."
+        )
     compiled = sorted(name for name, module_args in modules.items() if module_args.accelerator.torch_compile.enable)
     if accelerator.torch_compile.enable or compiled:
         # Only name the switches that are actually on: listing ``model.accelerator``

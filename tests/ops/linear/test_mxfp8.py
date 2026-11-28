@@ -124,3 +124,21 @@ def test_mxfp8_rejects_unsupported_shapes_and_device():
     pytest.importorskip("torchao")
     with pytest.raises(RuntimeError, match="SM100"):
         torchao_mxfp8_linear(x, torch.zeros(32, 64))
+
+
+def test_activation_offload_leaves_gathered_buffers_owned_by_fsdp():
+    from veomni.distributed.async_offload import async_save_on_cpu
+    from veomni.distributed.fsdp2.mxfp8_weight import MXFP8GatheredWeight
+    from veomni.distributed.offloading import OffloadPolicy, custom_save_on_cpu
+
+    def payload(rows, cols):
+        return torch.empty((rows, cols), device="meta", dtype=torch.uint8)
+
+    weight = MXFP8GatheredWeight(payload(64, 96), payload(64, 3), payload(64, 96), payload(2, 96))
+    sync = custom_save_on_cpu(pin_memory=True)
+    packed = sync.pack_hook(weight)
+    assert packed[0] is OffloadPolicy.IGNORE
+    assert sync.unpack_hook(packed) is weight
+
+    offload = async_save_on_cpu(0, 2, manager=None, custom_check_fn=lambda tensor: tensor.data_ptr() != 0)
+    assert offload.unpack_hook(offload.pack_hook(weight)) is weight

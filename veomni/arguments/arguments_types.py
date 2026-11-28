@@ -825,6 +825,10 @@ class FSDPConfig:
         },
     )
     hyper_parallel: HyperParallelFSDPConfig = field(default_factory=HyperParallelFSDPConfig)
+    mxfp8_all_gather: bool = field(
+        default=False,
+        metadata={"help": "Gather dense torchao MXFP8 projection weights as E4M3 values and E8M0 block scales."},
+    )
 
     def __post_init__(self):
         if self.fsdp_mode not in ("ddp", "fsdp2", "hyper_fsdp2", "eager"):
@@ -835,6 +839,8 @@ class FSDPConfig:
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
+        if not isinstance(self.mxfp8_all_gather, bool):
+            raise ValueError("mxfp8_all_gather must be a boolean.")
         if not isinstance(self.expert_weight_fp8_all_gather, bool):
             raise ValueError("expert_weight_fp8_all_gather must be a boolean.")
         validate_expert_fsdp_shard_dim(self.expert_fsdp_shard_dim, fsdp_mode=self.fsdp_mode)

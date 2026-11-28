@@ -329,7 +329,8 @@ def test_qwen3_and_llama_bind_float8_handles(monkeypatch):
 
 
 @cpu
-def test_dpo_reference_builds_cleanly_without_trainer_float8_patch(monkeypatch):
+@pytest.mark.parametrize("mxfp8_transport", [False, True])
+def test_dpo_reference_builds_cleanly_without_trainer_float8_patch(monkeypatch, mxfp8_transport):
     """Frozen DPO reference disables mixed precision without needing any float8 trainer patch."""
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.trainer import text_dpo_trainer as dpo
@@ -341,15 +342,24 @@ def test_dpo_reference_builds_cleanly_without_trainer_float8_patch(monkeypatch):
             self.proj = nn.Linear(32, 32)
 
     ops = make_eager_ops_config()
-    ops.linear_implementation = _fp8_selection(recipe="rowwise")
-    ops.gated_mlp_implementation = _fp8_selection(recipe="rowwise")
+    row = (
+        OpsSelection(name="torchao", kwargs={"dtype": "mxfp8"})
+        if mxfp8_transport
+        else _fp8_selection(recipe="rowwise")
+    )
+    ops.linear_implementation = row
+    ops.gated_mlp_implementation = row
     args = ModelArguments(config_path="/tmp/qwen3", ops_implementation=ops)
+    args.accelerator.fsdp_config.mxfp8_all_gather = mxfp8_transport
     monkeypatch.setattr(dpo.DPOReferenceModelRuntime, "setup", lambda self: None)
     monkeypatch.setattr(dpo, "use_parallel_state", lambda _: nullcontext())
     monkeypatch.setattr("veomni.models.auto.build_foundation_model", lambda **kwargs: _DummyModel())
     monkeypatch.setattr(dpo.DPOReferenceModelRuntime, "_build_parallelized_model", lambda self: None)
 
     reference = dpo.DPOReferenceModelRuntime(args, train=None)
+    assert args.accelerator.fsdp_config.mxfp8_all_gather is mxfp8_transport
+    assert reference.args.ops_implementation.linear_implementation == row
+    assert not reference.args.accelerator.fsdp_config.mxfp8_all_gather
     assert not reference.args.accelerator.fsdp_config.mixed_precision.enable
     assert not hasattr(reference.args.accelerator.fsdp_config.mixed_precision, "float8")
 

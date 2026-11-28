@@ -390,6 +390,15 @@ pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |
 
+### Dense MXFP8 parameter transport
+
+`FSDPConfig.mxfp8_all_gather` selects the weights consumed by resolved
+`linear/standard` and `gated_mlp/standard` MXFP8 rows. The FSDP2 builder
+installs hooks on materialized local shards before the first unshard. The
+functional rows consume the gathered weight in either GEMM orientation.
+Optimizers and checkpoint loaders continue to operate on ordinary master shards.
+See [dense MXFP8 transport](../../docs/usage/low_precision_training.md#optional-fsdp2-allgather).
+
 ### DeepGEMM FP8 expert parameter transport
 
 `FSDPConfig.expert_weight_fp8_all_gather` flows through `VeOmniModelRuntime` and

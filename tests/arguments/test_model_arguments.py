@@ -17,7 +17,8 @@
 import pytest
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import AcceleratorConfig, FSDPConfig, ModelArguments, OptimizerConfig
+from veomni.arguments import AcceleratorConfig, FSDPConfig, MixedPrecisionConfig, ModelArguments, OptimizerConfig
+from veomni.distributed.torch_compile import CompileConfig
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -150,6 +151,41 @@ def test_fp8_all_gather_requires_boolean():
 
     with pytest.raises(ValueError, match="boolean"):
         FSDPConfig(expert_weight_fp8_all_gather="true")
+
+
+def test_mxfp8_all_gather_requires_explicit_boolean():
+    assert FSDPConfig().mxfp8_all_gather is False
+    assert FSDPConfig(mxfp8_all_gather=True).mxfp8_all_gather is True
+    with pytest.raises(ValueError, match="mxfp8_all_gather must be a boolean"):
+        FSDPConfig(mxfp8_all_gather="false")
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ({"enable_fsdp_offload": True}, "no CPU offload"),
+        ({"mixed_precision": MixedPrecisionConfig(param_dtype="float16")}, "BF16"),
+        ({"extra_parallel_only": True}, "native FSDP2"),
+        ({"compile_config": CompileConfig(enable=True)}, "torch.compile"),
+    ],
+)
+def test_mxfp8_transport_checks_selected_rows_before_sharding(monkeypatch, options, message):
+    from torch import nn
+
+    from veomni.distributed.torch_parallelize import parallelize_model_fsdp2
+    from veomni.ops import OpsSelection, VeomniOp
+    from veomni.ops import registry as ops_registry
+
+    # Only row selection is exercised; the policy rejects the run before a GEMM.
+    is_available = ops_registry.is_package_available
+    monkeypatch.setattr(ops_registry, "is_package_available", lambda name: name == "torchao" or is_available(name))
+    monkeypatch.setattr(ops_registry, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(VeomniOp, "_intern", {})
+    model = nn.Module()
+    model.q_proj = nn.Linear(64, 64)
+    model.veomni_q_proj = VeomniOp("linear", "standard", OpsSelection(name="torchao", kwargs={"dtype": "mxfp8"}))
+    with pytest.raises(ValueError, match=message):
+        parallelize_model_fsdp2(model, mxfp8_all_gather=True, **options)
 
 
 def test_fp8_all_gather_is_opt_in():

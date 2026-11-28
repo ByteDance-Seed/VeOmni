@@ -117,7 +117,7 @@ reduction dimensions. The weight-gradient GEMM quantizes the input and output
 gradient along the token dimension. The GEMMs produce BF16. At the model
 boundary the projection returns the active autocast dtype, or the input dtype
 when autocast is off. This also allows an FP32 model to enable MXFP8 on a single
-attention projection. FSDP2 uses its ordinary floating-point AllGather.
+attention projection. FSDP2 uses its ordinary floating-point AllGather by default.
 
 On B200 with PyTorch 2.11, CUDA Inductor supports the linear row. With bias,
 compiler fusion can round the sum differently from eager execution. For the
@@ -126,6 +126,37 @@ reference by up to 6% in relative L2 in testing. Use eager execution or
 `backend: aot_eager` for that row. CPU emulation works in eager mode; CPU
 Inductor lacks the E8M0 scale lowering. See the
 [compiler restrictions](../key_features/torch_compile.md).
+
+### Optional FSDP2 AllGather
+
+To quantize weights before the collective, add this setting alongside the
+MXFP8 op selections above.
+
+```yaml
+model:
+  accelerator:
+    fsdp_config:
+      mxfp8_all_gather: true
+```
+
+Only the dense weights consumed by a selected MXFP8 linear or gated MLP use
+this transport. Biases, embeddings, the LM head and eager projections use
+ordinary FSDP. The optimizer, distributed checkpoints and HF export see the
+original master parameters. The frozen DPO reference uses ordinary AllGather.
+
+Each rank rounds its local master shard to BF16 and independently quantizes
+rows of the weight and its transpose. Forward uses the row layout, and the
+input gradient uses the transposed layout. Both are gathered with their E8M0
+scales. Together they carry 2.0625 bytes per weight element before collective
+padding, compared with 2 bytes for BF16. This moves weight quantization onto
+the local shard and avoids quantizing the gathered weight on each rank.
+
+Use eager native FSDP2 with BF16 mixed precision and accelerator-resident
+parameters. Each weight must be evenly sharded on dimension 0, with both
+local dimensions divisible by 32. A shared projection weight must use MXFP8
+with the same emulation setting at every alias. Unselected tied embeddings
+and heads keep their ordinary FSDP behavior. Partial resharding and model compilation
+are unsupported with this option. Per-site MXFP8 selections still apply.
 
 ---
 
@@ -224,7 +255,8 @@ and the complete example in
   `torchao` or `qat` (`FSDPLinear` subclasses cannot have their weights read
   directly); use `eager` (or per-site `overrides`) for those layers.
 - **Sequence / context parallel & CPU offload**: Supported (see the `nvfp4`
-  rank-local `amax` note above).
+  rank-local `amax` note above). Optional MXFP8 AllGather requires master
+  shards on the accelerator.
 - **LoRA**: Quantizing rows (`torchao`, `qat`, `deepgemm`) read base weights
   directly and refuse LoRA-wrapped projections (`LoraLinear` / MoE-LoRA) rather
   than silently bypassing adapters. Use `eager` (or `liger_kernel` for
@@ -248,6 +280,6 @@ training, DCP resume, HF export) require the `float8` extra and skip when
 
 ```bash
 uv sync --locked --extra gpu --extra float8 --dev
-pytest tests/models/test_float8_training.py tests/models/test_qat_fsdp.py \
+pytest tests/models/test_float8_training.py tests/models/test_qat_fsdp.py tests/models/test_mxfp8_fsdp.py \
   tests/ops/linear/ tests/ops/gated_mlp/ tests/models/transformers/qwen/test_qwen3.py -q
 ```

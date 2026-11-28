@@ -273,6 +273,14 @@ def _mxfp8_padded_rows(tensor: Tensor) -> Tensor:
     return F.pad(rows, (0, 0, 0, padding)) if padding else rows
 
 
+def _mxfp8_weight_operand(weight: Tensor, emulated: bool, *, transposed: bool = False) -> Tensor:
+    from ..distributed.fsdp2.mxfp8_weight import MXFP8GatheredWeight
+
+    if isinstance(weight, MXFP8GatheredWeight):
+        return weight.mx(transposed=transposed, emulated=emulated)
+    return _quantize_mxfp8(weight.t() if transposed else weight, emulated)
+
+
 @torch._dynamo.allow_in_graph
 class _MXFP8LinearFunction(torch.autograd.Function):
     """Quantize both operands along the reduction axis of each training GEMM."""
@@ -285,7 +293,9 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         shape = (*x.shape[:-1], weight.shape[0])
         if x.numel() == 0:
             return x.new_empty(shape, dtype=torch.bfloat16)
-        output = torch.mm(_quantize_mxfp8(_mxfp8_padded_rows(x), emulated), _quantize_mxfp8(weight, emulated).t())
+        output = torch.mm(
+            _quantize_mxfp8(_mxfp8_padded_rows(x), emulated), _mxfp8_weight_operand(weight, emulated).t()
+        )
         return output[: x.numel() // x.shape[-1]].reshape(shape)
 
     @staticmethod
@@ -293,9 +303,11 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         """Quantize the transpose of the original weight for input gradients."""
         x, weight = ctx.saved_tensors
         if x.numel() == 0:
-            return torch.empty_like(x), torch.zeros_like(weight), None
+            return torch.empty_like(x), grad_output.new_zeros(weight.shape, dtype=weight.dtype), None
         x_rows, grad_rows = _mxfp8_padded_rows(x), _mxfp8_padded_rows(grad_output)
-        grad_input = torch.mm(_quantize_mxfp8(grad_rows, ctx.emulated), _quantize_mxfp8(weight.t(), ctx.emulated).t())
+        grad_input = torch.mm(
+            _quantize_mxfp8(grad_rows, ctx.emulated), _mxfp8_weight_operand(weight, ctx.emulated, transposed=True).t()
+        )
         # The weight gradient contracts over tokens, including zero padding in
         # the final 32-element block of each transposed operand.
         grad_weight = torch.mm(
@@ -308,8 +320,8 @@ class _MXFP8LinearFunction(torch.autograd.Function):
 def torchao_mxfp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None, *, emulated: bool = False) -> Tensor:
     """Compute a BF16 dense projection using 32-wide MXFP8 blocks for all three training GEMMs.
 
-    Accepts local FP32 or BF16 inputs and a plain weight whose dimensions are
-    positive multiples of 32. Arbitrary leading token dimensions, including
+    Accepts local FP32 or BF16 inputs and a plain or FSDP2-gathered MXFP8
+    weight with positive dimensions divisible by 32. Arbitrary leading token dimensions, including
     empty batches, are supported. Set ``emulated=True`` to run without SM100+.
     """
     if type(emulated) is not bool:
