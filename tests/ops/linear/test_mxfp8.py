@@ -96,15 +96,23 @@ def test_mxfp8_rejects_projection_hooks(register, hook):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
-def test_native_mxfp8_matches_independent_oracle():
+@pytest.mark.parametrize(("tokens", "autocast_dtype"), [(1, torch.float16), (33, None)])
+def test_native_mxfp8_matches_independent_oracle(tokens, autocast_dtype):
     if not device.IS_CUDA_AVAILABLE or torch.version.hip is not None or device.get_gpu_compute_capability() < 100:
         pytest.skip("Requires native MXFP8 on NVIDIA SM100+.")
     pytest.importorskip("torchao")
     from torch.profiler import ProfilerActivity, profile
 
-    with profile(activities=[ProfilerActivity.CPU]) as trace:
-        _check_projection(33, torch.float32, device.get_device_type(), emulated=False)
-    assert sum(event.count for event in trace.key_averages() if event.key == "aten::_scaled_mm") == 3
+    with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as trace:
+        _check_projection(
+            tokens, torch.float32, device.get_device_type(), emulated=False, autocast_dtype=autocast_dtype
+        )
+    token_block = ((tokens + 31) // 32) * 32
+    assert [event.input_shapes[:2] for event in trace.events() if event.name == "aten::_scaled_mm"] == [
+        [[tokens, 64], [64, 128]],
+        [[tokens, 128], [128, 64]],
+        [[128, token_block], [token_block, 64]],
+    ]
 
 
 def test_mxfp8_handles_empty_input():

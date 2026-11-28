@@ -273,10 +273,12 @@ def _quantize_mxfp8(tensor: Tensor, emulated: bool) -> Tensor:
     )
 
 
-def _mxfp8_padded_rows(tensor: Tensor) -> Tensor:
-    rows = tensor.reshape(-1, tensor.shape[-1])
+def _mxfp8_wgrad_operand(rows: Tensor, emulated: bool) -> Tensor:
+    """Quantize the transpose in whole 32-token blocks, zero-filling the final block."""
     padding = (-rows.shape[0]) % MXFP8_BLOCK_SIZE
-    return F.pad(rows, (0, 0, 0, padding)) if padding else rows
+    if padding:
+        rows = F.pad(rows, (0, 0, 0, padding))
+    return _quantize_mxfp8(rows.t(), emulated)
 
 
 @torch._dynamo.allow_in_graph
@@ -291,8 +293,9 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         shape = (*x.shape[:-1], weight.shape[0])
         if x.numel() == 0:
             return x.new_empty(shape, dtype=torch.bfloat16)
-        output = torch.mm(_quantize_mxfp8(_mxfp8_padded_rows(x), emulated), _quantize_mxfp8(weight, emulated).t())
-        return output[: x.numel() // x.shape[-1]].reshape(shape)
+        x_rows = x.reshape(-1, x.shape[-1])
+        output = torch.mm(_quantize_mxfp8(x_rows, emulated), _quantize_mxfp8(weight, emulated).t())
+        return output.reshape(shape)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -300,15 +303,13 @@ class _MXFP8LinearFunction(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         if x.numel() == 0:
             return torch.empty_like(x), torch.zeros_like(weight), None
-        x_rows, grad_rows = _mxfp8_padded_rows(x), _mxfp8_padded_rows(grad_output)
+        x_rows = x.reshape(-1, x.shape[-1])
+        grad_rows = grad_output.reshape(-1, grad_output.shape[-1])
         grad_input = torch.mm(_quantize_mxfp8(grad_rows, ctx.emulated), _quantize_mxfp8(weight.t(), ctx.emulated).t())
-        # The weight gradient contracts over tokens, including zero padding in
-        # the final 32-element block of each transposed operand.
         grad_weight = torch.mm(
-            _quantize_mxfp8(grad_rows.t(), ctx.emulated), _quantize_mxfp8(x_rows.t(), ctx.emulated).t()
+            _mxfp8_wgrad_operand(grad_rows, ctx.emulated), _mxfp8_wgrad_operand(x_rows, ctx.emulated).t()
         )
-        grad_input = grad_input[: x.numel() // x.shape[-1]].reshape_as(x)
-        return grad_input.to(x.dtype), grad_weight.to(weight.dtype), None
+        return grad_input.reshape_as(x).to(x.dtype), grad_weight.to(weight.dtype), None
 
 
 def torchao_mxfp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None, *, emulated: bool = False) -> Tensor:
