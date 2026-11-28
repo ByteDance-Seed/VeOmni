@@ -13,7 +13,9 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from tests.models.tiny_configs import tiny_llama_config
+from veomni.distributed import torch_parallelize
 from veomni.distributed.fsdp2.mxfp8_all_gather import has_mxfp8_all_gather_targets, register_mxfp8_all_gather
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 from veomni.ops import OpsSelection, VeomniOp
 
 
@@ -79,6 +81,37 @@ def test_shared_weight_consumers(mesh, shared):
         with pytest.raises(ValueError, match="conflicting emulated modes|also used by"):
             register_mxfp8_all_gather(model)
         assert not hasattr(model[0].q_b_proj.weight._local_tensor, "fsdp_pre_all_gather")
+
+
+@pytest.mark.parametrize("both_selected, error", [(False, "also used by"), (True, "same FSDP unit")])
+def test_cross_block_shared_projection_weights(mesh, monkeypatch, both_selected, error):
+    pytest.importorskip("torchao")
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
+
+    config = tiny_llama_config()
+    ops = eager_ops_config()
+    ops.linear_implementation = {
+        "name": "eager",
+        "overrides": [
+            {
+                "site": r"layers\.\d+\.q_proj" if both_selected else r"layers\.0\.q_proj",
+                "name": "torchao",
+                "kwargs": {"dtype": "mxfp8", "emulated": True},
+            }
+        ],
+    }
+    config._set_ops_implementation(ops)
+    with torch.device("meta"):
+        model = LlamaForCausalLM(config)
+    first, second = model.model.layers
+    second.self_attn.q_proj.weight = first.self_attn.q_proj.weight
+    monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
+    _init_parallel_state(device_type="cpu")
+    try:
+        with pytest.raises(ValueError, match=error):
+            torch_parallelize.parallelize_model_fsdp2(model, init_device="meta", mxfp8_all_gather=True)
+    finally:
+        clear_parallel_state()
 
 
 def test_invalid_shard_leaves_all_hooks_uninstalled(mesh):

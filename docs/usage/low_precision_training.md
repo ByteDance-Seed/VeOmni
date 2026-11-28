@@ -153,10 +153,11 @@ the local shard and avoids quantizing the gathered weight on each rank.
 
 Use eager native FSDP2 with BF16 mixed precision and accelerator-resident
 parameters. Each weight must be evenly sharded on dimension 0, with both
-local dimensions divisible by 32. A shared projection weight must use MXFP8
-with the same emulation setting at every alias. Unselected tied embeddings
-and heads keep their ordinary FSDP behavior. Partial resharding and model compilation
-are unsupported with this option. Per-site MXFP8 selections still apply.
+local dimensions divisible by 32. All aliases of a shared projection weight
+must belong to the same FSDP unit and use MXFP8 with the same emulation setting.
+Unselected tied embeddings and heads keep their ordinary FSDP behavior.
+Partial resharding and model compilation are unsupported with this option.
+Per-site MXFP8 selections still apply.
 
 ---
 

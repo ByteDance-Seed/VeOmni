@@ -606,6 +606,9 @@ def parallelize_model_fsdp2(
             raise ValueError("mxfp8_all_gather requires native FSDP2 with BF16 mixed precision and no CPU offload.")
         if compile_config is not None and compile_config.enable:
             raise ValueError("mxfp8_all_gather does not support torch.compile.")
+        from .fsdp2.mxfp8_all_gather import shared_mxfp8_weight_aliases
+
+        mxfp8_aliases = shared_mxfp8_weight_aliases(model)
 
     parallel_state = get_parallel_state()
     if extra_parallel_only and mixed_precision.enable:
@@ -1041,6 +1044,10 @@ def parallelize_model_fsdp2(
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
+    if mxfp8_all_gather:
+        for alias, first_name in mxfp8_aliases.items():
+            if model.get_parameter(alias) is not model.get_parameter(first_name):
+                raise ValueError(f"Shared MXFP8 weights must belong to the same FSDP unit: {first_name}, {alias}.")
     # Persistent ExtraParallel parameters are ignored by every FSDP group and
     # retain their original 2D DTensor identity. Record them after wrapping so
     # gradient clipping can reduce their unique local shards once over the

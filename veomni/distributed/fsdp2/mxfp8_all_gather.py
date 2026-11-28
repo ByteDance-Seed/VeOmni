@@ -34,6 +34,7 @@ def has_mxfp8_all_gather_targets(model: nn.Module) -> bool:
 
 def _selected_weights(model):
     selected = {}
+    shared_aliases = {}
     selected_names = set()
     for path, owner, attr, op in _mxfp8_handles(model):
         # Standard linear sites call self.veomni_<proj>(self.<proj>, x).
@@ -50,11 +51,11 @@ def _selected_weights(model):
             if type(layer) is not nn.Linear:
                 raise ValueError(f"MXFP8 all-gather requires a plain nn.Linear at {fqn}.")
             param_id = id(layer.weight)
-            if param_id in selected and selected[param_id][1] != emulated:
-                raise ValueError(
-                    f"Shared MXFP8 weight has conflicting emulated modes: {selected[param_id][0]}, {fqn}."
-                )
-            selected[param_id] = (fqn, emulated)
+            first_name, first_mode = selected.setdefault(param_id, (fqn, emulated))
+            if first_mode != emulated:
+                raise ValueError(f"Shared MXFP8 weight has conflicting emulated modes: {first_name}, {fqn}.")
+            if first_name != fqn:
+                shared_aliases[fqn] = first_name
             selected_names.add(fqn)
     # FSDP exposes the same gathered weight at every alias. An eager consumer
     # (for example a tied embedding) cannot read the two MXFP8 representations.
@@ -62,12 +63,18 @@ def _selected_weights(model):
         for fqn, weight in model.named_parameters(remove_duplicate=False):
             if id(weight) in selected and fqn not in selected_names:
                 raise ValueError(f"Selected MXFP8 weight {selected[id(weight)][0]} is also used by {fqn}.")
-    return selected
+    return selected, shared_aliases
+
+
+def shared_mxfp8_weight_aliases(model: nn.Module) -> dict[str, str]:
+    """Validate the original consumers and record selected ties before FSDP replaces parameters."""
+    _, aliases = _selected_weights(model)
+    return aliases
 
 
 def register_mxfp8_all_gather(model: nn.Module) -> int:
     """Bind native extensions after materialization and before the first unshard."""
-    selected = _selected_weights(model)
+    selected, _ = _selected_weights(model)
     if not selected:
         return 0
 
