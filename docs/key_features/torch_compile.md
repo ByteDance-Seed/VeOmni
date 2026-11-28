@@ -164,9 +164,16 @@ Inductor ran the MXFP8 `linear` row on B200 with PyTorch 2.11 and torchao
 128-wide hidden layer, Inductor changed the down-projection weight gradient
 relative to eager by 1.65% in native mode and 5.96% in emulation (relative
 L2). The eager gradients matched the independent dequantized reference.
-The measurement does not isolate which compiler transformation caused the
-difference. VeOmni rejects both gated modes with Inductor. Use eager execution
-or `backend: aot_eager`.
+VeOmni rejects both gated modes with Inductor. Use eager execution or
+`backend: aot_eager` for gated MLPs.
+
+An independent B200 run isolated the effect of BF16 rounding on the same
+shape. Compiling only the clamp, SiLU and multiply changed the hidden
+activation by 0.30% relative L2. Feeding that activation to the eager down
+projection reproduced the full compiled weight gradient in emulation. In
+native mode this explained only part of the difference. With Inductor's
+`emulate_precision_casts=True`, the output, input gradient and down-projection
+weight gradient matched eager exactly in both modes for this input.
 
 To repeat the down-gradient comparison directly on SM100+, run the following
 test with the `float8` extra installed. An `XFAIL` reports the measured relative
@@ -174,6 +181,7 @@ L2 above 0.5%. A pass means this reproducer matches eager within that threshold.
 
 ```bash
 pytest -q -rx tests/distributed/test_torch_compile.py::test_mxfp8_gated_inductor_down_gradient
+TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1 pytest -q -rx tests/distributed/test_torch_compile.py::test_mxfp8_gated_inductor_down_gradient
 ```
 
 ## The default `mode=None`
