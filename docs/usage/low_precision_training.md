@@ -111,6 +111,12 @@ Native MXFP8 requires NVIDIA SM100+ and `torchao==0.18.0`. Set `emulated: true`
 in a row's `kwargs` for emulation. The input and output feature dimensions must
 both be multiples of 32. Token counts may be ragged or zero.
 
+Native numerical and two-GPU FSDP2 results have been verified manually on
+B200. GitHub Actions runs native tests only when a maintainer configures an
+SM100+ runner using `MXFP8_SM100_RUNNER_LABEL`. The distributed case needs
+two visible SM100+ GPUs. The regular GPU suite exercises emulated MXFP8
+with ordinary FSDP2 AllGather after installing the `float8` extra.
+
 MXFP8 reads each projection's weight directly. It rejects forward and backward
 module hooks registered on the selected linear projection or on the gate, up,
 or down projection of a selected MLP. To observe a whole block, register the
