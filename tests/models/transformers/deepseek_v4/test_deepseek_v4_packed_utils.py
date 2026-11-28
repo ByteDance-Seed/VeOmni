@@ -22,6 +22,7 @@ import torch
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.transformers.deepseek_v4.packed_utils import (
     build_packed_compression_metadata,
+    compress_packed_windows,
     ensure_unmasked_packed_attention,
     resolve_packed_sequence_slices,
     shard_packed_compression_metadata,
@@ -173,3 +174,56 @@ def test_shard_packed_compression_metadata_keeps_global_compressed_slots():
         local["range_starts"],
         metadata["range_starts"][rank * LOCAL_LEN : (rank + 1) * LOCAL_LEN],
     )
+
+
+class _Scale(torch.nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(width))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states * self.weight
+
+
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
+def test_empty_packed_window_anchor_keeps_norm_and_bias_in_the_graph():
+    head_dim = 4
+    kv = torch.randn(1, 3, head_dim, requires_grad=True)
+    gate = torch.randn(1, 3, head_dim, requires_grad=True)
+    position_bias = torch.nn.Parameter(torch.randn(4, head_dim))
+    kv_norm = _Scale(head_dim)
+    metadata = {"window_starts": torch.empty(0, dtype=torch.long)}
+
+    def compress(*, anchor_empty: bool) -> torch.Tensor:
+        return compress_packed_windows(
+            kv,
+            gate,
+            position_bias,
+            head_dim,
+            compress_rate=4,
+            kv_norm=kv_norm,
+            rotary_emb=torch.nn.Identity(),
+            rope_layer_type="compress",
+            position_ids=torch.zeros(1, 3, dtype=torch.long),
+            packed_metadata=metadata,
+            overlap=False,
+            apply_rope=lambda hidden, cos, sin: hidden,
+            anchor_empty=anchor_empty,
+        )
+
+    unanchored = compress(anchor_empty=False)
+    assert unanchored.shape[1] == 0
+    unanchored.sum().backward()
+    assert kv.grad is not None and gate.grad is not None
+    assert kv_norm.weight.grad is None
+    assert position_bias.grad is None
+
+    kv.grad = None
+    gate.grad = None
+    anchored = compress(anchor_empty=True)
+    torch.testing.assert_close(anchored, unanchored)
+    anchored.sum().backward()
+    assert kv_norm.weight.grad is not None
+    assert position_bias.grad is not None
+    assert torch.count_nonzero(kv_norm.weight.grad) == 0
+    assert torch.count_nonzero(position_bias.grad) == 0

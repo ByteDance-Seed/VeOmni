@@ -386,6 +386,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         swiglu_limit=None,
         assume_distinct_experts=False,
         activation="silu",
+        swiglu_alpha=None,
     ):
         """Scatter, merged fc1 GEMM, gated activation, fc2, gather."""
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
@@ -429,7 +430,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # same way the split-fc1 forward does it, so ``forward`` and ``backward``
         # cannot disagree about which function was applied.
         if is_silu(activation):
-            fc1_activation = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
+            fc1_activation = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output, swiglu_alpha)
         else:
             fc1_activation = _expert_activation(fc1_1_output, activation) * fc1_2_output
 
@@ -455,6 +456,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
         ctx.activation = activation
+        ctx.swiglu_alpha = swiglu_alpha
         ctx.max_expert_tokens = max_expert_tokens
         # These intermediates are cheap to recompute in backward and do not
         # need to remain live for the entire forward-to-backward interval.
@@ -537,6 +539,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 grad_fc1_activation,
                 mask_fc1_1 if swiglu_limit is not None else None,
                 mask_fc1_2 if swiglu_limit is not None else None,
+                ctx.swiglu_alpha,
             )
         else:
             gate_grad = activation_backward(grad_fc1_activation * fc1_2_output, fc1_1_output, ctx.activation)
@@ -610,6 +613,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             None,  # swiglu_limit
             None,  # assume_distinct_experts
             None,  # activation
+            None,  # swiglu_alpha
         )
 
 
@@ -618,7 +622,7 @@ def _balanced_experts(tokens, gate, down, plan, group, gate_transfer, down_trans
 
     cumsum = plan.tokens_per_local_physical_expert.sum(dim=0).cumsum(dim=0).to(tokens.device)
     if gate_transfer is None:
-        return EPMergedFc1GroupGemm.apply(tokens, cumsum, gate, down, limit, activation)
+        return EPMergedFc1GroupGemm.apply(tokens, cumsum, gate, down, limit, activation, None)
     replica_gate = gate_transfer.wait()
     replica_down = down_transfer.wait()
     transfers = (gate_transfer, down_transfer) if memory else None
@@ -639,6 +643,7 @@ def group_gemm_fused_moe_forward(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     activation: str = "silu",
+    swiglu_alpha: float | None = None,
     *,
     load_balancer=None,
 ):
@@ -671,6 +676,8 @@ def group_gemm_fused_moe_forward(
     """
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     if load_balancer is not None:
+        if swiglu_alpha is not None:
+            raise ValueError("Qwen3.5 EP load balancing requires standard SwiGLU.")
         from .....distributed.moe.moe_layer import dispatch_to_ep_with_replicas
 
         gate = fc1_1_2_weight if fc1_1_weight is None and fc1_2_weight is None else None
@@ -704,6 +711,7 @@ def group_gemm_fused_moe_forward(
                 fc2_weight,
                 swiglu_limit,
                 activation,
+                swiglu_alpha,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
@@ -734,6 +742,7 @@ def group_gemm_fused_moe_forward(
                 swiglu_limit,
                 assume_distinct_experts,
                 activation,
+                swiglu_alpha,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:

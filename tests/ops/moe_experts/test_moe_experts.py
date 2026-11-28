@@ -696,9 +696,9 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     calls = []
     original = swiglu.merged_swiglu_forward
 
-    def record(gate_input, up):
+    def record(gate_input, up, alpha=None):
         calls.append(gate_input.shape)
-        return original(gate_input, up)
+        return original(gate_input, up, alpha)
 
     def run():
         inputs = [value.detach().clone().requires_grad_() for value in (x, gate, w1, w2)]
@@ -726,9 +726,11 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     ep_grads = torch.autograd.grad(ep_out.float().square().mean(), ep_inputs)
     assert calls == [(tokens * top_k, intermediate), (tokens, intermediate)]
 
-    monkeypatch.setattr(swiglu, "merged_swiglu_forward", lambda gate_input, up: torch.ops.aten.silu(gate_input) * up)
+    monkeypatch.setattr(
+        swiglu, "merged_swiglu_forward", lambda gate_input, up, alpha=None: torch.ops.aten.silu(gate_input) * up
+    )
 
-    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None):
+    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None, alpha=None):
         silu = torch.ops.aten.silu(gate_input)
         grad_gate = torch.ops.aten.silu_backward(grad * up, gate_input)
         grad_up = silu * grad
@@ -1688,7 +1690,7 @@ def test_every_triton_function_backward_returns_one_gradient_per_argument():
         if arguments != entries:
             mismatches.append((cls.name, arguments, entries))
 
-    assert checked == 4, f"expected both Triton and both EP Functions, checked {checked}"
+    assert checked == 5, f"expected both Triton Functions and three EP Functions, checked {checked}"
     assert not mismatches, f"backward tuple does not match forward's arguments: {mismatches}"
 
 
@@ -1878,7 +1880,8 @@ def test_the_expert_parallel_functions_receive_the_activation():
 
     source = pathlib.Path(ep_module.__file__).read_text()
     checked = 0
-    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+    base_ep_classes = {"EPGroupGemm", "EPMergedFc1GroupGemm"}
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name in base_ep_classes):
         forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
         backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
         if forward is None or backward is None:
@@ -1927,7 +1930,7 @@ def test_every_backward_keeps_its_weight_gradient_inside_the_requires_grad_guard
                 if "requires_grad" not in test:
                     continue
                 body = ast.unparse(node)
-                if "group_gemm" not in body:
+                if not any(call in body for call in ("group_gemm", "launch_weight_grad(", "weight_grad_fn(")):
                     problems.append(f"{cls.name}: `if {test}` computes no weight gradient")
 
     assert not problems, f"a weight gradient moved out of its guard: {problems}"
@@ -2042,7 +2045,7 @@ def test_every_backward_attribute_exists_on_the_ctx_its_forward_built():
             }
             missing.extend(f"{cls.name}.{name}" for name in read - assigned - {"saved_tensors", "needs_input_grad"})
 
-    assert checked == 4, f"expected four Functions across both modules, checked {checked}"
+    assert checked == 5, f"expected five Functions across both modules, checked {checked}"
     assert not missing, f"backward reads a ctx attribute its forward never sets: {missing}"
 
 

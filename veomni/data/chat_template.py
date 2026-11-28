@@ -17,7 +17,7 @@ import json
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Union
 
 import torch
 import torch.nn.functional as F
@@ -613,3 +613,150 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
 @CHAT_TEMPLATE_REGISTRY.register("qwen3_5vl")
 class Qwen3_5VLChatTemplate(MTPLabelMixin, Qwen3VLChatTemplate):
     pass
+
+
+@CHAT_TEMPLATE_REGISTRY.register("minimax_m3_vl")
+class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
+    """MiniMax M3 VL media expansion with the processor's native chat template.
+
+    Media placeholders are expanded here, then the conversation is rendered with
+    the checkpoint's own jinja so the training text matches MiniMax exactly.
+    Assistant-only labels come from rendering the conversation turn by turn,
+    which requires that adding a message never rewrites what was rendered before.
+    """
+
+    IMAGE_TOKEN = "]<]image[>["
+    VIDEO_TOKEN = "]<]video[>["
+    VISION_START_TOKEN = "]<]start of image[>["
+    VISION_END_TOKEN = "]<]end of image[>["
+
+    def __init__(self, processor: "ProcessorMixin") -> None:
+        super().__init__(processor)
+        self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.IMAGE_TOKEN)
+        self.video_token_id = self.tokenizer.convert_tokens_to_ids(self.VIDEO_TOKEN)
+
+    # Media expansion mirrors MiniMaxM3VLProcessor.replace_image_token /
+    # replace_video_token instead of calling them: under MODELING_BACKEND=hf, or
+    # when the registry does not recognise the checkpoint's processor class, the
+    # processor here is the checkpoint's bundled MiniMaxVLProcessor, which has no
+    # such methods. Only image/video processor attributes that both carry are used.
+    def image_pattern(self, token_num: int) -> str:
+        return self.VISION_START_TOKEN + self.IMAGE_TOKEN * token_num + self.VISION_END_TOKEN
+
+    def video_pattern(self, token_num: int) -> str:
+        return self.VISION_START_TOKEN + self.VIDEO_TOKEN * token_num + self.VISION_END_TOKEN
+
+    @staticmethod
+    def _require_grid(inputs: Dict[str, Any], key: str, index: int, modality: str) -> None:
+        grid = inputs.get(key)
+        if grid is None or index >= len(grid):
+            raise ValueError(f"The conversation has more {modality} placeholders than processed {modality} inputs.")
+
+    def _expand_image(self, image_inputs: Dict[str, torch.Tensor], image_idx: int) -> str:
+        self._require_grid(image_inputs, "image_grid_thw", image_idx, "image")
+        merge_length = self.processor.image_processor.merge_size**2
+        token_num = int(image_inputs["image_grid_thw"][image_idx].prod() // merge_length)
+        return self.image_pattern(token_num)
+
+    def _expand_video(self, video_inputs: Dict[str, Any], video_idx: int, video_metadata: Sequence[Any]) -> str:
+        self._require_grid(video_inputs, "video_grid_thw", video_idx, "video")
+        video_processor = self.processor.video_processor
+        grid_thw = video_inputs["video_grid_thw"][video_idx]
+        grid_t = int(grid_thw[0])
+        frame_seqlen = int(grid_thw[1:].prod() // video_processor.merge_size**2)
+        metadata = video_metadata[video_idx] if video_metadata is not None else None
+        fps = getattr(metadata, "fps", None)
+        frames_indices = getattr(metadata, "frames_indices", None)
+        temporal_patch_size = getattr(video_processor, "temporal_patch_size", 1)
+
+        chunks = []
+        for frame in range(grid_t):
+            if fps is not None and frames_indices is not None and len(frames_indices) > 0:
+                frame_idx = min(frame * temporal_patch_size, len(frames_indices) - 1)
+                chunks.append(f"]<]{frames_indices[frame_idx] / fps:.1f} seconds[>[")
+            chunks.append(self.video_pattern(frame_seqlen))
+        return "".join(chunks)
+
+    def _expand_media(
+        self,
+        conversations: Sequence[Sequence[Any]],
+        image_inputs: Dict[str, torch.Tensor],
+        video_inputs: Dict[str, Any],
+        video_metadata: Sequence[Any],
+    ) -> List[Dict[str, str]]:
+        messages = []
+        image_idx = video_idx = 0
+        for message in conversations:
+            role = message[0]
+            content = ""
+            for value in message[1:]:
+                if value[0] == "text":
+                    content += value[1]
+                elif value[0] == "image":
+                    content += self._expand_image(image_inputs, image_idx)
+                    image_idx += 1
+                elif value[0] == "video":
+                    content += self._expand_video(video_inputs, video_idx, video_metadata)
+                    video_idx += 1
+                else:
+                    raise ValueError(f"Unknown value type: {value[0]}")
+            messages.append({"role": role, "content": content})
+        return messages
+
+    def _render_and_tokenize(self, messages: List[Dict[str, str]], *, add_generation_prompt: bool) -> List[int]:
+        rendered = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=add_generation_prompt
+        )
+        return self.tokenizer.encode(rendered, add_special_tokens=False)
+
+    @staticmethod
+    def _require_prefix(prefix: List[int], sequence: List[int], context: str) -> None:
+        if sequence[: len(prefix)] != prefix:
+            raise ValueError(
+                f"The MiniMax M3 VL native chat template rewrote the {context}; "
+                "assistant-only loss masking requires prefix-stable rendering."
+            )
+
+    def _tokenize_and_label(self, messages: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
+        """Render the conversation turn by turn; only assistant replies are trained on."""
+        if messages and messages[0]["role"] == "assistant":
+            # The generation prefix of a first assistant turn would need rendering an
+            # empty conversation, which apply_chat_template cannot do.
+            raise ValueError("MiniMax M3 VL conversations must not start with an assistant message.")
+
+        input_ids: List[int] = []
+        labels: List[int] = []
+        for end, message in enumerate(messages, start=1):
+            # Loss starts after the assistant generation prefix, or nowhere in other turns.
+            if message["role"] == "assistant":
+                prefix = self._render_and_tokenize(messages[: end - 1], add_generation_prompt=True)
+                self._require_prefix(input_ids, prefix, "rendered conversation history")
+                current_ids = self._render_and_tokenize(messages[:end], add_generation_prompt=False)
+                self._require_prefix(prefix, current_ids, "assistant generation prefix")
+                boundary = len(prefix)
+            else:
+                current_ids = self._render_and_tokenize(messages[:end], add_generation_prompt=False)
+                self._require_prefix(input_ids, current_ids, "rendered conversation history")
+                boundary = len(current_ids)
+            labels.extend([IGNORE_INDEX] * (boundary - len(input_ids)) + current_ids[boundary:])
+            input_ids = current_ids
+
+        return {
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+            "labels": torch.tensor(labels),
+        }
+
+    def encode_messages(self, conversations: Sequence[Sequence[Any]], **kwargs) -> Dict[str, torch.Tensor]:
+        """Expand media from the processor outputs, then render with the native chat template.
+
+        Placeholder counts and video frame timestamps are read from ``image_inputs`` /
+        ``video_inputs`` / ``video_metadata`` produced by ``process_sample_minimax_m3_vl``.
+        """
+        messages = self._expand_media(
+            conversations,
+            image_inputs=kwargs.get("image_inputs") or {},
+            video_inputs=kwargs.get("video_inputs") or {},
+            video_metadata=kwargs.get("video_metadata"),
+        )
+        return self._tokenize_and_label(messages)

@@ -611,9 +611,19 @@ class TorchCompileConfig:
         default=True,
         metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
     )
-    dynamic: bool = field(
-        default=False,
-        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
+    dynamic: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether to pass dynamic=True to torch.compile. Unset keeps torch's default: the first call "
+                "compiles a static graph and a shape change promotes it to a symbolic one covering the rest of "
+                "the run. Leave it unset. False is not the safe choice: with fullgraph=True a re-cache is a "
+                "hard failure, so one new shape per step raises FailOnRecompileLimitHit once "
+                "torch._dynamo.config.cache_size_limit (8) is exhausted. True survives a moving shape but pays "
+                "for it on the first call, and it breaks a custom autograd Function that chains two Triton "
+                "kernels (the fused-Triton MoE experts)."
+            )
+        },
     )
 
 
@@ -1535,6 +1545,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"torch_npu"}),
     "situ_and_mul_implementation": frozenset({"triton"}),
     "chunk_kda_implementation": frozenset({"ascendc"}),
 }
@@ -1544,6 +1555,7 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"torch_npu"}),
 }
 
 _AITER_ATTENTION_IMPLEMENTATIONS = frozenset(
@@ -1800,6 +1812,12 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
+    minimax_sparse_attention_implementation: Optional[Literal["eager", "torch_npu"]] = field(
+        default=None,
+        metadata={
+            "help": "MiniMax sparse language attention. Defaults to NPU fusion on Ascend and PyTorch elsewhere."
+        },
+    )
     qsa_attention_implementation: Literal["eager", "tilelang", "torch_npu"] = field(
         default="eager",
         metadata={
@@ -1810,6 +1828,15 @@ class OpsImplementationConfig:
             "torch_npu.npu_fusion_attention (requires bf16, Ascend NPU). "
             "Both fused backends cover training forward/backward only, no KV cache, and raise on an "
             "attention mask. Nonzero attention dropout falls back to eager with a warning."
+        },
+    )
+    qsa_indexer_implementation: Literal["eager"] = field(
+        default="eager",
+        metadata={
+            "help": "Qwen4-Exp QSA block top-k. 'eager' masks invisible blocks with finite -1.0 "
+            "and runs PyTorch topk. Visible scores are ReLU outputs (>= 0), so -1.0 stays below "
+            "them without an -inf sentinel that faults Ascend TopKV2. On NPU the validity gather "
+            "uses int8. Projections, RoPE, and the compressed-row gather stay in the model."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(

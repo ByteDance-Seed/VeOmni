@@ -34,6 +34,25 @@ class _Meta:
     weight_needs_grad: bool
 
 
+def _unpack_liger_ce_forward_output(result: tuple) -> tuple[Tensor, Tensor | None, Tensor | None]:
+    """Extract ``(loss, grad_hidden, grad_weight)`` across Liger 6- and 7-tuple returns.
+
+    ``liger-kernel < 0.8.0`` returns
+    ``(loss, z_loss, token_accuracy, grad_input, grad_weight, grad_bias)``.
+    ``liger-kernel >= 0.8.0`` inserts ``predicted_tokens`` at index 3, returning
+    ``(loss, z_loss, token_accuracy, predicted_tokens, grad_input, grad_weight, grad_bias)``.
+    """
+    if len(result) == 6:
+        loss, _z_loss, _token_accuracy, grad_hidden, grad_weight, _grad_bias = result
+        return loss, grad_hidden, grad_weight
+    if len(result) == 7:
+        loss, _z_loss, _token_accuracy, _predicted_tokens, grad_hidden, grad_weight, _grad_bias = result
+        return loss, grad_hidden, grad_weight
+    raise RuntimeError(
+        f"Unexpected return tuple length {len(result)} from liger fused_linear_cross_entropy_forward (expected 6 or 7)"
+    )
+
+
 def forward(
     hidden: Tensor,
     labels: Tensor,
@@ -82,13 +101,15 @@ def forward(
     if weight_needs_grad:
         weight_c.requires_grad_(True)
     reduction = "sum" if num_items_in_batch is not None else "mean"
-    loss, _z_loss, _token_accuracy, grad_hidden, grad_weight, _grad_bias = fused_linear_cross_entropy_forward(
-        _input=hidden_flat,
-        weight=weight_c,
-        target=labels_flat.contiguous(),
-        bias=None,
-        ignore_index=ignore_index,
-        reduction=reduction,
+    loss, grad_hidden, grad_weight = _unpack_liger_ce_forward_output(
+        fused_linear_cross_entropy_forward(
+            _input=hidden_flat,
+            weight=weight_c,
+            target=labels_flat.contiguous(),
+            bias=None,
+            ignore_index=ignore_index,
+            reduction=reduction,
+        )
     )
     if (hidden_needs_grad or weight_needs_grad) and grad_hidden is None:
         raise RuntimeError("liger fused CE did not allocate the input grad buffer")

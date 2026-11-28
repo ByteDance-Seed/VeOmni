@@ -27,6 +27,7 @@ def test_down_wait_follows_dx_and_precedes_gate_weight_grad(monkeypatch, needs, 
         saved_tensors=(tokens, torch.tensor([4]), gate, down, pre_gate, pre_up, torch.empty(0), torch.empty(0), None),
         swiglu_limit=None,
         activation="silu",
+        swiglu_alpha=None,
         tile_prefix_total=None,
     )
     calls = 0

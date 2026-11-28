@@ -35,12 +35,16 @@ def wrapper(
     del seq_idx
     from fla.modules.convolution import causal_conv1d
 
+    cu_opt = optional_tensor(cu_seqlens)
+    if cu_opt is not None and cu_opt.device != x.device:
+        cu_opt = cu_opt.to(device=x.device, non_blocking=True)
+
     output, _final_state = causal_conv1d(
         x=x,
         weight=weight,
         bias=optional_tensor(bias),
         activation=activation,
-        cu_seqlens=optional_tensor(cu_seqlens),
+        cu_seqlens=cu_opt,
         backend=backend or "triton",
     )
     return output

@@ -25,6 +25,7 @@ from torch import Tensor
 from .....distributed.moe import cumsum_to_counts, dispatch_to_ep_class
 from .....distributed.parallel_state import get_parallel_state
 from ..shared.activation import is_silu
+from ..shared.swiglu import swiglu_oai
 
 
 class GmmFunction(torch.autograd.Function):
@@ -119,10 +120,16 @@ def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
     return _eager_clamped_swiglu(x, limit)
 
 
-def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
+def _swiglu(x: torch.Tensor, swiglu_limit: float | None, swiglu_alpha: float | None = None) -> torch.Tensor:
     """NPU SwiGLU, or the clamped path when ``swiglu_limit`` is set."""
     import torch_npu
 
+    if swiglu_alpha is not None:
+        gate, up = x.chunk(2, dim=-1)
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+        return swiglu_oai(gate, up, swiglu_alpha)
     if swiglu_limit is None:
         return torch_npu.npu_swiglu(x, dim=-1)
     return _clamped_swiglu(x, swiglu_limit)
@@ -138,6 +145,7 @@ def _npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
 ) -> torch.Tensor:
     """NPU single-device fused MoE forward pass (non-EP).
 
@@ -154,7 +162,7 @@ def _npu_fused_moe_forward(
 
     fc1_weight = _fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight).transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(permuted_hidden_states, fc1_weight, tokens_per_expert)
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit, swiglu_alpha)
     output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert)
     # NPU unpermute applies routing after fc2. Equivalent for a biasless down
     # projection; bf16 rounding can differ from the pre-fc2 fused order.
@@ -162,7 +170,7 @@ def _npu_fused_moe_forward(
     return hidden_states
 
 
-def _npu_expert_math(permute_tokens, cumsum, fc1_weight, fc2_weight, swiglu_limit=None):
+def _npu_expert_math(permute_tokens, cumsum, fc1_weight, fc2_weight, swiglu_limit=None, swiglu_alpha=None):
     """Two Ascend grouped GEMMs with the gated activation between them.
 
     Takes the shape ``dispatch_to_ep_class`` provides, so the all-to-all plumbing is
@@ -176,7 +184,7 @@ def _npu_expert_math(permute_tokens, cumsum, fc1_weight, fc2_weight, swiglu_limi
     """
     counts = cumsum_to_counts(cumsum)
     intermediate = npu_group_gemm(permute_tokens, fc1_weight, counts)
-    activated = _swiglu(intermediate, swiglu_limit)
+    activated = _swiglu(intermediate, swiglu_limit, swiglu_alpha)
     return npu_group_gemm(activated, fc2_weight, counts)
 
 
@@ -225,6 +233,7 @@ def npu_ep_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     ep_group: dist.ProcessGroup | None = None,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
     *,
     load_balancer=None,
 ) -> torch.Tensor:
@@ -234,6 +243,8 @@ def npu_ep_fused_moe_forward(
     plumbing is shared with every other fused row; only the per-rank math is Ascend's.
     """
     if load_balancer is not None:
+        if swiglu_alpha is not None:
+            raise ValueError("Qwen3.5 EP load balancing requires standard SwiGLU.")
         from .....distributed.moe.moe_layer import dispatch_to_ep_with_replicas
 
         if ep_group is None or ep_group is not load_balancer.ep_group:
@@ -261,6 +272,7 @@ def npu_ep_fused_moe_forward(
         fc1_weight,
         fc2_weight.transpose(1, 2),
         swiglu_limit,
+        swiglu_alpha,
     )
 
 
@@ -275,6 +287,7 @@ def npu_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,  # intentionally unused; see the del below
+    swiglu_alpha: float | None = None,
     *,
     load_balancer=None,
 ):
@@ -299,6 +312,7 @@ def npu_fused_moe_forward(
             fc1_1_2_weight,
             ep_group=get_parallel_state().ep_group,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
             load_balancer=load_balancer,
         )
     else:
@@ -314,6 +328,7 @@ def npu_fused_moe_forward(
             fc2_weight,
             fc1_1_2_weight,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
         )
     return final_hidden_states
 

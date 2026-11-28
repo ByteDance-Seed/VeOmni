@@ -227,6 +227,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         fc2_weight,
         swiglu_limit=None,
         activation="silu",
+        swiglu_alpha=None,
         *,
         replica_fc1_weight=None,
         replica_fc2_weight=None,
@@ -255,7 +256,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             fc1_1_output, fc1_2_output, swiglu_limit
         )
         if is_silu(activation):
-            fc1_result = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
+            fc1_result = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output, swiglu_alpha)
         else:
             fc1_result = _expert_activation(fc1_1_output, activation) * fc1_2_output
         fc2_output = group_gemm_same_nk(
@@ -272,6 +273,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
 
         ctx.swiglu_limit = swiglu_limit
         ctx.activation = activation
+        ctx.swiglu_alpha = swiglu_alpha
         ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             permute_tokens,
@@ -332,6 +334,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
                 grad_fc1_result,
                 mask_fc1_1 if swiglu_limit is not None else None,
                 mask_fc1_2 if swiglu_limit is not None else None,
+                ctx.swiglu_alpha,
             )
         else:
             gate_grad = activation_backward(grad_fc1_result * fc1_2_output, fc1_1_output, ctx.activation)
@@ -405,6 +408,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             grad_fc2_weight,
             None,
             None,  # activation
+            None,  # swiglu_alpha
         )
 
 
@@ -473,7 +477,7 @@ class BalancedEPMergedFc1GroupGemm(torch.autograd.Function):
             make_ordered_weight_grad(plan, group, grad_output.device) if ordered and any(need_weights) else None
         )
         try:
-            dx, _, dgate, ddown, _, _ = EPMergedFc1GroupGemm.backward(
+            dx, _, dgate, ddown, _, _, _ = EPMergedFc1GroupGemm.backward(
                 ctx,
                 grad_output,
                 weight_gradient_dtype=torch.float32,
