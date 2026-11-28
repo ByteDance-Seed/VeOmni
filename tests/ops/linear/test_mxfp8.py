@@ -35,13 +35,13 @@ def _reference(x, weight, bias, dy):
     return output, dx, dw, dy_rows.sum(0).to(bias.dtype)
 
 
-def _check_projection(tokens, weight_dtype, target_device, *, emulated, autocast=False):
+def _check_projection(tokens, weight_dtype, target_device, *, emulated, autocast_dtype=None):
     generator = torch.Generator().manual_seed(31)
     x = torch.randn(1, tokens, 64, dtype=torch.float32, generator=generator)
     weight = torch.randn(128, 64, dtype=weight_dtype, generator=generator)
     bias = torch.randn(128, generator=generator)
     dy = torch.randn(1, tokens, 128, dtype=torch.bfloat16, generator=generator)
-    expected = _reference(x.bfloat16() if autocast else x, weight, bias, dy)
+    expected = _reference(x.bfloat16() if autocast_dtype else x, weight, bias, dy)
 
     layer = torch.nn.Linear(64, 128, device="meta")
     layer.weight = torch.nn.Parameter(weight.to(target_device))
@@ -49,9 +49,9 @@ def _check_projection(tokens, weight_dtype, target_device, *, emulated, autocast
     x = x.to(target_device).requires_grad_()
     selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp8", "emulated": emulated})
     op = VeomniOp("linear", "standard", selection)
-    with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=autocast):
+    with torch.autocast(x.device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
         output = op(layer, x)
-    assert output.dtype == (torch.bfloat16 if autocast else x.dtype)
+    assert output.dtype == (autocast_dtype or x.dtype)
     output.backward(dy.to(target_device))
     for actual, reference in zip((output, x.grad, layer.weight.grad, layer.bias.grad), expected, strict=True):
         # Native and CPU emulated reductions may differ by one BF16 spacing.
@@ -64,12 +64,17 @@ def _check_projection(tokens, weight_dtype, target_device, *, emulated, autocast
 
 
 @pytest.mark.parametrize(
-    ("tokens", "weight_dtype", "autocast"),
-    [(1, torch.float32, True), (32, torch.bfloat16, False), (65, torch.float32, False)],
+    ("tokens", "weight_dtype", "autocast_dtype"),
+    [
+        (1, torch.float32, torch.bfloat16),
+        (3, torch.float32, torch.float16),
+        (32, torch.bfloat16, None),
+        (65, torch.float32, None),
+    ],
 )
-def test_emulated_mxfp8_matches_independent_oracle(tokens, weight_dtype, autocast):
+def test_emulated_mxfp8_matches_independent_oracle(tokens, weight_dtype, autocast_dtype):
     pytest.importorskip("torchao")
-    _check_projection(tokens, weight_dtype, "cpu", emulated=True, autocast=autocast)
+    _check_projection(tokens, weight_dtype, "cpu", emulated=True, autocast_dtype=autocast_dtype)
 
 
 @pytest.mark.parametrize(

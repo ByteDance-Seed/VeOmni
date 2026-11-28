@@ -333,7 +333,9 @@ def torchao_mxfp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None, 
     if weight.device != x.device or (bias is not None and bias.device != x.device):
         raise ValueError("MXFP8 linear operands must be on the same device.")
     if torch.is_autocast_enabled(x.device.type):
-        x = x.to(torch.get_autocast_dtype(x.device.type))
+        # The MX quantizer accepts BF16 or FP32. Keep the master weight's
+        # precision and cast the model-facing result in mxfp8_model_projection.
+        x = x.to(torch.bfloat16)
     if x.dtype not in (torch.bfloat16, torch.float32) or weight.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError(f"MXFP8 linear requires BF16 or FP32 inputs and weights, got {x.dtype} and {weight.dtype}.")
     _require_mxfp8_runtime(None if emulated else x.device)

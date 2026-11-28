@@ -131,10 +131,12 @@ two so the largest value fits in E4M3FN. MXFP4 QAT keeps torchao's
 OCP-style FLOOR recipe to match the E2M1 deployment format. Forward and
 input-gradient GEMMs quantize the supplied weight independently along their
 reduction dimensions. The weight-gradient GEMM quantizes the input and output
-gradient along the token dimension. The GEMMs produce BF16. At the model
-boundary the projection returns the active autocast dtype, or the input dtype
-when autocast is off. This also allows an FP32 model to enable MXFP8 on a single
-attention projection. FSDP2 uses its ordinary floating-point AllGather.
+gradient along the token dimension. The GEMMs produce BF16. Under BF16 or
+FP16 autocast the quantizer reads BF16 activations and keeps the supplied
+BF16 or FP32 weight precision. The projection returns the active autocast
+dtype, or the input dtype when autocast is off. This also allows an FP32 model
+to enable MXFP8 on a single attention projection. FSDP2 uses its ordinary
+floating-point AllGather.
 
 On B200 with PyTorch 2.11, CUDA Inductor supports the linear row. With bias,
 compiler fusion can round the sum differently from eager execution. For the
