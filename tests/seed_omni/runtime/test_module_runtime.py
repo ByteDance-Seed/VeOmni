@@ -675,26 +675,37 @@ def test_the_recompute_apply_is_a_no_op_when_checkpointing_is_off(monkeypatch):
     assert calls == []
 
 
-def test_distributed_inference_wraps_lora_before_loading_weights(monkeypatch):
+def test_distributed_inference_prepares_precision_and_lora_before_loading_weights(monkeypatch):
     """With ``lora_config`` set the loader maps base keys onto ``base_model.model.*``;
     an unwrapped model has no such names, so its base weights would never load."""
     calls = []
-    for step in ("setup", "_build_model_assets", "_setup_lora", "_build_parallelized_model"):
+
+    def parallelize(runtime):
+        fsdp = runtime.args.accelerator.fsdp_config
+        assert fsdp.mixed_precision.enable is False
+        assert fsdp.mxfp8_all_gather is False
+        calls.append("_build_parallelized_model")
+
+    monkeypatch.setattr(ModuleRuntime, "_build_parallelized_model", parallelize)
+    for step in ("setup", "_build_model_assets", "_setup_lora"):
         monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
     monkeypatch.setattr(ModuleRuntime, "_build_model", lambda self: setattr(self, "model", nn.Linear(2, 2)))
     monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
     accelerator = _fsdp("module")
     accelerator.fsdp_config.mixed_precision = SimpleNamespace(enable=True)
+    accelerator.fsdp_config.mxfp8_all_gather = True
 
     ModuleRuntime(
         SimpleNamespace(accelerator=accelerator),
         "llm",
         module_config=SimpleNamespace(),
-        global_accelerator=_fsdp("module"),
+        global_accelerator=accelerator,
         for_inference=True,
     )
 
     assert calls.index("_setup_lora") < calls.index("_build_parallelized_model")
+    assert accelerator.fsdp_config.mixed_precision.enable is True
+    assert accelerator.fsdp_config.mxfp8_all_gather is True
 
 
 def test_a_module_the_lora_config_missed_stays_frozen_instead_of_failing():

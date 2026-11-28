@@ -64,6 +64,9 @@ Set it per child under `fsdp_scope: module`, or on the top-level accelerator
 under `fsdp_scope: model`. The composed wrap rejects conflicting child
 overrides. See [dense MXFP8 transport](../../usage/low_precision_training.md#optional-fsdp2-allgather).
 
+During inference, a module that owns its FSDP2 wrap loads BF16 weights
+directly and uses ordinary AllGather. Its selected MXFP8 operators still run.
+
 Two per-module properties are not accelerator settings but change how the
 module is wrapped and saved:
 
