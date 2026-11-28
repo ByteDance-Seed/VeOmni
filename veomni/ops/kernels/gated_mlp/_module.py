@@ -60,7 +60,7 @@ __all__ = [
 
 #: Rows that quantize the weights they are handed. Only these require a real
 #: ``weight``; every other row is arithmetic that also works on projection modules.
-#: ``torchao`` serves FP8, NVFP4, and MXFP4; the format is its ``dtype`` argument
+#: ``torchao`` serves FP8, MXFP8, NVFP4, and MXFP4; the format is its ``dtype`` argument
 #: and does not change whether it quantizes.
 QUANTIZING_IMPLS = frozenset({"qat", "torchao", "deepgemm"})
 
